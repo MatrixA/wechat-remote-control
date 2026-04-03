@@ -42,9 +42,10 @@ const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switc
 const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh']);
 
 // ── Mutable state ────────────────────────────────────────────────────
-let lastInjectedText = null;
-let lastPushedText   = null;
-let pendingText      = null;   // queued WeChat text awaiting injection
+let lastInjectedText       = null;
+let lastInjectedTranscript = null;  // transcript path of the session we injected into
+let lastPushedText         = null;
+let pendingText            = null;   // queued WeChat text awaiting injection
 let injectTimer      = null;
 let ccBusy           = false;
 let contextToken     = '';     // latest WeChat context_token for pushes
@@ -456,7 +457,8 @@ async function handleBridgeCommand(text, sender) {
     writeSessions(reg);
 
     // Reset injection state for the new session
-    lastInjectedText = null;
+    lastInjectedText       = null;
+    lastInjectedTranscript = null;
     lastPushedText = null;
     saveSession({ targetUserId, lastInjectedText: null });
 
@@ -518,10 +520,11 @@ function scheduleInject() {
     pendingText = null;
     try {
       sendKeys(target, text);
-      lastInjectedText = text;
-      saveSession({ targetUserId, lastInjectedText });
+      lastInjectedText       = text;
+      lastInjectedTranscript = state.transcriptPath || null;
+      saveSession({ targetUserId, lastInjectedText, lastInjectedTranscript });
       appendHistory({ type: 'user_wechat', text });
-      logger.info('Injected WeChat message', { chars: text.length });
+      logger.info('Injected WeChat message', { chars: text.length, transcript: lastInjectedTranscript?.slice(-40) });
     } catch (err) {
       logger.error('tmux inject failed', { error: err.message });
     }
@@ -535,19 +538,25 @@ async function onStop(payload, sender) {
   const tpath = payload.transcript_path || state.transcriptPath;
   if (!tpath) { scheduleInject(); return; }
 
-  if (state.transcriptPath && tpath !== state.transcriptPath) {
-    logger.debug('Stop from foreign session, ignoring', { tpath: tpath.slice(-60) });
+  // Accept Stop from: (1) the session we injected into, (2) the current active session.
+  // Using lastInjectedTranscript is more reliable than state.transcriptPath because
+  // sessions.json.active may have changed between inject time and Stop time.
+  const expectedPath = lastInjectedTranscript || state.transcriptPath;
+  if (expectedPath && tpath !== expectedPath) {
+    logger.debug('Stop from foreign session, ignoring', { tpath: tpath.slice(-60), expected: expectedPath.slice(-40) });
     return;
   }
 
   logger.info('Stop hook received', { transcript_path: tpath.slice(-60) });
 
-  const entries = parseTranscript(tpath);
+  // Read from the transcript we actually injected into (may differ from tpath if payload was missing)
+  const readPath = lastInjectedTranscript || tpath;
+  const entries = parseTranscript(readPath);
   let responseText = findResponseToInjected(entries, lastInjectedText);
 
   if (!responseText && lastInjectedText) {
     await new Promise(r => setTimeout(r, 500));
-    const entries2 = parseTranscript(tpath);
+    const entries2 = parseTranscript(readPath);
     responseText = findResponseToInjected(entries2, lastInjectedText);
     if (responseText) logger.info('Found response on retry');
   }
@@ -559,9 +568,10 @@ async function onStop(payload, sender) {
 
   if (responseText && responseText !== lastPushedText) {
     if (lastInjectedText) {
-      lastPushedText = responseText;
-      lastInjectedText = null;
-      saveSession({ targetUserId, lastInjectedText: null });
+      lastPushedText         = responseText;
+      lastInjectedText       = null;
+      lastInjectedTranscript = null;
+      saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
       appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
       const chunks = splitMessage(responseText);
       for (const chunk of chunks) {
@@ -606,14 +616,16 @@ async function onNotification(payload, sender) {
   if (msg.includes('waiting for your input') && lastInjectedText) {
     logger.info('Notification: idle + pending lastInjected, re-reading transcript');
     const state = getActiveState();
-    const tpath = state.transcriptPath;
+    // Prefer the transcript we actually injected into; fall back to current active session
+    const tpath = lastInjectedTranscript || state.transcriptPath;
     if (tpath) {
       const entries = parseTranscript(tpath);
       const responseText = findResponseToInjected(entries, lastInjectedText);
       if (responseText && responseText !== lastPushedText) {
-        lastPushedText = responseText;
-        lastInjectedText = null;
-        saveSession({ targetUserId, lastInjectedText: null });
+        lastPushedText         = responseText;
+        lastInjectedText       = null;
+        lastInjectedTranscript = null;
+        saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
         appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
         const chunks = splitMessage(responseText);
         for (const chunk of chunks) {
@@ -735,8 +747,9 @@ async function main() {
   }
 
   const session = loadSession();
-  targetUserId     = session.targetUserId || '';
-  lastInjectedText = session.lastInjectedText || null;
+  targetUserId           = session.targetUserId || '';
+  lastInjectedText       = session.lastInjectedText || null;
+  lastInjectedTranscript = session.lastInjectedTranscript || null;
 
   const api    = new WeChatApi(account.botToken, account.baseUrl);
   const sender = createSender(api, account.accountId);
