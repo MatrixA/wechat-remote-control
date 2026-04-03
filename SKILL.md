@@ -62,47 +62,79 @@ ls ~/.wechat-bridge/accounts/*.json 2>/dev/null | head -1
 If account files exist, note them and ask the user whether they want to re-login
 or if this was triggered by a session expiry. If they're just setting up fresh, proceed.
 
-### Step 2: Fetch QR code
+### Step 2: Locate skill directory and ensure dependencies
+
+```bash
+SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name "login.js" 2>/dev/null \
+  | grep "wechat-remote-control/dist/wechat/login.js" | head -1 \
+  | sed 's|/dist/wechat/login.js||')
+echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
+test -d "$SKILL_DIR/node_modules/qrcode" && echo "qrcode: OK" || echo "qrcode: missing"
+```
+
+Note the SKILL_DIR value. If qrcode is missing, install it:
+
+```bash
+cd "$SKILL_DIR" && npm install --production --ignore-scripts 2>&1 | tail -3
+```
+
+### Step 3: Fetch QR code and display
+
+Replace `SKILL_DIR` with the actual path found above, then run:
 
 ```bash
 node --input-type=module -e "
-  import { startQrLogin } from '$HOME/.claude/skills/wechat-remote-control/dist/wechat/login.js';
+  import { createRequire } from 'module';
+  import { createWriteStream } from 'fs';
+  import { startQrLogin } from 'SKILL_DIR/dist/wechat/login.js';
+
   const { qrcodeUrl, qrcodeId } = await startQrLogin();
+
+  // Write QR directly to /dev/tty — bypasses CC stdout capture,
+  // appears inline in the terminal without truncation or ctrl+o.
+  try {
+    const require = createRequire('SKILL_DIR/package.json');
+    const QRCode = require('qrcode');
+    const text = await new Promise((res, rej) =>
+      QRCode.toString(qrcodeUrl, { type: 'utf8', small: true }, (e, s) => e ? rej(e) : res(s))
+    );
+    const tty = createWriteStream('/dev/tty');
+    tty.write(text + '\n');
+    tty.end();
+    await new Promise(res => tty.on('finish', res));
+  } catch(e) {
+    // /dev/tty unavailable or qrcode not installed — fall back to URL in JSON
+  }
+
+  // Only the JSON goes to stdout (one line, no collapse)
   console.log(JSON.stringify({ qrcodeUrl, qrcodeId }));
 "
 ```
 
-Parse the JSON. Then generate and display the QR code in terminal:
+The QR code appears directly in the terminal (not inside CC's tool output box).
+Parse the JSON from stdout. Tell the user: "请用微信扫描终端中的二维码并确认登录。"
 
-```bash
-npx --yes qrcode-terminal "<qrcodeUrl>" --small
-```
+### Step 4: Wait for scan confirmation
 
-If `npx` or `qrcode-terminal` fail, display the URL directly and tell the user to
-open it in a browser or scan it with WeChat.
-
-After displaying the QR, tell the user: "Please scan the QR code with WeChat and confirm..."
-
-### Step 3: Wait for scan confirmation
+Replace `SKILL_DIR` and `QRCODE_ID` with actual values:
 
 ```bash
 node --input-type=module -e "
-  import { waitForQrScan } from '$HOME/.claude/skills/wechat-remote-control/dist/wechat/login.js';
-  const result = await waitForQrScan('<QRCODE_ID>');
+  import { waitForQrScan } from 'SKILL_DIR/dist/wechat/login.js';
+  const result = await waitForQrScan('QRCODE_ID');
   console.log(JSON.stringify({ status: 'confirmed', accountId: result.accountId }));
 "
 ```
 
-Replace `<QRCODE_ID>` with the `qrcodeId` from Step 2. Allow up to 3 minutes.
-If it throws "expired", go back to Step 2 to refresh.
+Allow up to 3 minutes. If it throws "expired", go back to Step 3 to refresh.
 
-### Step 4: Verify and report
+### Step 5: Verify and report
 
 ```bash
 ls ~/.wechat-bridge/accounts/*.json 2>/dev/null
 ```
 
-If no files: retry from Step 2. Otherwise confirm login success.
+If no files: retry from Step 3. Otherwise confirm login success.
 
 ---
 
