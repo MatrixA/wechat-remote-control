@@ -8,7 +8,7 @@ export interface Config {
   permissionMode?: "default" | "acceptEdits" | "plan" | "auto";
 }
 
-const CONFIG_DIR = join(homedir(), ".wechat-bridge");
+const CONFIG_DIR = join(homedir(), ".wechat-remote-control");
 const CONFIG_PATH = join(CONFIG_DIR, "config.env");
 
 const DEFAULT_CONFIG: Config = {

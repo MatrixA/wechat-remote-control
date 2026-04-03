@@ -3,8 +3,8 @@
 # Shows "💬 已连微信" when THIS CC session is the active WeChat target.
 # Cross-platform: works on Linux (/proc) and macOS (ps).
 
-BRIDGE_PID_FILE="$HOME/.wechat-bridge/bridge.pid"
-CC_PID_FILE="$HOME/.wechat-bridge/cc_pid"
+BRIDGE_PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
+CC_PID_FILE="$HOME/.wechat-remote-control/cc_pid"
 
 # 1. Bridge daemon must be running (use PID file — no /proc scanning)
 [[ -f "$BRIDGE_PID_FILE" ]] || exit 0

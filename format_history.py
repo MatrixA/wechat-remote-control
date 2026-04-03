@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Format ~/.cc_wechat/history.jsonl for display in Claude Code."""
+"""Format ~/.wechat-remote-control/history.jsonl for display in Claude Code."""
 import json, sys, os
 from datetime import datetime
 
-path = os.path.expanduser('~/.cc_wechat/history.jsonl')
+path = os.path.expanduser('~/.wechat-remote-control/history.jsonl')
 if not os.path.exists(path):
     print('没有找到微信会话记录。')
     sys.exit(0)

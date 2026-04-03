@@ -29,7 +29,7 @@ Never ask the user to copy-paste and run commands themselves — handle everythi
 
 ## Architecture overview (for Claude's reference)
 
-The wechat-bridge uses a **tmux-injection** model, bundled in this skill directory.
+The bridge uses a **tmux-injection** model, bundled in this skill directory.
 
 - **Bridge daemon** (`node src/index.js`): polls ilink WeChat API for messages, injects
   them into the user's tmux-hosted CC session via `tmux send-keys`.
@@ -38,9 +38,12 @@ The wechat-bridge uses a **tmux-injection** model, bundled in this skill directo
 - **Response forwarding**: on Stop/Notification hook, reads CC transcript JSONL, finds the
   response to the injected WeChat message, and forwards it to WeChat. Terminal-initiated
   responses are NOT forwarded.
-- **State**: `~/.cc_wechat/state.json` (tmux target, autoApprove, transcriptPath).
-- **Accounts**: `~/.wechat-bridge/accounts/<accountId>.json`.
-- **Logs**: `~/.wechat-bridge/logs/bridge-YYYY-MM-DD.log` (rotated, 30-day retention).
+- **All state lives in one directory**: `~/.wechat-remote-control/`
+  - `accounts/<accountId>.json` — WeChat credentials
+  - `state.json` — tmux target, autoApprove, transcriptPath
+  - `bridge.json` / `bridge.pid` / `cc_pid` — daemon metadata
+  - `logs/bridge-YYYY-MM-DD.log` — rotated logs (30-day retention)
+  - `history.jsonl` — injected messages and forwarded responses
 
 **Critical: process kill safety.** Do NOT use `pgrep -f` or `grep` with bridge path strings
 in the same bash command that does other work. Claude Code wraps commands in `bash -c "..."`,
@@ -56,7 +59,7 @@ Run this once before first use, or whenever the bridge reports session expiry.
 ### Step 1: Check if already logged in
 
 ```bash
-ls ~/.wechat-bridge/accounts/*.json 2>/dev/null | head -1
+ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null | head -1
 ```
 
 If account files exist, note them and ask the user whether they want to re-login
@@ -136,7 +139,7 @@ to Step 3 to get a fresh QR code and display it again.
 ### Step 5: Verify and report
 
 ```bash
-ls ~/.wechat-bridge/accounts/*.json 2>/dev/null
+ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null
 ```
 
 If no files: retry from Step 3. Otherwise confirm login success.
@@ -151,11 +154,11 @@ If no files: retry from Step 3. Otherwise confirm login success.
 echo "=== bridge installed ==="
 test -f $HOME/.claude/skills/wechat-remote-control/src/index.js && echo "OK" || echo "NOT_FOUND"
 echo "=== account ==="
-ls ~/.wechat-bridge/accounts/*.json 2>/dev/null | head -1 || echo "NOT_FOUND"
+ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null | head -1 || echo "NOT_FOUND"
 echo "=== tmux ==="
 echo "SESSION:$(tmux display-message -p '#S' 2>/dev/null); WINDOW:$(tmux display-message -p '#I' 2>/dev/null); PANE:$(tmux display-message -p '#P' 2>/dev/null)" || echo "NOT_IN_TMUX"
 echo "=== existing attach ==="
-cat ~/.cc_wechat/state.json 2>/dev/null || echo "{}"
+cat ~/.wechat-remote-control/state.json 2>/dev/null || echo "{}"
 ```
 
 **If bridge NOT_FOUND:** tell user bridge is not installed, stop.
@@ -187,6 +190,8 @@ TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$ENCODED"/*.jsonl 2>/dev/null | head 
 SESSION_ID=$(basename "$TRANSCRIPT" .jsonl 2>/dev/null)
 python3 -c "
 import json, os, time, datetime
+d = os.path.expanduser('~/.wechat-remote-control')
+os.makedirs(d, exist_ok=True)
 # Write state.json (tmux injection model)
 state = {
     'injectTarget': {
@@ -199,21 +204,19 @@ state = {
     'active': True,
     'transcriptPath': '$TRANSCRIPT'
 }
-os.makedirs(os.path.expanduser('~/.cc_wechat'), exist_ok=True)
-with open(os.path.expanduser('~/.cc_wechat/state.json'), 'w') as f:
+with open(os.path.join(d, 'state.json'), 'w') as f:
     json.dump(state, f, indent=2)
-# Write bridge.json (bridge-watcher model + ccPid for status bar)
-os.makedirs(os.path.expanduser('~/.wechat-bridge'), exist_ok=True)
+# Write bridge.json (daemon metadata + ccPid for status bar)
 bridge = {
     'sessionId': '$SESSION_ID',
     'cwd': '$CWD',
     'ccPid': $CC_PID,
     'attachedAt': datetime.datetime.now(datetime.timezone.utc).isoformat()
 }
-with open(os.path.expanduser('~/.wechat-bridge/bridge.json'), 'w') as f:
+with open(os.path.join(d, 'bridge.json'), 'w') as f:
     json.dump(bridge, f, indent=2)
 # Store ccPid separately so bridge daemon updates don't overwrite it
-with open(os.path.expanduser('~/.wechat-bridge/cc_pid'), 'w') as f:
+with open(os.path.join(d, 'cc_pid'), 'w') as f:
     f.write(str($CC_PID))
 print('OK: target=' + '$SESSION:$WINDOW.$PANE' + ' ccPid=$CC_PID')
 "
@@ -221,7 +224,7 @@ print('OK: target=' + '$SESSION:$WINDOW.$PANE' + ' ccPid=$CC_PID')
 
 ### Step 4: Configure hooks in settings.json
 
-Read `~/.claude/settings.json`. Merge the wechat-bridge hooks — do not overwrite other settings.
+Read `~/.claude/settings.json`. Merge the hooks — do not overwrite other settings.
 
 Target hooks config:
 ```json
@@ -270,7 +273,7 @@ Never kill a healthy bridge just because attach was called again.
 **Check existing daemon:**
 
 ```bash
-PID_FILE="$HOME/.wechat-bridge/bridge.pid"
+PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
 BRIDGE_RUNNING=0
 if [ -f "$PID_FILE" ]; then
     STORED_PID=$(cat "$PID_FILE")
@@ -290,7 +293,7 @@ echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
 ```bash
 nohup node $HOME/.claude/skills/wechat-remote-control/src/index.js >> /tmp/cc_wechat_bridge.log 2>&1 &
 NEW_PID=$!
-echo $NEW_PID > $HOME/.wechat-bridge/bridge.pid
+echo $NEW_PID > $HOME/.wechat-remote-control/bridge.pid
 echo "PID=$NEW_PID"
 ```
 
@@ -326,13 +329,13 @@ Terminal-initiated responses are NOT forwarded to WeChat.
 
 ```bash
 python3 $HOME/.claude/skills/wechat-remote-control/format_history.py 2>/dev/null \
-  || (tail -20 ~/.cc_wechat/history.jsonl 2>/dev/null || echo "No WeChat history found.")
+  || (tail -20 ~/.wechat-remote-control/history.jsonl 2>/dev/null || echo "No WeChat history found.")
 ```
 
 If no history exists, check the bridge logs:
 
 ```bash
-tail -50 ~/.wechat-bridge/logs/bridge-$(date +%Y-%m-%d).log 2>/dev/null | grep -E "INFO|WARN|ERROR" | tail -20
+tail -50 ~/.wechat-remote-control/logs/bridge-$(date +%Y-%m-%d).log 2>/dev/null | grep -E "INFO|WARN|ERROR" | tail -20
 ```
 
 ### Step 2: Summarize

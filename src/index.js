@@ -27,7 +27,7 @@ import { logger } from '../dist/logger.js';
 
 // ── Paths ────────────────────────────────────────────────────────────
 const HOOK_SOCKET    = '/tmp/cc_wechat_hook.sock';
-const CC_WECHAT      = join(homedir(), '.cc_wechat');
+const CC_WECHAT      = join(homedir(), '.wechat-remote-control');
 const STATE_FILE     = join(CC_WECHAT, 'state.json');       // legacy single-session
 const SESSIONS_FILE  = join(CC_WECHAT, 'sessions.json');    // multi-session registry
 const HISTORY_FILE   = join(CC_WECHAT, 'history.jsonl');

@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-const CONFIG_DIR = join(homedir(), ".wechat-bridge");
+const CONFIG_DIR = join(homedir(), ".wechat-remote-control");
 const CONFIG_PATH = join(CONFIG_DIR, "config.env");
 const DEFAULT_CONFIG = {
     workingDirectory: process.cwd(),

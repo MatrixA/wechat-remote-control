@@ -5,7 +5,7 @@ import { loadJson, saveJson } from '../store.js';
 import { logger } from '../logger.js';
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
 export const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
-const ACCOUNTS_DIR = join(homedir(), '.wechat-bridge', 'accounts');
+const ACCOUNTS_DIR = join(homedir(), '.wechat-remote-control', 'accounts');
 /** Reject accountIds containing path traversal or unexpected characters. */
 function validateAccountId(accountId) {
     if (!/^[a-zA-Z0-9_.@=-]+$/.test(accountId)) {

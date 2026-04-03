@@ -15,7 +15,7 @@ export interface AccountData {
   createdAt: string;
 }
 
-const ACCOUNTS_DIR = join(homedir(), '.wechat-bridge', 'accounts');
+const ACCOUNTS_DIR = join(homedir(), '.wechat-remote-control', 'accounts');
 
 /** Reject accountIds containing path traversal or unexpected characters. */
 function validateAccountId(accountId: string): void {
