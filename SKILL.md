@@ -85,34 +85,40 @@ Replace `SKILL_DIR` with the actual path found above, then run:
 ```bash
 node --input-type=module -e "
   import { createRequire } from 'module';
-  import { createWriteStream } from 'fs';
   import { startQrLogin } from 'SKILL_DIR/dist/wechat/login.js';
 
   const { qrcodeUrl, qrcodeId } = await startQrLogin();
 
-  // Write QR directly to /dev/tty — bypasses CC stdout capture,
-  // appears inline in the terminal without truncation or ctrl+o.
+  let qrcodeText = null;
   try {
     const require = createRequire('SKILL_DIR/package.json');
     const QRCode = require('qrcode');
-    const text = await new Promise((res, rej) =>
-      QRCode.toString(qrcodeUrl, { type: 'utf8', small: true }, (e, s) => e ? rej(e) : res(s))
+    qrcodeText = await new Promise((res, rej) =>
+      QRCode.toString(qrcodeUrl, { type: 'utf8', small: true, margin: 0 }, (e, s) => e ? rej(e) : res(s))
     );
-    const tty = createWriteStream('/dev/tty');
-    tty.write(text + '\n');
-    tty.end();
-    await new Promise(res => tty.on('finish', res));
   } catch(e) {
-    // /dev/tty unavailable or qrcode not installed — fall back to URL in JSON
+    // qrcode not available
   }
 
-  // Only the JSON goes to stdout (one line, no collapse)
-  console.log(JSON.stringify({ qrcodeUrl, qrcodeId }));
+  console.log(JSON.stringify({ qrcodeUrl, qrcodeId, qrcodeText }));
 "
 ```
 
-The QR code appears directly in the terminal (not inside CC's tool output box).
-Parse the JSON from stdout. Tell the user: "请用微信扫描终端中的二维码并确认登录。"
+Parse the JSON. Then **output `qrcodeText` verbatim in your reply as a code block** — this
+puts the QR code inside the conversation (not inside a tool output box), so it is fully
+visible and scannable without any ctrl+o. Example reply format:
+
+```
+请用微信扫描以下二维码登录：
+
+​```
+<qrcodeText here>
+​```
+
+扫描后请确认登录，然后告诉我已完成。
+```
+
+If `qrcodeText` is null, show the URL instead and ask user to open it on their phone.
 
 ### Step 4: Wait for scan confirmation
 
