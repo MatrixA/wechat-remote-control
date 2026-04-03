@@ -256,26 +256,21 @@ with open(os.path.join(d, 'bridge.json'), 'w') as f:
 with open(os.path.join(d, 'cc_pid'), 'w') as f:
     f.write(str(cc_pid))
 
-# Update sessions.json active to this session (match by transcript path, then tmux target)
+# Update sessions.json active to this session.
+# Strategy: set active=null so the bridge's auto-pick logic kicks in on next scan.
+# The bridge (lines 350-362 in src/index.js) prefers the session whose tmux matches
+# state.json's injectTarget — which we just wrote correctly above.
+# Do NOT try to match by name here: sessions.json may have stale tmux values from
+# before the bridge scanner ran, causing wrong matches (e.g. exp2 at 0:4.0 which later
+# moves to 0:2.0 after the scanner updates it).
 tmux_target = f'{tmux_session}:{tmux_window}.{tmux_pane}'
 sessions_path = os.path.join(d, 'sessions.json')
 if os.path.exists(sessions_path):
     sessions = json.load(open(sessions_path))
-    matched = None
-    for name, s in sessions.get('sessions', {}).items():
-        if s.get('transcriptPath') == transcript:
-            matched = name; break
-    if not matched:
-        for name, s in sessions.get('sessions', {}).items():
-            if s.get('tmux') == tmux_target:
-                matched = name; break
-    if matched:
-        sessions['active'] = matched
-        with open(sessions_path, 'w') as f:
-            json.dump(sessions, f, indent=2)
-        print(f'OK: target={tmux_target} session={matched} ccPid={cc_pid}')
-    else:
-        print(f'OK: target={tmux_target} (session not in registry yet) ccPid={cc_pid}')
+    sessions['active'] = None
+    with open(sessions_path, 'w') as f:
+        json.dump(sessions, f, indent=2)
+    print(f'OK: target={tmux_target} active=null (bridge will auto-pick) ccPid={cc_pid}')
 else:
     print(f'OK: target={tmux_target} ccPid={cc_pid}')
 "
