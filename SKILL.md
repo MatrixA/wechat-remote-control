@@ -104,9 +104,9 @@ node --input-type=module -e "
 "
 ```
 
-Parse the JSON. Then **output `qrcodeText` verbatim in your reply as a code block** — this
-puts the QR code inside the conversation (not inside a tool output box), so it is fully
-visible and scannable without any ctrl+o. Example reply format:
+Parse the JSON. Then **in the same reply**, output `qrcodeText` verbatim as a code block,
+then **immediately** run the waitForQrScan command below — do NOT wait for user input.
+Example reply:
 
 ```
 请用微信扫描以下二维码登录：
@@ -114,13 +114,11 @@ visible and scannable without any ctrl+o. Example reply format:
 ​```
 <qrcodeText here>
 ​```
-
-扫描后请确认登录，然后告诉我已完成。
 ```
 
-If `qrcodeText` is null, show the URL instead and ask user to open it on their phone.
+If `qrcodeText` is null, show the URL instead.
 
-### Step 4: Wait for scan confirmation
+### Step 4: Wait for scan (run immediately after displaying QR — no user input needed)
 
 Replace `SKILL_DIR` and `QRCODE_ID` with actual values:
 
@@ -132,7 +130,8 @@ node --input-type=module -e "
 "
 ```
 
-Allow up to 3 minutes. If it throws "expired", go back to Step 3 to refresh.
+This blocks until the user scans. Allow up to 3 minutes. If it throws "expired", go back
+to Step 3 to get a fresh QR code and display it again.
 
 ### Step 5: Verify and report
 
