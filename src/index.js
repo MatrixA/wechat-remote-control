@@ -49,6 +49,7 @@ let injectTimer      = null;
 let ccBusy           = false;
 let contextToken     = '';     // latest WeChat context_token for pushes
 let targetUserId     = '';     // WeChat user to push to
+const welcomedUsers  = new Set(); // users already sent a welcome this process run
 
 // ── JSON helpers ─────────────────────────────────────────────────────
 function readJson(path, fallback) {
@@ -624,9 +625,31 @@ function handleWeChatMessage(msg, sender) {
 
   logger.info('WeChat message', { from: targetUserId, text: text.slice(0, 80) });
 
+  // Send welcome to first-time users (once per bridge process run)
+  if (!welcomedUsers.has(targetUserId)) {
+    welcomedUsers.add(targetUserId);
+    sender.sendText(targetUserId, contextToken,
+      '👋 Claude Code 已连接！\n\n' +
+      '可用指令：\n' +
+      '  #ls — 列出所有 CC sessions\n' +
+      '  #sw <名字/序号> — 切换 session\n\n' +
+      '直接发消息即注入当前 CC session，回复将自动转发。'
+    ).catch(err => logger.error('Welcome message failed', { error: err.message }));
+  }
+
+  // Normalize /ls and /sw to # bridge commands.
+  // CC slash commands injected via tmux don't produce transcript entries,
+  // so /ls would silently fail on the WeChat side ("Unknown skill" in TUI only).
+  let cmdText = text.trim();
+  if (/^\/ls\b/i.test(cmdText) || /^\/sessions\b/i.test(cmdText)) {
+    cmdText = '#ls';
+  } else if (/^\/sw(\s|$)/i.test(cmdText)) {
+    cmdText = '#sw' + cmdText.slice(3);
+  }
+
   // Intercept bridge commands (# prefix) — never injected into CC
-  if (text.trimStart().startsWith('#')) {
-    handleBridgeCommand(text.trim(), sender);
+  if (cmdText.startsWith('#')) {
+    handleBridgeCommand(cmdText, sender);
     return;
   }
 
