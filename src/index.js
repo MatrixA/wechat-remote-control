@@ -460,7 +460,34 @@ async function handleBridgeCommand(text, sender) {
     lastPushedText = null;
     saveSession({ targetUserId, lastInjectedText: null });
 
+    // Update cc_pid to the CC process in the new session's pane
+    // so status.sh reflects the correct active session in each terminal.
     const s = reg.sessions[targetName];
+    try {
+      const paneLines = execFileSync('tmux', [
+        'list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}',
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n');
+      const newPanePid = paneLines
+        .map(l => l.split('\t'))
+        .find(([t]) => t === s.tmux)?.[1];
+      if (newPanePid) {
+        for (const pid of collectDescendants(newPanePid)) {
+          try {
+            if (readFileSync(`/proc/${pid}/comm`, 'utf8').trim() === 'claude') {
+              writeFileSync(join(CC_WECHAT, 'cc_pid'), String(pid));
+              const bridgeData = readJson(join(CC_WECHAT, 'bridge.json'), {});
+              bridgeData.ccPid = parseInt(pid);
+              writeJson(join(CC_WECHAT, 'bridge.json'), bridgeData);
+              logger.info('Updated cc_pid after #sw', { pid, session: targetName });
+              break;
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      logger.debug('Failed to update cc_pid after #sw', { error: err.message });
+    }
+
     const replay = getContextReplay(s.transcriptPath);
     const switchMsg = `✅ 已切换到: ${targetName} [${s.tmux}]\n\n${replay}`;
     for (const chunk of splitMessage(switchMsg)) await send(chunk);
