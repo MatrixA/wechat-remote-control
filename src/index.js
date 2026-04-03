@@ -193,6 +193,40 @@ function findLatestTranscript(cwd) {
 }
 
 /**
+ * Collect all descendant PIDs of a given PID via /proc (BFS).
+ */
+function collectDescendants(rootPid) {
+  const visited = new Set();
+  const queue = [String(rootPid)];
+  while (queue.length) {
+    const pid = queue.shift();
+    if (visited.has(pid)) continue;
+    visited.add(pid);
+    try {
+      const children = execFileSync('pgrep', ['-P', pid], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .trim().split('\n').filter(Boolean);
+      for (const c of children) queue.push(c);
+    } catch {}
+  }
+  return visited;
+}
+
+/**
+ * Return true if a 'claude' process is running in the process tree rooted at panePid.
+ */
+function hasCCProcess(panePid) {
+  try {
+    for (const pid of collectDescendants(panePid)) {
+      try {
+        const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
+        if (comm === 'claude') return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+/**
  * Find the transcript file actually held open by the CC process running in a
  * given tmux pane.  Walks the process tree rooted at panePid and checks each
  * descendant's open file descriptors via /proc/<pid>/fd.
@@ -200,21 +234,7 @@ function findLatestTranscript(cwd) {
  */
 function findTranscriptByPid(panePid) {
   try {
-    // Collect all descendant PIDs (BFS)
-    const visited = new Set();
-    const queue = [String(panePid)];
-    while (queue.length) {
-      const pid = queue.shift();
-      if (visited.has(pid)) continue;
-      visited.add(pid);
-      try {
-        const children = execFileSync('pgrep', ['-P', pid], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-          .trim().split('\n').filter(Boolean);
-        for (const c of children) queue.push(c);
-      } catch {}
-    }
-    // For each descendant, check open fds for a .jsonl under CLAUDE_PROJECTS
-    for (const pid of visited) {
+    for (const pid of collectDescendants(panePid)) {
       const fdDir = `/proc/${pid}/fd`;
       try {
         for (const fd of readdirSync(fdDir)) {
@@ -248,12 +268,14 @@ function readCustomTitle(transcriptPath) {
 
 /**
  * Determine the display name for a session.
- * Priority: CC /rename title > tmux window name (if not a shell) > cwd basename
+ * Priority: CC /rename title > tmux window name (if not a shell/tmux-internal) > cwd basename
  */
 function getSessionDisplayName(cwd, windowName, transcriptPath) {
   const customTitle = readCustomTitle(transcriptPath);
   if (customTitle) return customTitle;
-  if (windowName && !SHELL_NAMES.has(windowName.toLowerCase())) return windowName;
+  // Reject shell names and tmux-internal bracketed names like [tmux], [copy], etc.
+  const isBracketed = windowName && /^\[.*\]$/.test(windowName);
+  if (windowName && !SHELL_NAMES.has(windowName.toLowerCase()) && !isBracketed) return windowName;
   return basename(cwd) || cwd;
 }
 
@@ -280,10 +302,12 @@ function scanTmuxForCC() {
       const [tmuxStr, windowName, cwd, panePid] = parts;
       if (!cwd) continue;
 
-      // Try to find transcript via open file descriptors first (precise),
-      // fall back to latest-modified file in project dir (may collide for same cwd)
+      // Only register panes where a 'claude' process is actually running.
+      // Use open-fd scan first (precise, works when CC is active); fall back to
+      // latest-modified transcript only when CC is confirmed present but idle.
+      if (!hasCCProcess(panePid)) continue;
       const transcriptPath = findTranscriptByPid(panePid) || findLatestTranscript(cwd);
-      if (!transcriptPath) continue; // not a CC project pane
+      if (!transcriptPath) continue;
 
       activeTmuxTargets.add(tmuxStr);
 
@@ -321,10 +345,21 @@ function scanTmuxForCC() {
       }
     }
 
-    // Pick a default active session if none set
+    // Pick a default active session if none set.
+    // Prefer the session matching state.json's tmux target (set by /attach).
     if (!reg.active || !reg.sessions[reg.active]) {
-      const first = Object.keys(reg.sessions)[0];
-      if (first) { reg.active = first; logger.info(`Active session defaulted to: ${first}`); }
+      const state = readState();
+      const stateTarget = tmuxTarget(state);
+      const stateTranscript = state.transcriptPath;
+      let preferred = null;
+      for (const [name, s] of Object.entries(reg.sessions)) {
+        if ((stateTarget && s.tmux === stateTarget) ||
+            (stateTranscript && s.transcriptPath === stateTranscript)) {
+          preferred = name; break;
+        }
+      }
+      const chosen = preferred || Object.keys(reg.sessions)[0];
+      if (chosen) { reg.active = chosen; logger.info(`Active session defaulted to: ${chosen}`); }
     }
 
     writeSessions(reg);
