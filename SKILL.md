@@ -176,49 +176,108 @@ Default: **Y** (override). If user says no, stop.
 
 ### Step 3: Write state.json and bridge.json
 
-Detect the current tmux target and transcript path automatically.
-`$PPID` in the bash subprocess is the CC process PID — capture it for the status bar.
+Detect the current tmux target via **process ancestry** (reliable) and transcript path automatically.
+`$PPID` in the bash subprocess is the CC process PID.
+
+**Critical:** Do NOT use `tmux display-message` for the pane — it reports the currently
+focused client window, not the pane where CC lives. Use process ancestry via /proc instead.
 
 ```bash
-SESSION=$(tmux display-message -p '#S')
-WINDOW=$(tmux display-message -p '#I')
-PANE=$(tmux display-message -p '#P')
 CWD=$(pwd)
 CC_PID=$PPID
 ENCODED=$(echo "$CWD" | sed 's|[^a-zA-Z0-9-]|-|g')
 TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$ENCODED"/*.jsonl 2>/dev/null | head -1)
 SESSION_ID=$(basename "$TRANSCRIPT" .jsonl 2>/dev/null)
 python3 -c "
-import json, os, time, datetime
+import json, os, time, datetime, subprocess
+
+cc_pid = $CC_PID
+cwd = '$CWD'
+transcript = '$TRANSCRIPT'
+session_id = '$SESSION_ID'
+
+# Find the tmux pane where this CC process lives via /proc ancestry
+tmux_session = tmux_window = tmux_pane = None
+try:
+    result = subprocess.run(
+        ['tmux', 'list-panes', '-a', '-F', '#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_index}'],
+        capture_output=True, text=True
+    )
+    pane_map = {}
+    for line in result.stdout.strip().split('\n'):
+        parts = line.split('\t')
+        if len(parts) == 4:
+            pane_map[int(parts[0])] = tuple(parts[1:])
+    pid = cc_pid
+    while pid > 1:
+        if pid in pane_map:
+            tmux_session, tmux_window, tmux_pane = pane_map[pid]
+            break
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith('PPid:'):
+                        pid = int(line.split()[1]); break
+        except:
+            break
+except Exception as e:
+    print(f'pane scan error: {e}')
+
+if not tmux_session:
+    # Fallback
+    import subprocess as sp
+    tmux_session = sp.run(['tmux', 'display-message', '-p', '#S'], capture_output=True, text=True).stdout.strip()
+    tmux_window  = sp.run(['tmux', 'display-message', '-p', '#I'], capture_output=True, text=True).stdout.strip()
+    tmux_pane    = sp.run(['tmux', 'display-message', '-p', '#P'], capture_output=True, text=True).stdout.strip()
+
 d = os.path.expanduser('~/.wechat-remote-control')
 os.makedirs(d, exist_ok=True)
-# Write state.json (tmux injection model)
+
+# Write state.json
 state = {
     'injectTarget': {
-        'session': '$SESSION',
-        'window': '$WINDOW',
-        'pane': '$PANE',
+        'session': tmux_session, 'window': tmux_window, 'pane': tmux_pane,
         'attachedAt': int(time.time() * 1000)
     },
-    'autoApprove': True,
-    'active': True,
-    'transcriptPath': '$TRANSCRIPT'
+    'autoApprove': True, 'active': True, 'transcriptPath': transcript
 }
 with open(os.path.join(d, 'state.json'), 'w') as f:
     json.dump(state, f, indent=2)
-# Write bridge.json (daemon metadata + ccPid for status bar)
+
+# Write bridge.json
 bridge = {
-    'sessionId': '$SESSION_ID',
-    'cwd': '$CWD',
-    'ccPid': $CC_PID,
+    'sessionId': session_id, 'cwd': cwd, 'ccPid': cc_pid,
     'attachedAt': datetime.datetime.now(datetime.timezone.utc).isoformat()
 }
 with open(os.path.join(d, 'bridge.json'), 'w') as f:
     json.dump(bridge, f, indent=2)
-# Store ccPid separately so bridge daemon updates don't overwrite it
+
+# Store ccPid separately
 with open(os.path.join(d, 'cc_pid'), 'w') as f:
-    f.write(str($CC_PID))
-print('OK: target=' + '$SESSION:$WINDOW.$PANE' + ' ccPid=$CC_PID')
+    f.write(str(cc_pid))
+
+# Update sessions.json active to this session (match by transcript path, then tmux target)
+tmux_target = f'{tmux_session}:{tmux_window}.{tmux_pane}'
+sessions_path = os.path.join(d, 'sessions.json')
+if os.path.exists(sessions_path):
+    sessions = json.load(open(sessions_path))
+    matched = None
+    for name, s in sessions.get('sessions', {}).items():
+        if s.get('transcriptPath') == transcript:
+            matched = name; break
+    if not matched:
+        for name, s in sessions.get('sessions', {}).items():
+            if s.get('tmux') == tmux_target:
+                matched = name; break
+    if matched:
+        sessions['active'] = matched
+        with open(sessions_path, 'w') as f:
+            json.dump(sessions, f, indent=2)
+        print(f'OK: target={tmux_target} session={matched} ccPid={cc_pid}')
+    else:
+        print(f'OK: target={tmux_target} (session not in registry yet) ccPid={cc_pid}')
+else:
+    print(f'OK: target={tmux_target} ccPid={cc_pid}')
 "
 ```
 

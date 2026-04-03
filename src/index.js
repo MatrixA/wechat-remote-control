@@ -691,6 +691,21 @@ async function main() {
   console.log(`[wrc-bridge] active session: ${reg.active || 'NONE'} → ${target || 'NONE'}`);
   logger.info('Bridge started', { accountId: account.accountId, active: reg.active, target });
 
+  // Send proactive welcome if we know the user from a previous session
+  if (targetUserId) {
+    welcomedUsers.add(targetUserId); // suppress duplicate on first incoming message
+    const reg = readSessions();
+    const activeName = reg.active || '(unknown)';
+    sender.sendText(targetUserId, contextToken,
+      `👋 Claude Code 已重连！\n\n当前 session: ${activeName}\n\n` +
+      '可用指令：\n' +
+      '  #ls — 列出所有 CC sessions\n' +
+      '  #sw <名字/序号> — 切换 session\n\n' +
+      '直接发消息即注入当前 CC session，回复将自动转发。'
+    ).catch(err => logger.error('Startup welcome failed', { error: err.message }));
+    logger.info('Sent startup welcome', { userId: targetUserId });
+  }
+
   const monitor = createMonitor(api, {
     onMessage: async (msg) => { handleWeChatMessage(msg, sender); },
     onSessionExpired: () => {
