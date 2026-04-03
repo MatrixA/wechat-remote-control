@@ -4,13 +4,17 @@
  * Injects WeChat messages into a tmux-hosted CC session via send-keys,
  * watches the CC transcript for assistant responses, and forwards them
  * back to WeChat.  Hook events arrive over a Unix socket from hook.py.
+ *
+ * Multi-session support:
+ *   #ls           — list all discovered CC sessions
+ *   #sw <n|name>  — switch active session (resets injection state, replays context)
  */
 
 import net from 'node:net';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, appendFileSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, readlinkSync, unlinkSync, appendFileSync, chmodSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 
 // Reuse compiled dist/ modules for WeChat API
 import { WeChatApi } from '../dist/wechat/api.js';
@@ -22,13 +26,20 @@ import { MessageType } from '../dist/wechat/types.js';
 import { logger } from '../dist/logger.js';
 
 // ── Paths ────────────────────────────────────────────────────────────
-const HOOK_SOCKET  = '/tmp/cc_wechat_hook.sock';
-const CC_WECHAT    = join(homedir(), '.cc_wechat');
-const STATE_FILE   = join(CC_WECHAT, 'state.json');
-const HISTORY_FILE = join(CC_WECHAT, 'history.jsonl');
-const SESSION_FILE = join(CC_WECHAT, 'ilink_session.json');
-const MAX_MSG_LEN  = 2048;
-const INJECT_DELAY = 500;   // ms to wait after Stop before injecting
+const HOOK_SOCKET    = '/tmp/cc_wechat_hook.sock';
+const CC_WECHAT      = join(homedir(), '.cc_wechat');
+const STATE_FILE     = join(CC_WECHAT, 'state.json');       // legacy single-session
+const SESSIONS_FILE  = join(CC_WECHAT, 'sessions.json');    // multi-session registry
+const HISTORY_FILE   = join(CC_WECHAT, 'history.jsonl');
+const SESSION_FILE   = join(CC_WECHAT, 'ilink_session.json');
+const CLAUDE_PROJECTS = join(homedir(), '.claude', 'projects');
+const MAX_MSG_LEN    = 2048;
+const INJECT_DELAY   = 500;    // ms to wait after Stop before injecting
+const SCAN_INTERVAL  = 30_000; // ms between tmux auto-discovery scans
+const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switch
+
+// Shell names that should NOT be used as session display names
+const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh']);
 
 // ── Mutable state ────────────────────────────────────────────────────
 let lastInjectedText = null;
@@ -50,9 +61,30 @@ function writeJson(path, data) {
 }
 
 // ── State helpers ────────────────────────────────────────────────────
-function readState()   { return readJson(STATE_FILE, {}); }
-function loadSession() { return readJson(SESSION_FILE, {}); }
+function readState()    { return readJson(STATE_FILE, {}); }
+function loadSession()  { return readJson(SESSION_FILE, {}); }
 function saveSession(obj) { writeJson(SESSION_FILE, obj); }
+function readSessions() { return readJson(SESSIONS_FILE, { active: null, sessions: {} }); }
+function writeSessions(data) { writeJson(SESSIONS_FILE, data); }
+
+/**
+ * Return the state for the currently active session.
+ * Falls back to legacy state.json if sessions registry is empty.
+ */
+function getActiveState() {
+  const reg = readSessions();
+  if (reg.active && reg.sessions[reg.active]) {
+    const s = reg.sessions[reg.active];
+    const [sessionPart, rest] = s.tmux.split(':');
+    const [window, pane] = (rest || '0.0').split('.');
+    return {
+      injectTarget: { session: sessionPart, window: window || '0', pane: pane || '0' },
+      transcriptPath: s.transcriptPath,
+      autoApprove: true,
+    };
+  }
+  return readState();
+}
 
 function appendHistory(entry) {
   mkdirSync(CC_WECHAT, { recursive: true, mode: 0o700 });
@@ -72,13 +104,12 @@ function paneExists(target) {
 }
 
 function sendKeys(target, text) {
-  // Strip control characters (except newline) to prevent injection
   const safe = text.replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '');
   execFileSync('tmux', ['send-keys', '-l', '-t', target, safe]);
   execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
 }
 
-// ── Transcript parsing ───────────────────────────────────────────────
+// ── Transcript helpers ───────────────────────────────────────────────
 function parseTranscript(filePath) {
   try {
     const lines = readFileSync(filePath, 'utf8').trim().split('\n');
@@ -86,7 +117,6 @@ function parseTranscript(filePath) {
   } catch { return []; }
 }
 
-/** Extract text from message content (handles both string and array formats) */
 function textFromContent(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -95,14 +125,8 @@ function textFromContent(content) {
   return null;
 }
 
-/**
- * Find the assistant response to a specific injected user message.
- * Searches backward for the injected text, then returns the assistant
- * response that follows it. This avoids race conditions with transcript writes.
- */
 function findResponseToInjected(entries, injectedText) {
   if (!injectedText) return null;
-  // Find the last occurrence of the injected text as a user message
   let userIdx = -1;
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
@@ -112,14 +136,25 @@ function findResponseToInjected(entries, injectedText) {
     }
   }
   if (userIdx === -1) return null;
-  // Find the first completed assistant response AFTER that user entry
+
   for (let i = userIdx + 1; i < entries.length; i++) {
     const e = entries[i];
-    if (e.type === 'assistant' && e.message?.stop_reason) {
+    if (e.type === 'user' && typeof e.message?.content === 'string') break;
+    if (e.type === 'assistant' && e.message?.stop_reason === 'end_turn') {
       return textFromContent(e.message.content);
     }
   }
-  return null;
+
+  let lastText = null;
+  for (let i = userIdx + 1; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.type === 'user' && typeof e.message?.content === 'string') break;
+    if (e.type === 'assistant') {
+      const t = textFromContent(e.message?.content);
+      if (t) lastText = t;
+    }
+  }
+  return lastText;
 }
 
 // ── Message splitting ────────────────────────────────────────────────
@@ -137,6 +172,270 @@ function splitMessage(text, maxLen = MAX_MSG_LEN) {
   return chunks;
 }
 
+// ── Multi-session: discovery ─────────────────────────────────────────
+
+/** Encode a filesystem path to the format CC uses for project dirs. */
+function encodeCwd(cwd) {
+  return cwd.replace(/[^a-zA-Z0-9-]/g, '-');
+}
+
+/** Find the most recently modified .jsonl transcript for a given cwd (fallback). */
+function findLatestTranscript(cwd) {
+  const projectDir = join(CLAUDE_PROJECTS, encodeCwd(cwd));
+  try {
+    const files = readdirSync(projectDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => { const p = join(projectDir, f); return { p, mtime: statSync(p).mtimeMs }; })
+      .sort((a, b) => b.mtime - a.mtime);
+    return files[0]?.p ?? null;
+  } catch { return null; }
+}
+
+/**
+ * Find the transcript file actually held open by the CC process running in a
+ * given tmux pane.  Walks the process tree rooted at panePid and checks each
+ * descendant's open file descriptors via /proc/<pid>/fd.
+ * Returns null if nothing is found (e.g. non-Linux, or no CC in that pane).
+ */
+function findTranscriptByPid(panePid) {
+  try {
+    // Collect all descendant PIDs (BFS)
+    const visited = new Set();
+    const queue = [String(panePid)];
+    while (queue.length) {
+      const pid = queue.shift();
+      if (visited.has(pid)) continue;
+      visited.add(pid);
+      try {
+        const children = execFileSync('pgrep', ['-P', pid], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+          .trim().split('\n').filter(Boolean);
+        for (const c of children) queue.push(c);
+      } catch {}
+    }
+    // For each descendant, check open fds for a .jsonl under CLAUDE_PROJECTS
+    for (const pid of visited) {
+      const fdDir = `/proc/${pid}/fd`;
+      try {
+        for (const fd of readdirSync(fdDir)) {
+          try {
+            const target = readlinkSync(join(fdDir, fd));
+            if (target.endsWith('.jsonl') && target.startsWith(CLAUDE_PROJECTS)) {
+              return target;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+/** Read the last custom-title entry from a transcript (CC /rename result). */
+function readCustomTitle(transcriptPath) {
+  if (!transcriptPath) return null;
+  try {
+    const lines = readFileSync(transcriptPath, 'utf8').trim().split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const obj = JSON.parse(lines[i]);
+        if (obj.type === 'custom-title' && obj.customTitle) return obj.customTitle;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Determine the display name for a session.
+ * Priority: CC /rename title > tmux window name (if not a shell) > cwd basename
+ */
+function getSessionDisplayName(cwd, windowName, transcriptPath) {
+  const customTitle = readCustomTitle(transcriptPath);
+  if (customTitle) return customTitle;
+  if (windowName && !SHELL_NAMES.has(windowName.toLowerCase())) return windowName;
+  return basename(cwd) || cwd;
+}
+
+/**
+ * Scan all tmux panes for active CC sessions and update the registry.
+ * A pane is considered a CC session if its cwd has a corresponding
+ * ~/.claude/projects/<encoded>/*.jsonl file.
+ */
+function scanTmuxForCC() {
+  try {
+    const output = execFileSync('tmux', [
+      'list-panes', '-a',
+      '-F', '#{session_name}:#{window_index}.#{pane_index}|#{window_name}|#{pane_current_path}|#{pane_pid}',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+
+    const reg = readSessions();
+    const now = Date.now();
+    const activeTmuxTargets = new Set();
+
+    for (const line of output.trim().split('\n')) {
+      if (!line.trim()) continue;
+      const parts = line.split('|');
+      if (parts.length < 4) continue;
+      const [tmuxStr, windowName, cwd, panePid] = parts;
+      if (!cwd) continue;
+
+      // Try to find transcript via open file descriptors first (precise),
+      // fall back to latest-modified file in project dir (may collide for same cwd)
+      const transcriptPath = findTranscriptByPid(panePid) || findLatestTranscript(cwd);
+      if (!transcriptPath) continue; // not a CC project pane
+
+      activeTmuxTargets.add(tmuxStr);
+
+      // Already registered — refresh transcript path and lastSeen
+      const existing = Object.entries(reg.sessions).find(([, s]) => s.tmux === tmuxStr);
+      if (existing) {
+        reg.sessions[existing[0]].lastSeen = now;
+        reg.sessions[existing[0]].transcriptPath = transcriptPath;
+        // Refresh name in case user renamed after initial registration
+        const newName = getSessionDisplayName(cwd, windowName, transcriptPath);
+        if (newName !== existing[0] && !reg.sessions[newName]) {
+          reg.sessions[newName] = { ...reg.sessions[existing[0]], lastSeen: now };
+          if (reg.active === existing[0]) reg.active = newName;
+          delete reg.sessions[existing[0]];
+        }
+        continue;
+      }
+
+      // New session — derive name and add
+      const baseName = getSessionDisplayName(cwd, windowName, transcriptPath);
+      let name = baseName;
+      let suffix = 2;
+      while (reg.sessions[name]) name = `${baseName}-${suffix++}`;
+
+      reg.sessions[name] = { tmux: tmuxStr, cwd, transcriptPath, lastSeen: now };
+      logger.info(`Auto-discovered CC session: ${name} [${tmuxStr}]`);
+    }
+
+    // Prune sessions not seen in 2 scan intervals
+    for (const [name, s] of Object.entries(reg.sessions)) {
+      if (!activeTmuxTargets.has(s.tmux) && now - (s.lastSeen || 0) > SCAN_INTERVAL * 2) {
+        logger.info(`Removing stale session: ${name}`);
+        if (reg.active === name) reg.active = null;
+        delete reg.sessions[name];
+      }
+    }
+
+    // Pick a default active session if none set
+    if (!reg.active || !reg.sessions[reg.active]) {
+      const first = Object.keys(reg.sessions)[0];
+      if (first) { reg.active = first; logger.info(`Active session defaulted to: ${first}`); }
+    }
+
+    writeSessions(reg);
+  } catch (err) {
+    logger.debug('tmux scan error', { error: err.message });
+  }
+}
+
+// ── Multi-session: WeChat bridge commands ────────────────────────────
+
+function formatSessionList(reg) {
+  const names = Object.keys(reg.sessions);
+  if (names.length === 0) return '暂无发现活跃的 CC session\n（等待自动扫描，约30秒）';
+  const home = homedir();
+  const lines = ['📋 CC Sessions:'];
+  names.forEach((name, i) => {
+    const s = reg.sessions[name];
+    const marker = name === reg.active ? '▶' : '○';
+    const shortPath = s.cwd.replace(home, '~');
+    lines.push(`${marker} ${i + 1}. ${name}  [${s.tmux}]\n   ${shortPath}`);
+  });
+  lines.push(`\n当前: ${reg.active || '无'}`);
+  lines.push('切换: #sw <名字> 或 #sw <序号>');
+  return lines.join('\n');
+}
+
+/** Extract the last N human↔assistant conversation rounds from a transcript. */
+function getContextReplay(transcriptPath, rounds = CONTEXT_ROUNDS) {
+  const entries = parseTranscript(transcriptPath);
+  const pairs = [];
+  let i = entries.length - 1;
+
+  while (i >= 0 && pairs.length < rounds) {
+    while (i >= 0 && entries[i].type !== 'assistant') i--;
+    if (i < 0) break;
+    const assistantText = textFromContent(entries[i].message?.content);
+    i--;
+    while (i >= 0 && entries[i].type !== 'user') i--;
+    const userText = i >= 0 ? textFromContent(entries[i].message?.content) : null;
+    if (i >= 0) i--;
+    if (assistantText) pairs.unshift({ user: userText, assistant: assistantText });
+  }
+
+  if (pairs.length === 0) return '（暂无对话记录）';
+  const lines = [`📜 最近 ${pairs.length} 轮对话:`];
+  for (const { user, assistant } of pairs) {
+    if (user) lines.push(`\n👤 ${user.slice(0, 150)}`);
+    lines.push(`🤖 ${assistant.slice(0, 400)}`);
+  }
+  return lines.join('\n');
+}
+
+async function handleBridgeCommand(text, sender) {
+  const send = (msg) => sender.sendText(targetUserId, contextToken, msg)
+    .catch(err => logger.error('Bridge command reply failed', { error: err.message }));
+
+  const parts = text.trim().split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  // #ls / #sessions — list all sessions
+  if (cmd === '#ls' || cmd === '#sessions') {
+    const reg = readSessions();
+    await send(formatSessionList(reg));
+    return;
+  }
+
+  // #sw <name|number> — switch active session
+  if (cmd === '#sw') {
+    const arg = parts.slice(1).join(' ').trim();
+    if (!arg) { await send('用法: #sw <session名> 或 #sw <序号>'); return; }
+
+    const reg = readSessions();
+    const names = Object.keys(reg.sessions);
+    let targetName = null;
+
+    const num = parseInt(arg, 10);
+    if (!isNaN(num) && num >= 1 && num <= names.length) {
+      targetName = names[num - 1];
+    } else {
+      targetName = names.find(n => n.toLowerCase() === arg.toLowerCase())
+        ?? names.find(n => n.toLowerCase().includes(arg.toLowerCase()));
+    }
+
+    if (!targetName) {
+      await send(`找不到 session: "${arg}"\n\n${formatSessionList(reg)}`);
+      return;
+    }
+    if (targetName === reg.active) {
+      await send(`已经在 ${targetName} 了`);
+      return;
+    }
+
+    reg.active = targetName;
+    writeSessions(reg);
+
+    // Reset injection state for the new session
+    lastInjectedText = null;
+    lastPushedText = null;
+    saveSession({ targetUserId, lastInjectedText: null });
+
+    const s = reg.sessions[targetName];
+    const replay = getContextReplay(s.transcriptPath);
+    const switchMsg = `✅ 已切换到: ${targetName} [${s.tmux}]\n\n${replay}`;
+    for (const chunk of splitMessage(switchMsg)) await send(chunk);
+
+    logger.info(`Switched active session to: ${targetName}`);
+    return;
+  }
+
+  await send(`未知指令: ${text}\n可用:\n  #ls — 列出 sessions\n  #sw <名字/序号> — 切换`);
+}
+
 // ── Injection state machine ──────────────────────────────────────────
 function cancelPending() {
   if (injectTimer) { clearTimeout(injectTimer); injectTimer = null; }
@@ -146,7 +445,7 @@ function scheduleInject() {
   cancelPending();
   if (!pendingText) return;
   injectTimer = setTimeout(() => {
-    const state = readState();
+    const state = getActiveState();
     const target = tmuxTarget(state);
     if (!target || !paneExists(target)) {
       logger.warn('Cannot inject: tmux target unavailable', { target });
@@ -169,23 +468,20 @@ function scheduleInject() {
 // ── Hook event handlers ──────────────────────────────────────────────
 async function onStop(payload, sender) {
   ccBusy = false;
-  const state = readState();
+  const state = getActiveState();
   const tpath = payload.transcript_path || state.transcriptPath;
   if (!tpath) { scheduleInject(); return; }
 
-  // Only process Stop from the target CC session (ignore other sessions' Stop hooks)
   if (state.transcriptPath && tpath !== state.transcriptPath) {
     logger.debug('Stop from foreign session, ignoring', { tpath: tpath.slice(-60) });
-    return;  // Don't scheduleInject — this Stop isn't from our target
+    return;
   }
 
   logger.info('Stop hook received', { transcript_path: tpath.slice(-60) });
 
   const entries = parseTranscript(tpath);
-
   let responseText = findResponseToInjected(entries, lastInjectedText);
 
-  // Retry once after 500ms if response not found yet (transcript write race)
   if (!responseText && lastInjectedText) {
     await new Promise(r => setTimeout(r, 500));
     const entries2 = parseTranscript(tpath);
@@ -200,21 +496,17 @@ async function onStop(payload, sender) {
 
   if (responseText && responseText !== lastPushedText) {
     if (lastInjectedText) {
-      // Found response to our injected WeChat message — push it
       lastPushedText = responseText;
       lastInjectedText = null;
       saveSession({ targetUserId, lastInjectedText: null });
-      const assistantText = responseText;
-
-      appendHistory({ type: 'assistant', text: assistantText.slice(0, 500) });
-
-      const chunks = splitMessage(assistantText);
+      appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
+      const chunks = splitMessage(responseText);
       for (const chunk of chunks) {
         sender.sendText(targetUserId, contextToken, chunk).catch(err => {
           logger.error('Push to WeChat failed', { error: err.message });
         });
       }
-      logger.info('Pushed response to WeChat', { chars: assistantText.length });
+      logger.info('Pushed response to WeChat', { chars: responseText.length });
     }
   }
 
@@ -225,8 +517,8 @@ function onPreToolUse(payload, sender) {
   ccBusy = true;
   cancelPending();
 
-  const state = readState();
-  if (!state.autoApprove) return undefined;  // let CC show normal permission dialog
+  const state = getActiveState();
+  if (!state.autoApprove) return undefined;
 
   const toolName  = payload.tool_name || '?';
   const toolInput = payload.tool_input || {};
@@ -248,12 +540,9 @@ function onPreToolUse(payload, sender) {
 async function onNotification(payload, sender) {
   const msg = payload.message || '';
 
-  // "waiting for input" = CC is idle. If we still have a pending injected text,
-  // the Stop hook may have fired too early (before the final response was written).
-  // Re-read the transcript now to catch the response.
   if (msg.includes('waiting for your input') && lastInjectedText) {
     logger.info('Notification: idle + pending lastInjected, re-reading transcript');
-    const state = readState();
+    const state = getActiveState();
     const tpath = state.transcriptPath;
     if (tpath) {
       const entries = parseTranscript(tpath);
@@ -288,7 +577,7 @@ function startHookServer(sender) {
   try { unlinkSync(HOOK_SOCKET); } catch {}
 
   const server = net.createServer(conn => {
-    conn.on('error', () => {});  // swallow EPIPE / ECONNRESET
+    conn.on('error', () => {});
     const chunks = [];
     conn.on('data', d => chunks.push(d));
     conn.on('end', () => {
@@ -299,8 +588,8 @@ function startHookServer(sender) {
       const hookType = payload._hookType || '';
       let reply;
       try {
-        if (hookType === 'stop')           onStop(payload, sender);
-        else if (hookType === 'pretooluse') reply = onPreToolUse(payload, sender);
+        if (hookType === 'stop')              onStop(payload, sender);
+        else if (hookType === 'pretooluse')   reply = onPreToolUse(payload, sender);
         else if (hookType === 'notification') onNotification(payload, sender);
         else logger.debug('Unknown hook type', { hookType });
       } catch (err) {
@@ -308,11 +597,8 @@ function startHookServer(sender) {
       }
 
       try {
-        if (reply !== undefined) {
-          conn.end(JSON.stringify(reply));
-        } else {
-          conn.destroy();
-        }
+        if (reply !== undefined) conn.end(JSON.stringify(reply));
+        else conn.destroy();
       } catch { conn.destroy(); }
     });
   });
@@ -338,7 +624,13 @@ function handleWeChatMessage(msg, sender) {
 
   logger.info('WeChat message', { from: targetUserId, text: text.slice(0, 80) });
 
-  // Queue for tmux injection
+  // Intercept bridge commands (# prefix) — never injected into CC
+  if (text.trimStart().startsWith('#')) {
+    handleBridgeCommand(text.trim(), sender);
+    return;
+  }
+
+  // Queue for tmux injection into active CC session
   pendingText = text;
   if (!ccBusy) {
     scheduleInject();
@@ -351,32 +643,31 @@ function handleWeChatMessage(msg, sender) {
 async function main() {
   mkdirSync(CC_WECHAT, { recursive: true });
 
-  // Load account
   const account = loadLatestAccount();
   if (!account) {
     console.error('No account found. Run login first.');
     process.exit(1);
   }
 
-  // Restore persisted session
   const session = loadSession();
   targetUserId     = session.targetUserId || '';
   lastInjectedText = session.lastInjectedText || null;
 
-  // Create API + sender
   const api    = new WeChatApi(account.botToken, account.baseUrl);
   const sender = createSender(api, account.accountId);
 
-  // Start hook server
   const hookServer = startHookServer(sender);
 
-  // Log state
-  const state  = readState();
-  const target = tmuxTarget(state);
-  console.log(`[wrc-bridge] inject target: ${target || 'NONE'}, autoApprove=${state.autoApprove ?? false}`);
-  logger.info('Bridge started', { accountId: account.accountId, target, autoApprove: state.autoApprove });
+  // Initial tmux scan then periodic
+  scanTmuxForCC();
+  setInterval(scanTmuxForCC, SCAN_INTERVAL);
 
-  // Start WeChat poll loop
+  const state  = getActiveState();
+  const target = tmuxTarget(state);
+  const reg    = readSessions();
+  console.log(`[wrc-bridge] active session: ${reg.active || 'NONE'} → ${target || 'NONE'}`);
+  logger.info('Bridge started', { accountId: account.accountId, active: reg.active, target });
+
   const monitor = createMonitor(api, {
     onMessage: async (msg) => { handleWeChatMessage(msg, sender); },
     onSessionExpired: () => {
@@ -387,7 +678,6 @@ async function main() {
 
   console.log('[wrc-bridge] starting WeChat poll loop...');
 
-  // Graceful shutdown
   function shutdown() {
     logger.info('Shutting down');
     monitor.stop();

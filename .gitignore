@@ -1,3 +1,5 @@
 node_modules/
 __pycache__/
 *.pyc
+package-lock.json
+dist_archive.tar.gz

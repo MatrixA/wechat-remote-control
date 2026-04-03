@@ -134,19 +134,23 @@ If `state.json` shows `active: true` and `injectTarget` exists, show the user:
 
 Default: **Y** (override). If user says no, stop.
 
-### Step 3: Write state.json
+### Step 3: Write state.json and bridge.json
 
-Detect the current tmux target and transcript path automatically:
+Detect the current tmux target and transcript path automatically.
+`$PPID` in the bash subprocess is the CC process PID — capture it for the status bar.
 
 ```bash
 SESSION=$(tmux display-message -p '#S')
 WINDOW=$(tmux display-message -p '#I')
 PANE=$(tmux display-message -p '#P')
 CWD=$(pwd)
+CC_PID=$PPID
 ENCODED=$(echo "$CWD" | sed 's|[^a-zA-Z0-9-]|-|g')
 TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$ENCODED"/*.jsonl 2>/dev/null | head -1)
+SESSION_ID=$(basename "$TRANSCRIPT" .jsonl 2>/dev/null)
 python3 -c "
-import json, os, time
+import json, os, time, datetime
+# Write state.json (tmux injection model)
 state = {
     'injectTarget': {
         'session': '$SESSION',
@@ -161,7 +165,20 @@ state = {
 os.makedirs(os.path.expanduser('~/.cc_wechat'), exist_ok=True)
 with open(os.path.expanduser('~/.cc_wechat/state.json'), 'w') as f:
     json.dump(state, f, indent=2)
-print('OK: target=' + '$SESSION:$WINDOW.$PANE')
+# Write bridge.json (bridge-watcher model + ccPid for status bar)
+os.makedirs(os.path.expanduser('~/.wechat-bridge'), exist_ok=True)
+bridge = {
+    'sessionId': '$SESSION_ID',
+    'cwd': '$CWD',
+    'ccPid': $CC_PID,
+    'attachedAt': datetime.datetime.now(datetime.timezone.utc).isoformat()
+}
+with open(os.path.expanduser('~/.wechat-bridge/bridge.json'), 'w') as f:
+    json.dump(bridge, f, indent=2)
+# Store ccPid separately so bridge daemon updates don't overwrite it
+with open(os.path.expanduser('~/.wechat-bridge/cc_pid'), 'w') as f:
+    f.write(str($CC_PID))
+print('OK: target=' + '$SESSION:$WINDOW.$PANE' + ' ccPid=$CC_PID')
 "
 ```
 
@@ -182,44 +199,73 @@ Target hooks config:
 
 If hooks are already present with the same commands, skip this step.
 
-### Step 5: Start/restart the bridge daemon
+### Step 5: Configure status line in settings.json
 
-**Call 1 — kill existing** (separate bash call):
+Check if `statusLine` is already configured. If not (or if the command points elsewhere),
+merge it into `~/.claude/settings.json` without overwriting other settings:
 
 ```bash
 python3 -c "
-import os, signal
-me, parent = os.getpid(), os.getppid()
-for p in os.listdir('/proc'):
-    if not p.isdigit(): continue
-    ip = int(p)
-    if ip == me or ip == parent: continue
-    try:
-        cmd = open(f'/proc/{p}/cmdline','rb').read().decode()
-        if 'node' in cmd and ('wechat-remote-control/src/index' in cmd or 'wechat-bridge/src/index' in cmd or 'wechat-bridge/dist/main' in cmd):
-            os.kill(ip, signal.SIGTERM)
-            print(f'Killed {ip}')
-    except: pass
-print('Done')
+import json, os
+path = os.path.expanduser('~/.claude/settings.json')
+settings = json.load(open(path)) if os.path.exists(path) else {}
+desired = {
+    'type': 'command',
+    'command': 'bash \$HOME/.claude/skills/wechat-remote-control/status.sh'
+}
+if settings.get('statusLine') == desired:
+    print('ALREADY_SET')
+else:
+    settings['statusLine'] = desired
+    with open(path, 'w') as f:
+        json.dump(settings, f, indent=2)
+    print('OK')
 "
 ```
 
-**Call 2 — start daemon** (separate bash call):
+If `ALREADY_SET`, skip silently.
+
+### Step 6: Ensure bridge daemon is running (service model)
+
+The bridge is a singleton service. Check if it's already running via PID file before starting.
+Never kill a healthy bridge just because attach was called again.
+
+**Check existing daemon:**
+
+```bash
+PID_FILE="$HOME/.wechat-bridge/bridge.pid"
+BRIDGE_RUNNING=0
+if [ -f "$PID_FILE" ]; then
+    STORED_PID=$(cat "$PID_FILE")
+    if kill -0 "$STORED_PID" 2>/dev/null; then
+        echo "already running PID=$STORED_PID"
+        BRIDGE_RUNNING=1
+    else
+        echo "stale PID file, cleaning up"
+        rm -f "$PID_FILE"
+    fi
+fi
+echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
+```
+
+**Only if BRIDGE_RUNNING=0 — start daemon** (separate bash call):
 
 ```bash
 nohup node $HOME/.claude/skills/wechat-remote-control/src/index.js >> /tmp/cc_wechat_bridge.log 2>&1 &
-echo "PID=$!"
+NEW_PID=$!
+echo $NEW_PID > $HOME/.wechat-bridge/bridge.pid
+echo "PID=$NEW_PID"
 ```
 
-**Call 3 — verify** (after ~3 seconds):
+**Verify** (after ~3 seconds):
 
 ```bash
-kill -0 <PID> 2>/dev/null && echo "running" || echo "FAILED"
+kill -0 <NEW_PID> 2>/dev/null && echo "running" || echo "FAILED"
 ```
 
 If FAILED: read the last 30 lines of `/tmp/cc_wechat_bridge.log` and diagnose.
 
-### Step 6: Report success
+### Step 7: Report success
 
 ```
 WeChat Remote Control activated
