@@ -1,0 +1,167 @@
+# wechat-remote-control
+
+> Chat with Claude Code from WeChat — a Claude Code Skill that bridges your personal WeChat to a local Claude Code session running in tmux.
+>
+> 用微信遥控你电脑里跑着的 Claude Code —— 走开了也能继续指挥 / 收回执。
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](https://nodejs.org/)
+[![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-8a4cf2)](https://docs.claude.com/en/docs/claude-code/skills)
+
+---
+
+## What it does / 它做什么
+
+When you're away from your terminal but a Claude Code task is still running — long refactor, batch analysis, slow tool calls — you can register the current CC session as a "WeChat remote target" and continue interacting from your phone:
+
+- 微信对话框里发什么，就被 `tmux send-keys` 注入到本地 CC 所在的 pane
+- CC 的回复（带 tool call 摘要、报错、文件 diff）通过 hook 转发回微信
+- 终端那边的本地输入 **不会** 被反向广播到微信，避免泄漏交互
+
+---
+
+## Architecture / 架构
+
+```
++---------+       +-------------------+       +---------------+       +-------------+
+| WeChat  | <---> |  ilink long-poll  | <---> | bridge daemon | <---> | tmux + CC   |
+| (phone) |       |  (cloud)          |       | (this repo)   |  PTY  | (your Mac)  |
++---------+       +-------------------+       +-------------------+   +-------------+
+                                                       ^
+                                                       | Unix socket
+                                                       |
+                                                CC hooks (hook.py)
+```
+
+- **Bridge daemon** (`src/index.js` → `dist/...`): polls ilink WeChat API for messages and injects them into the user's tmux-hosted CC session via `tmux send-keys`.
+- **Hook server**: listens on Unix socket `/tmp/cc_wechat_hook.sock`. CC hooks (PreToolUse / Stop / Notification) send events here via `hook.py`.
+- **Response forwarding**: on Stop / Notification, reads the CC transcript JSONL, finds the response to the injected WeChat message, and forwards it to WeChat. Terminal-initiated responses are not forwarded.
+- **All state lives in one directory** — `~/.wechat-remote-control/`:
+  - `accounts/<accountId>.json` — WeChat credentials
+  - `state.json` / `sessions.json` — attach target & multi-session registry
+  - `ilink_session.json` — long-poll cursor
+  - `bridge.json` / `bridge.pid` / `cc_pid` — daemon metadata
+  - `logs/bridge-YYYY-MM-DD.log` — rotated logs (30-day retention)
+  - `history.jsonl` — injected messages and forwarded responses
+
+---
+
+## Requirements / 依赖
+
+- **macOS or Linux** with `tmux` installed
+- **Node.js ≥ 18** (ESM imports are used throughout the bridge)
+- **Python 3** (used by `detect.py` for `/proc` / `ps` ancestry walk and by `hook.py`)
+- **A working WeChat account** that can scan QR codes (the QR rotates every ~60 s; the skill auto-refreshes)
+- **Claude Code** running inside a tmux pane
+
+> ❌ Cloud / remote Claude Code sessions (those with `CLAUDE_CODE_REMOTE=true`) are not supported — the bridge needs local tmux + Unix sockets.
+
+---
+
+## Install as a Claude Code Skill / 作为 Claude Code Skill 安装
+
+### Option A — `npx skills` (recommended / 推荐)
+
+[`npx skills`](https://github.com/vercel-labs/skills) is a community package manager for agent skills that uses GitHub as its registry. One command installs this skill into `~/.claude/skills/`:
+
+```bash
+npx skills add MatrixA/wechat-remote-control
+cd ~/.claude/skills/wechat-remote-control
+npm install --production    # builds dist/ via postinstall
+```
+
+To target a specific agent, pass `-a`:
+
+```bash
+npx skills add MatrixA/wechat-remote-control -a claude-code
+```
+
+You can list / update / remove later with `npx skills list`, `npx skills update`, `npx skills remove`.
+
+### Option B — manual clone
+
+```bash
+git clone https://github.com/MatrixA/wechat-remote-control.git ~/.claude/skills/wechat-remote-control
+cd ~/.claude/skills/wechat-remote-control
+npm install --production    # also runs `tsc` via postinstall to refresh dist/
+```
+
+### Then use it
+
+Inside a tmux-hosted Claude Code session:
+
+```
+/wechat-remote-control login    # one-time WeChat QR login
+/wechat-remote-control attach   # register this CC session as the WeChat remote target
+/wechat-remote-control sync     # show WeChat history since last attach (for context)
+```
+
+If you just type `/wechat-remote-control` with no arg, it defaults to **attach**.
+
+> The skill itself is driven by `SKILL.md`. Read that file for the full operational runbook (environment checks, QR rotation handling, error recovery).
+
+---
+
+## Three sub-commands / 三个子命令
+
+### `login`
+
+Authenticate a WeChat account by scanning a QR code printed in the terminal. Run once before first use, or whenever the bridge reports session expiry. Credentials are saved to `~/.wechat-remote-control/accounts/<accountId>.json`. The QR auto-refreshes if you don't scan in time.
+
+### `attach`
+
+Registers the current Claude Code session as the WeChat remote target.
+
+1. `detect.py` walks the `/proc` parent chain (Linux) or `ps` ancestry (macOS) up from the bash subprocess, finds the actual `claude` process, and verifies it lives inside a `tmux list-panes -a` pane.
+2. Writes `state.json` / `bridge.json` / `sessions.json` so the daemon knows which pane to inject into.
+3. Starts the bridge daemon in the background (single-instance — re-attaching from another session moves the target).
+4. Sends a welcome message to the linked WeChat user so they know the channel is live.
+
+### `sync`
+
+Renders WeChat conversation history since last attach as a readable transcript, so a fresh CC session can pick up where the last one left off.
+
+---
+
+## Repository layout / 目录结构
+
+```
+wechat-remote-control/
+├── SKILL.md              # Claude Code skill entry — full runbook for login / attach / sync
+├── package.json          # node deps + build scripts
+├── tsconfig.json
+├── src/                  # TypeScript: bridge, tmux injection, ilink client, command router
+├── dist/                 # Pre-built JS — SKILL.md references these paths directly
+├── detect.py             # /proc + ps cross-platform CC-in-tmux detector
+├── hook.py               # Claude Code hook entry — ships PreToolUse/Stop/Notification events
+├── format_history.py     # Render history.jsonl into human-readable text
+├── status.sh             # Quick status check (bridge / account / session)
+└── .gitignore
+```
+
+---
+
+## Security notes / 安全说明
+
+- **Local-only state.** All credentials and session data live in `~/.wechat-remote-control/` on your machine. Nothing is uploaded except WeChat API traffic.
+- **Terminal isolation.** Local terminal input is never forwarded to WeChat. Only responses to messages that originated from WeChat are sent back.
+- **Process safety.** The bridge uses Python `/proc` scanning instead of `pgrep -f` because Claude Code wraps commands in `bash -c "..."` — `pgrep -f` would match the wrapper shell and could kill the wrong process.
+- **Auto-approve scope.** When `state.json` has `autoApprove: true`, hook events approve tool calls inline. This is convenient but means anyone with access to your WeChat account can trigger actions in your local CC. Treat this skill like SSH access to your machine.
+
+---
+
+## License / 许可证
+
+MIT — see [LICENSE](./LICENSE).
+
+---
+
+## Contributing
+
+Issues and PRs welcome. If you hit a bug, please include:
+
+- Output of `bash status.sh`
+- Last 50 lines of `~/.wechat-remote-control/logs/bridge-*.log`
+- Your `tmux -V`, `node --version`, and OS
+
+如果你想加新功能（图片 / 语音转发、群聊支持等）欢迎先开 Issue 讨论。
