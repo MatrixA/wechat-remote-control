@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type {
   GetUpdatesResp,
   SendMessageReq,
+  GetUploadUrlReq,
   GetUploadUrlResp,
 } from './types.js';
 import { logger } from '../logger.js';
@@ -98,15 +99,41 @@ export class WeChatApi {
     await this.request('ilink/bot/sendmessage', req);
   }
 
-  /** Get a presigned upload URL for media files. */
-  async getUploadUrl(
-    fileType: string,
-    fileSize: number,
-    fileName: string,
-  ): Promise<GetUploadUrlResp> {
-    return this.request<GetUploadUrlResp>(
-      'ilink/bot/getuploadurl',
-      { file_type: fileType, file_size: fileSize, file_name: fileName },
+  /**
+   * Get a presigned upload URL for media files.
+   * Matches the real API: filekey, media_type, to_user_id, rawsize, rawfilemd5,
+   * filesize, no_need_thumb, aeskey.
+   */
+  async getUploadUrl(req: GetUploadUrlReq): Promise<GetUploadUrlResp> {
+    return this.request<GetUploadUrlResp>('ilink/bot/getuploadurl', req);
+  }
+
+  /** Fetch bot config (includes typing_ticket) for a given user. */
+  async getConfig(
+    ilinkUserId: string,
+    contextToken: string,
+  ): Promise<{ ret?: number; typing_ticket?: string }> {
+    return this.request(
+      'ilink/bot/getconfig',
+      { ilink_user_id: ilinkUserId, context_token: contextToken },
+      10_000,
+    );
+  }
+
+  /** Send a typing indicator to a user. status=1 for typing, status=2 to cancel. */
+  async sendTyping(
+    toUserId: string,
+    typingTicket: string,
+    status: 1 | 2 = 1,
+  ): Promise<void> {
+    await this.request(
+      'ilink/bot/sendtyping',
+      {
+        ilink_user_id: toUserId,
+        typing_ticket: typingTicket,
+        status,
+      },
+      10_000,
     );
   }
 }

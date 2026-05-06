@@ -4,9 +4,9 @@ export function generateAesKey(): string {
   return randomBytes(16).toString("base64");
 }
 
+/** Compute AES-128-ECB ciphertext size with PKCS7 padding (always adds at least 1 byte). */
 export function aesEcbPaddedSize(size: number): number {
-  const block = 16;
-  return Math.floor((size + block - 1) / block) * block;
+  return Math.ceil((size + 1) / 16) * 16;
 }
 
 export function encryptAesEcb(key: Buffer, plaintext: Buffer): Buffer {

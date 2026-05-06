@@ -1,6 +1,7 @@
 {
-  "name": "wechat-claude-code",
+  "name": "wechat-remote-control",
   "version": "1.0.0",
+  "private": true,
   "description": "Chat with Claude Code from WeChat - a Claude Code Skill that bridges personal WeChat to local Claude Code",
   "type": "module",
   "scripts": {
@@ -32,10 +33,10 @@
     "chat",
     "skill"
   ],
-  "author": "Wechat-ggGitHub",
+  "author": "MatrixA",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Wechat-ggGitHub/wechat-claude-code.git"
+    "url": "https://github.com/MatrixA/wechat-remote-control.git"
   }
 }

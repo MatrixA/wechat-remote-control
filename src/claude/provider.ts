@@ -68,15 +68,21 @@ async function* singleUserMessage(
   text: string,
   images?: QueryOptions["images"],
 ): AsyncGenerator<SDKUserMessage, void, unknown> {
-  const contentBlocks: Array<{
-    type: string;
-    text?: string;
-    source?: { type: "base64"; media_type: string; data: string };
-  }> = [{ type: "text", text }];
+  const contentBlocks: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; source: { type: "base64"; media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp"; data: string } }
+  > = [{ type: "text", text }];
 
   if (images?.length) {
     for (const img of images) {
-      contentBlocks.push({ type: "image", source: img.source });
+      contentBlocks.push({
+        type: "image",
+        source: {
+          type: "base64" as const,
+          media_type: img.source.media_type as "image/png" | "image/jpeg" | "image/gif" | "image/webp",
+          data: img.source.data,
+        },
+      });
     }
   }
 

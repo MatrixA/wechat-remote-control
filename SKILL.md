@@ -1,6 +1,6 @@
 ---
 name: wechat-remote-control
-version: 2.0.0
+version: 1.0.0
 description: |
   WeChat Remote Control for Claude Code. Three sub-commands:
   - login:  Authenticate WeChat account (scan QR code). Run once before first use
@@ -40,7 +40,10 @@ The bridge uses a **tmux-injection** model, bundled in this skill directory.
   responses are NOT forwarded.
 - **All state lives in one directory**: `~/.wechat-remote-control/`
   - `accounts/<accountId>.json` — WeChat credentials
-  - `state.json` — tmux target, autoApprove, transcriptPath
+  - `state.json` — tmux target, autoApprove, transcriptPath (legacy single-session)
+  - `sessions.json` — multi-session registry (active session + per-tmux-target metadata)
+  - `ilink_session.json` — ilink long-poll session cache
+  - `get_updates_buf` — ilink sync buffer cursor
   - `bridge.json` / `bridge.pid` / `cc_pid` — daemon metadata
   - `logs/bridge-YYYY-MM-DD.log` — rotated logs (30-day retention)
   - `history.jsonl` — injected messages and forwarded responses
@@ -49,6 +52,20 @@ The bridge uses a **tmux-injection** model, bundled in this skill directory.
 in the same bash command that does other work. Claude Code wraps commands in `bash -c "..."`,
 so the pattern matches the shell itself, causing self-termination. Always use the Python
 `/proc` scanner shown below, in a **separate** bash call from the start command.
+
+**Environment variables this skill respects:**
+- `CLAUDECODE=1` — set by Claude Code in spawned shells. Used to confirm we are running
+  inside CC before doing anything.
+- `CLAUDE_CODE_REMOTE=true` — set in cloud sessions. The bridge cannot work in cloud
+  (no local tmux), so the skill refuses early with a clear message.
+- `CLAUDE_CONFIG_DIR` — relocates `~/.claude/` (undocumented but supported by Claude
+  Code; see anthropics/claude-code#3833). Both `detect.py` and the bridge daemon honour
+  it when looking up `<config>/projects/<encoded-cwd>/*.jsonl` transcript files.
+
+**Helpers:**
+- `detect.py` walks `/proc` (Linux) or `ps` (macOS) up from the bash subprocess to find
+  the `claude` ancestor process, then verifies it lives inside a `tmux list-panes -a`
+  pane. Used by attach Step 1 (preflight) and Step 3 (state-file writer).
 
 ---
 
@@ -68,6 +85,10 @@ or if this was triggered by a session expiry. If they're just setting up fresh, 
 ### Step 2: Locate skill directory and ensure dependencies
 
 ```bash
+echo "=== node/npm prereq ==="
+command -v node >/dev/null && node --version || echo "NO_NODE"
+command -v npm  >/dev/null && npm  --version || echo "NO_NPM"
+echo "=== skill dir ==="
 SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name "login.js" 2>/dev/null \
   | grep "wechat-remote-control/dist/wechat/login.js" | head -1 \
   | sed 's|/dist/wechat/login.js||')
@@ -75,66 +96,125 @@ echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
 test -d "$SKILL_DIR/node_modules/qrcode" && echo "qrcode: OK" || echo "qrcode: missing"
 ```
 
-Note the SKILL_DIR value. If qrcode is missing, install it:
+**If `NO_NODE` or `NO_NPM`:** install them yourself — don't push the work onto the user.
+Try the system package manager that's available, in this order, and stop on first success:
 
 ```bash
-cd "$SKILL_DIR" && npm install --production --ignore-scripts 2>&1 | tail -3
+if command -v apt-get >/dev/null; then sudo -n apt-get install -y -qq nodejs npm 2>&1 | tail -3 || apt-get install -y -qq nodejs npm 2>&1 | tail -3
+elif command -v dnf     >/dev/null; then sudo -n dnf     install -y    nodejs npm 2>&1 | tail -3 || dnf     install -y    nodejs npm 2>&1 | tail -3
+elif command -v pacman  >/dev/null; then sudo -n pacman  -S --noconfirm nodejs npm 2>&1 | tail -3 || pacman  -S --noconfirm nodejs npm 2>&1 | tail -3
+elif command -v brew    >/dev/null; then brew    install                node       2>&1 | tail -3
+else                                    echo "NO_PKG_MGR"
+fi
+node --version 2>/dev/null && npm --version 2>/dev/null || echo "INSTALL_FAILED"
 ```
 
-### Step 3: Fetch QR code and display
+Then verify Node ≥ 18 with `node --version`. If it's older (e.g. Debian 11 ships
+Node 12), tell the user to upgrade via nvm or NodeSource — older Node breaks ESM imports
+the bridge uses. If `INSTALL_FAILED` or `NO_PKG_MGR`, ask the user to install Node ≥ 18
+manually then re-run **login**.
 
-Replace `SKILL_DIR` with the actual path found above, then run:
+Note the SKILL_DIR value. If qrcode is missing, install it (quietly):
 
 ```bash
-node --input-type=module -e "
+cd "$SKILL_DIR" && npm install --production --ignore-scripts --no-audit --no-fund 2>&1 | tail -3
+```
+
+### Step 3: Launch background QR-login process (auto-retries on expiry)
+
+The QR is short-lived (~60s). To survive slow scans without forcing the user to start
+over, we run the login loop in a **detached background process** that re-requests a
+fresh QR whenever the previous one expires, and writes its progress to two files the
+foreground polls.
+
+Replace `SKILL_DIR` with the actual path, then run:
+
+```bash
+QR_INFO=/tmp/wrc_qr_info.json
+QR_RESULT=/tmp/wrc_qr_result.json
+rm -f "$QR_INFO" "$QR_RESULT"
+
+nohup node --input-type=module -e "
   import { createRequire } from 'module';
-  import { startQrLogin } from 'SKILL_DIR/dist/wechat/login.js';
+  import { writeFileSync } from 'fs';
+  import { startQrLogin, waitForQrScan } from 'SKILL_DIR/dist/wechat/login.js';
+  const require = createRequire('SKILL_DIR/package.json');
+  let QRCode = null; try { QRCode = require('qrcode'); } catch {}
+  const renderQr = (url) => QRCode
+    ? new Promise(r => QRCode.toString(url, { type:'utf8', small:true, margin:0 }, (e,s)=>r(e?null:s)))
+    : Promise.resolve(null);
 
-  const { qrcodeUrl, qrcodeId } = await startQrLogin();
-
-  let qrcodeText = null;
-  try {
-    const require = createRequire('SKILL_DIR/package.json');
-    const QRCode = require('qrcode');
-    qrcodeText = await new Promise((res, rej) =>
-      QRCode.toString(qrcodeUrl, { type: 'utf8', small: true, margin: 0 }, (e, s) => e ? rej(e) : res(s))
-    );
-  } catch(e) {
-    // qrcode not available
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const { qrcodeUrl, qrcodeId } = await startQrLogin();
+    const qrcodeText = await renderQr(qrcodeUrl);
+    writeFileSync('$QR_INFO', JSON.stringify({ qrcodeUrl, qrcodeId, qrcodeText, attempt, ts: Date.now() }));
+    try {
+      const result = await waitForQrScan(qrcodeId);
+      writeFileSync('$QR_RESULT', JSON.stringify({ status:'confirmed', accountId: result.accountId }));
+      process.exit(0);
+    } catch (e) {
+      if (!String(e.message).includes('expired')) {
+        writeFileSync('$QR_RESULT', JSON.stringify({ status:'error', error: String(e.message) }));
+        process.exit(1);
+      }
+      // QR expired; loop will request a fresh one.
+    }
   }
-
-  console.log(JSON.stringify({ qrcodeUrl, qrcodeId, qrcodeText }));
-"
+  writeFileSync('$QR_RESULT', JSON.stringify({ status:'error', error:'too many QR retries' }));
+  process.exit(1);
+" > /tmp/wrc_qr.log 2>&1 &
+echo "QR_LOGIN_PID=$!"
 ```
 
-Parse the JSON. Then **in the same reply**, output `qrcodeText` verbatim as a code block,
-then **immediately** run the waitForQrScan command below — do NOT wait for user input.
-Example reply:
+### Step 4: Display QR and poll for scan
+
+Wait for the background process to write the QR info, then read it:
+
+```bash
+for i in 1 2 3 4 5 6; do [ -f /tmp/wrc_qr_info.json ] && break; sleep 1; done
+cat /tmp/wrc_qr_info.json
+```
+
+Parse the JSON. **In the same reply**, output `qrcodeText` verbatim as a code block:
 
 ```
-请用微信扫描以下二维码登录：
+请在 60 秒内用微信扫描以下二维码登录（过期会自动刷新一张新的）：
 
 ​```
 <qrcodeText here>
 ​```
 ```
 
-If `qrcodeText` is null, show the URL instead.
+If `qrcodeText` is null, show `qrcodeUrl` instead. Remember the `attempt` number — you'll
+use it to detect QR rotation.
 
-### Step 4: Wait for scan (run immediately after displaying QR — no user input needed)
-
-Replace `SKILL_DIR` and `QRCODE_ID` with actual values:
+Then poll for the scan result. If the QR rotates (new `attempt`), re-display the new QR:
 
 ```bash
-node --input-type=module -e "
-  import { waitForQrScan } from 'SKILL_DIR/dist/wechat/login.js';
-  const result = await waitForQrScan('QRCODE_ID');
-  console.log(JSON.stringify({ status: 'confirmed', accountId: result.accountId }));
-"
+LAST_ATTEMPT=$(python3 -c "import json; print(json.load(open('/tmp/wrc_qr_info.json'))['attempt'])")
+for i in $(seq 1 24); do
+  if [ -f /tmp/wrc_qr_result.json ]; then
+    cat /tmp/wrc_qr_result.json
+    exit 0
+  fi
+  CUR_ATTEMPT=$(python3 -c "import json; print(json.load(open('/tmp/wrc_qr_info.json'))['attempt'])" 2>/dev/null || echo "$LAST_ATTEMPT")
+  if [ "$CUR_ATTEMPT" != "$LAST_ATTEMPT" ]; then
+    echo "QR_ROTATED"
+    exit 0
+  fi
+  sleep 5
+done
+echo "POLL_TIMEOUT"
 ```
 
-This blocks until the user scans. Allow up to 3 minutes. If it throws "expired", go back
-to Step 3 to get a fresh QR code and display it again.
+Interpret the output:
+
+- **`{"status":"confirmed",...}`** — scan succeeded, proceed to Step 5.
+- **`QR_ROTATED`** — old QR expired and a fresh one is ready. Re-read `/tmp/wrc_qr_info.json`,
+  display the new `qrcodeText` to the user, and re-run this poll loop.
+- **`{"status":"error",...}`** — login failed; report the error and stop.
+- **`POLL_TIMEOUT`** — 2 minutes elapsed without scan or rotation; re-run the poll loop
+  (the user is still scanning).
 
 ### Step 5: Verify and report
 
@@ -150,20 +230,68 @@ If no files: retry from Step 3. Otherwise confirm login success.
 
 ### Step 1: Pre-flight checks (run all in one bash call)
 
+`detect.py` walks the `/proc` parent chain (or `ps` on macOS) from the bash subprocess
+to find the actual `claude` process and verifies it lives inside a tmux pane. This
+replaces the old `tmux display-message` check, which was unreliable: `display-message`
+returns the *focused* client window, not the pane CC lives in, and the old `||
+echo NOT_IN_TMUX` guard never fired (echo always returns 0).
+
 ```bash
 echo "=== bridge installed ==="
 test -f $HOME/.claude/skills/wechat-remote-control/src/index.js && echo "OK" || echo "NOT_FOUND"
 echo "=== account ==="
 ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null | head -1 || echo "NOT_FOUND"
-echo "=== tmux ==="
-echo "SESSION:$(tmux display-message -p '#S' 2>/dev/null); WINDOW:$(tmux display-message -p '#I' 2>/dev/null); PANE:$(tmux display-message -p '#P' 2>/dev/null)" || echo "NOT_IN_TMUX"
+echo "=== detect ==="
+python3 $HOME/.claude/skills/wechat-remote-control/detect.py preflight
 echo "=== existing attach ==="
 cat ~/.wechat-remote-control/state.json 2>/dev/null || echo "{}"
 ```
 
-**If bridge NOT_FOUND:** tell user bridge is not installed, stop.
-**If account NOT_FOUND:** run **login** flow first, then continue.
-**If NOT_IN_TMUX:** tell user they must run CC inside tmux. Stop.
+Interpret the `status=...` line from the detect block:
+
+- **`status=OK`** — proceed. The `tmux_target=...` and `cc_pid=...` values are saved
+  to `/tmp/wrc_detect.json` later in Step 3.
+- **`status=NOT_CLAUDECODE`** — the `CLAUDECODE=1` env var is missing. This shouldn't
+  happen in a real CC session; ask the user how they invoked Claude Code, then stop.
+- **`status=REMOTE_SESSION`** — Claude Code is running as a cloud session
+  (`CLAUDE_CODE_REMOTE=true`). The bridge uses local tmux + Unix sockets and cannot
+  work in cloud. Stop and tell the user to use a local CC instance.
+- **`status=NO_CC_PROCESS`** — no `claude` ancestor was found in `/proc`. Stop and
+  ask the user to confirm CC was started normally (not via wrapper scripts).
+- **`status=NO_TMUX`** — `tmux` is not installed. Install it yourself (don't push the
+  work to the user), then fall through to the `CC_NOT_IN_TMUX` instructions below
+  (because the user still needs to restart CC inside a tmux session — installing tmux
+  doesn't move the already-running CC into one):
+
+  ```bash
+  if command -v apt-get >/dev/null; then sudo -n apt-get install -y -qq tmux 2>&1 | tail -3 || apt-get install -y -qq tmux 2>&1 | tail -3
+  elif command -v dnf     >/dev/null; then sudo -n dnf     install -y    tmux 2>&1 | tail -3 || dnf     install -y    tmux 2>&1 | tail -3
+  elif command -v pacman  >/dev/null; then sudo -n pacman  -S --noconfirm tmux 2>&1 | tail -3 || pacman  -S --noconfirm tmux 2>&1 | tail -3
+  elif command -v brew    >/dev/null; then brew    install               tmux 2>&1 | tail -3
+  else                                    echo "NO_PKG_MGR — please install tmux manually"
+  fi
+  ```
+
+- **`status=CC_NOT_IN_TMUX`** (or after installing tmux above) — **DO NOT silently
+  create a tmux session and proceed.** The bridge injects keystrokes into the tmux
+  pane where CC actually lives; injecting into a different pane silently sends keys
+  nowhere, and we cannot move an already-running CC into a new tmux session. Output
+  exactly:
+
+  > 检测到 Claude Code 不在 tmux 内运行。WeChat Remote Control 必须把 CC 跑在 tmux 里
+  > 才能转发消息（桥接靠 `tmux send-keys` 把微信消息注入 CC 所在面板）。
+  >
+  > 请：
+  > 1. 退出当前 CC 会话（Ctrl-D 或 `/exit`）
+  > 2. 启动 tmux：`tmux new -s cc`
+  > 3. 在 tmux 里重新运行 `claude`
+  > 4. 重新执行 `/wechat-remote-control`
+
+  Then stop. Do not proceed.
+
+**Other early stops:**
+- **bridge NOT_FOUND** — tell user the bridge is not installed, stop.
+- **account NOT_FOUND** — run **login** flow first, then return.
 
 ### Step 2: Check for existing attach — prompt for override
 
@@ -174,106 +302,81 @@ If `state.json` shows `active: true` and `injectTarget` exists, show the user:
 
 Default: **Y** (override). If user says no, stop.
 
-### Step 3: Write state.json and bridge.json
+### Step 3: Write state.json, bridge.json, sessions.json
 
-Detect the current tmux target via **process ancestry** (reliable) and transcript path automatically.
-`$PPID` in the bash subprocess is the CC process PID.
-
-**Critical:** Do NOT use `tmux display-message` for the pane — it reports the currently
-focused client window, not the pane where CC lives. Use process ancestry via /proc instead.
+`detect.py json` returns a single JSON blob with `cc_pid`, `cwd`, `tmux_target`, and
+`transcript`. We feed that into a small writer script that updates the runtime state
+files. The transcript path respects `CLAUDE_CONFIG_DIR` if set.
 
 ```bash
-CWD=$(pwd)
-CC_PID=$PPID
-ENCODED=$(echo "$CWD" | sed 's|[^a-zA-Z0-9-]|-|g')
-TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$ENCODED"/*.jsonl 2>/dev/null | head -1)
-SESSION_ID=$(basename "$TRANSCRIPT" .jsonl 2>/dev/null)
-python3 -c "
+python3 $HOME/.claude/skills/wechat-remote-control/detect.py json > /tmp/wrc_detect.json
+test "$(python3 -c "import json; print(json.load(open('/tmp/wrc_detect.json'))['status'])")" = "OK" || { echo "DETECT_FAILED"; cat /tmp/wrc_detect.json; exit 1; }
+
+python3 - <<'PY'
 import json, os, time, datetime, subprocess
+info = json.load(open('/tmp/wrc_detect.json'))
+d = os.path.expanduser('~/.wechat-remote-control'); os.makedirs(d, exist_ok=True)
+target = info['tmux_target']
 
-cc_pid = $CC_PID
-cwd = '$CWD'
-transcript = '$TRANSCRIPT'
-session_id = '$SESSION_ID'
-
-# Find the tmux pane where this CC process lives via /proc ancestry
-tmux_session = tmux_window = tmux_pane = None
-try:
-    result = subprocess.run(
-        ['tmux', 'list-panes', '-a', '-F', '#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_index}'],
-        capture_output=True, text=True
-    )
-    pane_map = {}
-    for line in result.stdout.strip().split('\n'):
-        parts = line.split('\t')
-        if len(parts) == 4:
-            pane_map[int(parts[0])] = tuple(parts[1:])
-    pid = cc_pid
-    while pid > 1:
-        if pid in pane_map:
-            tmux_session, tmux_window, tmux_pane = pane_map[pid]
-            break
-        try:
-            with open(f'/proc/{pid}/status') as f:
-                for line in f:
-                    if line.startswith('PPid:'):
-                        pid = int(line.split()[1]); break
-        except:
-            break
-except Exception as e:
-    print(f'pane scan error: {e}')
-
-if not tmux_session:
-    # Fallback
-    import subprocess as sp
-    tmux_session = sp.run(['tmux', 'display-message', '-p', '#S'], capture_output=True, text=True).stdout.strip()
-    tmux_window  = sp.run(['tmux', 'display-message', '-p', '#I'], capture_output=True, text=True).stdout.strip()
-    tmux_pane    = sp.run(['tmux', 'display-message', '-p', '#P'], capture_output=True, text=True).stdout.strip()
-
-d = os.path.expanduser('~/.wechat-remote-control')
-os.makedirs(d, exist_ok=True)
-
-# Write state.json
-state = {
+# state.json (legacy single-session)
+json.dump({
     'injectTarget': {
-        'session': tmux_session, 'window': tmux_window, 'pane': tmux_pane,
-        'attachedAt': int(time.time() * 1000)
+        'session': info['tmux_session'], 'window': info['tmux_window'], 'pane': info['tmux_pane'],
+        'attachedAt': int(time.time() * 1000),
     },
-    'autoApprove': True, 'active': True, 'transcriptPath': transcript
-}
-with open(os.path.join(d, 'state.json'), 'w') as f:
-    json.dump(state, f, indent=2)
+    'autoApprove': True,
+    'active': True,
+    'transcriptPath': info.get('transcript'),
+}, open(os.path.join(d, 'state.json'), 'w'), indent=2)
 
-# Write bridge.json
-bridge = {
-    'sessionId': session_id, 'cwd': cwd, 'ccPid': cc_pid,
-    'attachedAt': datetime.datetime.now(datetime.timezone.utc).isoformat()
-}
-with open(os.path.join(d, 'bridge.json'), 'w') as f:
-    json.dump(bridge, f, indent=2)
+# bridge.json (daemon metadata)
+session_id = os.path.basename(info['transcript']).replace('.jsonl', '') if info.get('transcript') else None
+json.dump({
+    'sessionId': session_id, 'cwd': info['cwd'], 'ccPid': info['cc_pid'],
+    'attachedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}, open(os.path.join(d, 'bridge.json'), 'w'), indent=2)
 
-# Store ccPid separately
-with open(os.path.join(d, 'cc_pid'), 'w') as f:
-    f.write(str(cc_pid))
+# cc_pid file (used by status.sh)
+open(os.path.join(d, 'cc_pid'), 'w').write(str(info['cc_pid']))
 
-# Update sessions.json active to this session.
-# Strategy: set active=null so the bridge's auto-pick logic kicks in on next scan.
-# The bridge (lines 350-362 in src/index.js) prefers the session whose tmux matches
-# state.json's injectTarget — which we just wrote correctly above.
-# Do NOT try to match by name here: sessions.json may have stale tmux values from
-# before the bridge scanner ran, causing wrong matches (e.g. exp2 at 0:4.0 which later
-# moves to 0:2.0 after the scanner updates it).
-tmux_target = f'{tmux_session}:{tmux_window}.{tmux_pane}'
-sessions_path = os.path.join(d, 'sessions.json')
-if os.path.exists(sessions_path):
-    sessions = json.load(open(sessions_path))
-    sessions['active'] = None
-    with open(sessions_path, 'w') as f:
-        json.dump(sessions, f, indent=2)
-    print(f'OK: target={tmux_target} active=null (bridge will auto-pick) ccPid={cc_pid}')
-else:
-    print(f'OK: target={tmux_target} ccPid={cc_pid}')
-"
+# sessions.json — match by tmux target; create entry if new; set active directly.
+# Never set active=None — the bridge's auto-pick heuristic can pick the wrong CC
+# when multiple sessions share a cwd.
+sp = os.path.join(d, 'sessions.json')
+sessions = json.load(open(sp)) if os.path.exists(sp) else {'active': None, 'sessions': {}}
+sessions.setdefault('sessions', {})
+
+matched = None
+for name, s in sessions['sessions'].items():
+    if s.get('tmux') == target:
+        matched = name
+        s['transcriptPath'] = info.get('transcript')
+        s['lastSeen'] = int(time.time() * 1000)
+        break
+
+if not matched:
+    try:
+        wname = subprocess.check_output(
+            ['tmux', 'display-message', '-t', target, '-p', '#{window_name}'],
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        wname = ''
+    SHELLS = {'bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh'}
+    base = wname if (wname and wname.lower() not in SHELLS and not wname.startswith('[')) else os.path.basename(info['cwd'])
+    matched = base
+    suffix = 2
+    while matched in sessions['sessions']:
+        matched = f'{base}-{suffix}'; suffix += 1
+    sessions['sessions'][matched] = {
+        'tmux': target, 'cwd': info['cwd'],
+        'transcriptPath': info.get('transcript'),
+        'lastSeen': int(time.time() * 1000),
+    }
+
+sessions['active'] = matched
+json.dump(sessions, open(sp, 'w'), indent=2)
+print(f'OK: target={target} active={matched} ccPid={info["cc_pid"]}')
+PY
 ```
 
 ### Step 4: Configure hooks in settings.json

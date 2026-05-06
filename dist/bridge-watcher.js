@@ -12,7 +12,8 @@ const MAX_MESSAGE_LENGTH = 2048;
 // ---------------------------------------------------------------------------
 function getSessionFilePath(cwd, sessionId) {
     const encoded = cwd.replace(/\//g, '-');
-    return join(homedir(), '.claude', 'projects', encoded, `${sessionId}.jsonl`);
+    const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+    return join(claudeDir, 'projects', encoded, `${sessionId}.jsonl`);
 }
 function extractTextsFromNewLines(lines) {
     const texts = [];

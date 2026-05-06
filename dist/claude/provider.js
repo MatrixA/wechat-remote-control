@@ -33,7 +33,14 @@ async function* singleUserMessage(text, images) {
     const contentBlocks = [{ type: "text", text }];
     if (images?.length) {
         for (const img of images) {
-            contentBlocks.push({ type: "image", source: img.source });
+            contentBlocks.push({
+                type: "image",
+                source: {
+                    type: "base64",
+                    media_type: img.source.media_type,
+                    data: img.source.data,
+                },
+            });
         }
     }
     const msg = {

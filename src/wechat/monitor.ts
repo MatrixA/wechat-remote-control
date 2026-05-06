@@ -8,6 +8,10 @@ const SESSION_EXPIRED_PAUSE_MS = 60 * 60 * 1000; // 1 hour
 const BACKOFF_THRESHOLD = 3;
 const BACKOFF_LONG_MS = 30_000;
 const BACKOFF_SHORT_MS = 3_000;
+// Defensive minimum gap between poll iterations. The server's long-poll normally
+// holds the connection for ~35s, so this only kicks in when the server returns
+// instantly (e.g. transient errors, short-circuits). Prevents runaway tight loops.
+const MIN_POLL_INTERVAL_MS = 1_000;
 
 export interface MonitorCallbacks {
   onMessage: (msg: WeixinMessage) => Promise<void>;
@@ -24,13 +28,20 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
     let consecutiveFailures = 0;
 
     while (!controller.signal.aborted) {
+      const iterStart = Date.now();
       try {
         const buf = loadSyncBuf();
         logger.debug('Polling for messages', { hasBuf: buf.length > 0 });
 
         const resp = await api.getUpdates(buf || undefined);
 
-        if (resp.ret === SESSION_EXPIRED_ERRCODE) {
+        // The server uses two field-name conventions: `ret`/`retmsg` for the
+        // legacy long-poll path and `errcode`/`errmsg` for the gateway path.
+        // Treat them interchangeably so session-expired (-14) is always caught.
+        const errCode = resp.ret ?? resp.errcode;
+        const errMsg = resp.retmsg ?? resp.errmsg;
+
+        if (errCode === SESSION_EXPIRED_ERRCODE) {
           logger.warn('Session expired, pausing for 1 hour');
           callbacks.onSessionExpired();
           await sleep(SESSION_EXPIRED_PAUSE_MS, controller.signal);
@@ -38,8 +49,8 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
           continue;
         }
 
-        if (resp.ret !== undefined && resp.ret !== 0) {
-          logger.warn('getUpdates returned error', { ret: resp.ret, retmsg: resp.retmsg });
+        if (errCode !== undefined && errCode !== 0) {
+          logger.warn('getUpdates returned error', { errCode, errMsg });
         }
 
         // Save the new sync buffer regardless of ret
@@ -91,6 +102,15 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
         const backoff = consecutiveFailures >= BACKOFF_THRESHOLD ? BACKOFF_LONG_MS : BACKOFF_SHORT_MS;
         logger.info(`Backing off ${backoff}ms`, { consecutiveFailures });
         await sleep(backoff, controller.signal);
+        continue;
+      }
+
+      // Defensive floor: if the iteration returned in well under the long-poll
+      // budget (e.g. a soft error returned 200/instant), still wait a moment
+      // before the next poll so we never hammer the API in a tight loop.
+      const elapsed = Date.now() - iterStart;
+      if (elapsed < MIN_POLL_INTERVAL_MS && !controller.signal.aborted) {
+        await sleep(MIN_POLL_INTERVAL_MS - elapsed, controller.signal);
       }
     }
 

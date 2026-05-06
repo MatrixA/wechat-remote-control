@@ -20,3 +20,11 @@ export var MessageState;
     MessageState[MessageState["GENERATING"] = 1] = "GENERATING";
     MessageState[MessageState["FINISH"] = 2] = "FINISH";
 })(MessageState || (MessageState = {}));
+/** Media type enum for getUploadUrl API. */
+export var UploadMediaType;
+(function (UploadMediaType) {
+    UploadMediaType[UploadMediaType["IMAGE"] = 1] = "IMAGE";
+    UploadMediaType[UploadMediaType["VIDEO"] = 2] = "VIDEO";
+    UploadMediaType[UploadMediaType["FILE"] = 3] = "FILE";
+    UploadMediaType[UploadMediaType["VOICE"] = 4] = "VOICE";
+})(UploadMediaType || (UploadMediaType = {}));

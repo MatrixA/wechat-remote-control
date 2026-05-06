@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # WeChat Remote Control status indicator for Claude Code status line.
-# Shows "💬 已连微信" when THIS CC session is the active WeChat target.
+# Shows "💬 已连微信" when THIS CC session is the active WeChat target,
+# or "⚠️ 微信会话过期" when the WeChat backend session needs re-login.
 # Cross-platform: works on Linux (/proc) and macOS (ps).
 
 BRIDGE_PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
 CC_PID_FILE="$HOME/.wechat-remote-control/cc_pid"
+STATE_FILE="$HOME/.wechat-remote-control/state.json"
 
 # 1. Bridge daemon must be running (use PID file — no /proc scanning)
 [[ -f "$BRIDGE_PID_FILE" ]] || exit 0
@@ -31,7 +33,13 @@ for _ in $(seq 1 12); do
     ppid=$(get_ppid "$pid")
     [[ -z "$ppid" || "$ppid" -le 1 ]] && break
     if [[ "$ppid" == "$STORED_CC_PID" ]]; then
-        printf '💬 \033[32m已连微信\033[0m'
+        # If the bridge has flagged the WeChat session as expired, surface that
+        # instead of the green "connected" indicator.
+        if [[ -f "$STATE_FILE" ]] && grep -q '"sessionExpired": *true' "$STATE_FILE" 2>/dev/null; then
+            printf '⚠️  \033[31m微信会话过期\033[0m \033[2m(运行 /wechat-remote-control 重连)\033[0m'
+        else
+            printf '💬 \033[32m已连微信\033[0m'
+        fi
         exit 0
     fi
     pid=$ppid

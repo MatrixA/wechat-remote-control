@@ -14,10 +14,18 @@ export declare enum MessageState {
     GENERATING = 1,
     FINISH = 2
 }
+/** Media type enum for getUploadUrl API. */
+export declare enum UploadMediaType {
+    IMAGE = 1,
+    VIDEO = 2,
+    FILE = 3,
+    VOICE = 4
+}
 export interface CDNMedia {
     aes_key: string;
     encrypt_query_param: string;
     cdn_url?: string;
+    encrypt_type?: number;
 }
 export interface TextItem {
     text: string;
@@ -28,21 +36,48 @@ export interface ImageItem {
     aeskey?: string;
     media?: {
         encrypt_query_param: string;
+        aes_key?: string;
+        encrypt_type?: number;
     };
     url?: string;
     mid_size?: number;
     hd_size?: number;
 }
 export interface VoiceItem {
-    cdn_media: CDNMedia;
+    cdn_media?: CDNMedia;
+    /** Alternative flat-format fields */
+    aeskey?: string;
+    media?: {
+        encrypt_query_param: string;
+        aes_key?: string;
+        encrypt_type?: number;
+    };
+    /** WeChat ASR transcription (if available) */
+    text?: string;
     voice_text?: string;
 }
 export interface FileItem {
-    cdn_media: CDNMedia;
+    cdn_media?: CDNMedia;
+    /** Alternative flat-format fields */
+    aeskey?: string;
+    media?: {
+        encrypt_query_param: string;
+        aes_key?: string;
+        encrypt_type?: number;
+    };
     file_name?: string;
+    len?: string;
 }
 export interface VideoItem {
-    cdn_media: CDNMedia;
+    cdn_media?: CDNMedia;
+    /** Alternative flat-format fields */
+    aeskey?: string;
+    media?: {
+        encrypt_query_param: string;
+        aes_key?: string;
+        encrypt_type?: number;
+    };
+    video_size?: number;
 }
 export interface MessageItem {
     type: MessageItemType;
@@ -69,6 +104,8 @@ export interface GetUpdatesReq {
 export interface GetUpdatesResp {
     ret?: number;
     retmsg?: string;
+    errcode?: number;
+    errmsg?: string;
     sync_buf: string;
     get_updates_buf: string;
     msgs?: WeixinMessage[];
@@ -86,13 +123,36 @@ export interface SendMessageReq {
     msg: OutboundMessage;
 }
 export interface GetUploadUrlReq {
-    file_type: string;
-    file_size: number;
-    file_name: string;
+    filekey: string;
+    media_type: UploadMediaType;
+    to_user_id: string;
+    rawsize: number;
+    rawfilemd5: string;
+    filesize: number;
+    no_need_thumb?: boolean;
+    aeskey: string;
 }
 export interface GetUploadUrlResp {
-    errcode: number;
-    url: string;
-    aes_key: string;
-    encrypt_query_param: string;
+    errcode?: number;
+    upload_param?: string;
+    upload_full_url?: string;
+}
+export interface UploadedMedia {
+    filekey: string;
+    downloadEncryptedQueryParam: string;
+    aeskey: string;
+    fileSize: number;
+    fileSizeCiphertext: number;
+}
+export interface DownloadedMedia {
+    type: 'image' | 'audio' | 'video' | 'file';
+    filePath: string;
+    mimeType: string;
+    fileName?: string;
+}
+export interface VoiceResult {
+    /** If WeChat ASR provided text, this is set and filePath is null */
+    text?: string;
+    /** If no ASR text, the audio file path */
+    media?: DownloadedMedia;
 }

@@ -8,7 +8,8 @@ import { loadLatestAccount } from './wechat/accounts.js';
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { downloadImage, extractText, extractFirstImageUrl } from './wechat/media.js';
+import { downloadImage, extractText, extractFirstImageUrl, extractFirstVoice, extractFirstFile, extractFirstVideo, downloadVoice, downloadFile, downloadVideo, } from './wechat/media.js';
+import { MessageType, MessageItemType } from './wechat/types.js';
 import { createSessionStore } from './session.js';
 import { createPermissionBroker } from './permission.js';
 import { routeCommand } from './commands/router.js';
@@ -18,7 +19,6 @@ import { createBridgeWatcher } from './bridge-watcher.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
-import { MessageType } from './wechat/types.js';
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -214,9 +214,12 @@ async function handleMessage(msg, account, session, sessionStore, permissionBrok
     const contextToken = msg.context_token ?? '';
     const fromUserId = msg.from_user_id;
     sharedCtx.lastContextToken = contextToken;
-    // Extract text from items
+    // Extract text and media from items
     const userText = extractTextFromItems(msg.item_list);
     const imageItem = extractFirstImageUrl(msg.item_list);
+    const voiceItem = extractFirstVoice(msg.item_list);
+    const fileItem = extractFirstFile(msg.item_list);
+    const videoItem = extractFirstVideo(msg.item_list);
     // Concurrency guard: reject normal messages and /clear while processing
     // Safety net: auto-reset stale processing state after 5 minutes
     const STALE_PROCESSING_MS = 5 * 60 * 1000;
@@ -309,21 +312,66 @@ async function handleMessage(msg, account, session, sessionStore, permissionBrok
         // Not handled, treat as normal message (fall through)
     }
     // -- Normal message -> Claude --
-    if (!userText && !imageItem) {
-        await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字或图片');
+    // Process voice messages: use ASR text if available
+    let effectiveText = userText;
+    let voiceResult = null;
+    if (voiceItem && !effectiveText) {
+        voiceResult = await downloadVoice(voiceItem);
+        if (voiceResult?.text) {
+            effectiveText = voiceResult.text;
+        }
+    }
+    // Process file/video attachments
+    let fileMedia = null;
+    let videoMedia = null;
+    if (fileItem) {
+        fileMedia = await downloadFile(fileItem);
+    }
+    if (videoItem) {
+        videoMedia = await downloadVideo(videoItem);
+    }
+    const hasAnyContent = effectiveText || imageItem || voiceResult?.media || fileMedia || videoMedia;
+    if (!hasAnyContent) {
+        await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、语音、图片或文件');
         return;
     }
-    await sendToClaude(userText, imageItem, fromUserId, contextToken, account, session, sessionStore, permissionBroker, sender, config, bridgeWatcher);
+    // Build context text for non-text media
+    const mediaParts = [];
+    if (voiceResult?.media) {
+        mediaParts.push(`[语音消息，音频文件: ${voiceResult.media.filePath}]`);
+    }
+    if (fileMedia) {
+        mediaParts.push(`[文件: ${fileMedia.fileName ?? fileMedia.filePath}，本地路径: ${fileMedia.filePath}]`);
+    }
+    if (videoMedia) {
+        mediaParts.push(`[视频文件: ${videoMedia.filePath}]`);
+    }
+    if (mediaParts.length > 0) {
+        effectiveText = [effectiveText, ...mediaParts].filter(Boolean).join('\n');
+    }
+    await sendToClaude(effectiveText, imageItem, fromUserId, contextToken, account, session, sessionStore, permissionBroker, sender, config, bridgeWatcher);
 }
 function extractTextFromItems(items) {
-    return items.map((item) => extractText(item)).filter(Boolean).join('\n');
+    const texts = [];
+    for (const item of items) {
+        const text = extractText(item);
+        if (text)
+            texts.push(text);
+        // Also extract voice ASR text if present
+        if (item.type === MessageItemType.VOICE) {
+            const voiceText = item.voice_item?.text ?? item.voice_item?.voice_text;
+            if (voiceText)
+                texts.push(voiceText);
+        }
+    }
+    return texts.join('\n');
 }
 async function sendToClaude(userText, imageItem, fromUserId, contextToken, account, session, sessionStore, permissionBroker, sender, config, bridgeWatcher) {
     // Set state to processing
     session.state = 'processing';
     sessionStore.save(account.accountId, session);
     // Record user message in chat history
-    sessionStore.addChatMessage(session, 'user', userText || '(图片)');
+    sessionStore.addChatMessage(session, 'user', userText || '(媒体消息)');
     // Pause the bridge watcher so it doesn't forward content that we'll
     // send directly via sendText below (prevents duplicate messages).
     bridgeWatcher.pause();
@@ -364,7 +412,7 @@ async function sendToClaude(userText, imageItem, fromUserId, contextToken, accou
             logger.info('Resuming from bridge', { sessionId: bridge.sessionId, cwd: effectiveCwd });
         }
         const queryOptions = {
-            prompt: userText || '请分析这张图片',
+            prompt: userText || '请描述这张图片',
             cwd: effectiveCwd,
             resume: resumeId,
             model: session.model,

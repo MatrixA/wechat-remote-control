@@ -33,7 +33,8 @@ export function writeBridge(data) {
 export function getLatestSessionId(cwd) {
     try {
         const encoded = cwd.replace(/\//g, '-');
-        const projectDir = join(homedir(), '.claude', 'projects', encoded);
+        const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+        const projectDir = join(claudeDir, 'projects', encoded);
         const files = readdirSync(projectDir)
             .filter(f => f.endsWith('.jsonl'))
             .map(f => ({
