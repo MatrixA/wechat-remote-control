@@ -24,6 +24,10 @@ import { createMonitor } from '../dist/wechat/monitor.js';
 import { extractText as extractItemText } from '../dist/wechat/media.js';
 import { MessageType, MessageItemType } from '../dist/wechat/types.js';
 import { logger } from '../dist/logger.js';
+import {
+  getAgent, sessionKind, resolveModelFor,
+  CODEX_SESSIONS, findCodexTranscriptByPid, findLatestCodexRollout,
+} from './agents.js';
 
 // ── Paths ────────────────────────────────────────────────────────────
 const HOOK_SOCKET    = '/tmp/cc_wechat_hook.sock';
@@ -36,6 +40,8 @@ const SESSION_FILE   = join(CC_WECHAT, 'ilink_session.json');
 // who relocate ~/.claude/ via that env var still have their transcripts found.
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
 const CLAUDE_PROJECTS = join(CLAUDE_CONFIG_DIR, 'projects');
+// Codex CLI rollout transcripts live under <CODEX_HOME>/sessions/ (CODEX_SESSIONS
+// is resolved env-aware in agents.js and re-used here for transcript discovery).
 const MAX_MSG_LEN    = 2048;
 const INJECT_DELAY   = 500;    // ms to wait after Stop before injecting
 const SCAN_INTERVAL  = 30_000; // ms between tmux auto-discovery scans
@@ -44,23 +50,8 @@ const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switc
 // Shell names that should NOT be used as session display names
 const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh']);
 
-// ── Known interactive commands that produce terminal TUI (not transcript) ───
-// These are intercepted at bridge level and handled as text menus in WeChat.
-const MODELS = [
-  { id: 'claude-opus-4-6',          display: 'Opus 4.6',   short: 'opus'   },
-  { id: 'claude-sonnet-4-6',        display: 'Sonnet 4.6', short: 'sonnet' },
-  { id: 'claude-haiku-4-5-20251001', display: 'Haiku 4.5', short: 'haiku'  },
-];
-
-function resolveModel(input) {
-  const s = input.trim().toLowerCase();
-  const num = parseInt(s, 10);
-  if (!isNaN(num) && num >= 1 && num <= MODELS.length) return MODELS[num - 1];
-  return MODELS.find(m =>
-    m.short === s || m.id === s || m.id.includes(s) ||
-    m.display.toLowerCase().includes(s)
-  ) ?? null;
-}
+// Per-agent model lists and resolution live in agents.js (getAgent(kind).models,
+// resolveModelFor). The #model menu is intercepted at bridge level for both agents.
 
 // ── Mutable state ────────────────────────────────────────────────────
 let lastInjectedText       = null;
@@ -159,10 +150,12 @@ function getActiveState() {
     return {
       injectTarget: { session: sessionPart, window: window || '0', pane: pane || '0' },
       transcriptPath: s.transcriptPath,
+      kind: sessionKind(s),
       autoApprove: true,
     };
   }
-  return readState();
+  // Legacy state.json has no kind — default to claude.
+  return { ...readState(), kind: 'claude' };
 }
 
 function appendHistory(entry) {
@@ -551,19 +544,30 @@ function collectDescendants(rootPid) {
   return visited;
 }
 
-/**
- * Return true if a 'claude' process is running in the process tree rooted at panePid.
- */
-function hasCCProcess(panePid) {
+/** Read a process's command basename (/proc on Linux, ps on macOS). */
+function getComm(pid) {
+  try { return readFileSync(`/proc/${pid}/comm`, 'utf8').trim(); } catch {}
   try {
-    for (const pid of collectDescendants(panePid)) {
-      try {
-        const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
-        if (comm === 'claude') return true;
-      } catch {}
-    }
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'comm='], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return basename(out);
   } catch {}
-  return false;
+  return '';
+}
+
+/**
+ * Determine which supported agent (if any) runs in a tmux pane's process tree.
+ * Returns 'claude', 'codex', or null. Claude takes priority if both appear.
+ */
+function detectPaneAgent(panePid) {
+  let found = null;
+  for (const pid of collectDescendants(panePid)) {
+    const comm = getComm(pid);
+    if (comm === 'claude') return 'claude';
+    if (comm === 'codex') found = 'codex';
+  }
+  return found;
 }
 
 /**
@@ -650,26 +654,38 @@ function scanTmuxForCC() {
       const [tmuxStr, windowName, cwd, panePid] = parts;
       if (!cwd) continue;
 
-      // Only register panes where a 'claude' process is actually running.
-      if (!hasCCProcess(panePid)) continue;
+      // Only register panes where a supported agent (claude or codex) is running.
+      const kind = detectPaneAgent(panePid);
+      if (!kind) continue;
 
-      // Use open-fd scan first (precise); fall back to process-start-time matching
-      // which avoids the findLatestTranscript pitfall where all sessions sharing
-      // a CWD get assigned the most-recently-modified .jsonl.
-      const fdTranscript = findTranscriptByPid(panePid);
-      const fallbackTranscript = fdTranscript ? null : findTranscriptForProcess(panePid, cwd);
+      // Use open-fd scan first (precise); fall back to per-kind discovery.
+      //  - claude: process-start-time matching (avoids the findLatestTranscript
+      //    pitfall where all sessions sharing a CWD get the newest .jsonl).
+      //  - codex: newest rollout whose session_meta cwd matches (date-based dirs).
+      let fdTranscript, fallbackTranscript;
+      if (kind === 'codex') {
+        fdTranscript = findCodexTranscriptByPid(panePid);
+        fallbackTranscript = fdTranscript ? null : findLatestCodexRollout(cwd);
+      } else {
+        fdTranscript = findTranscriptByPid(panePid);
+        fallbackTranscript = fdTranscript ? null : findTranscriptForProcess(panePid, cwd);
+      }
       const transcriptPath = fdTranscript || fallbackTranscript;
       if (!transcriptPath) continue;
 
       activeTmuxTargets.add(tmuxStr);
 
+      // Codex rollouts have no /rename custom-title, so never read one for codex.
+      const useCustomTitle = (reliable) => kind === 'claude' && reliable;
+
       // Already registered — refresh transcript path and lastSeen
       const existing = Object.entries(reg.sessions).find(([, s]) => s.tmux === tmuxStr);
       if (existing) {
         reg.sessions[existing[0]].lastSeen = now;
+        reg.sessions[existing[0]].kind = kind;
         if (fdTranscript) {
           reg.sessions[existing[0]].transcriptPath = fdTranscript;
-        } else {
+        } else if (kind === 'claude') {
           // Re-evaluate transcript via process-start-time matching to fix
           // initial misassignment (findLatestTranscript always picks the active
           // session's transcript when multiple sessions share the same CWD).
@@ -680,12 +696,8 @@ function scanTmuxForCC() {
           }
         }
         // Refresh name in case user renamed after initial registration.
-        // Use stored transcript for custom-title (it was set via fd previously
-        // and is authoritative).  Only read custom-title at all if this session
-        // has an fd-based transcript (current or stored).
         const nameTranscript = fdTranscript || reg.sessions[existing[0]].transcriptPath;
-        const hasReliableTranscript = !!fdTranscript;
-        const newName = getSessionDisplayName(cwd, windowName, nameTranscript, hasReliableTranscript);
+        const newName = getSessionDisplayName(cwd, windowName, nameTranscript, useCustomTitle(!!fdTranscript));
         if (newName !== existing[0] && !reg.sessions[newName]) {
           logger.info(`Session renamed: ${existing[0]} → ${newName} [${tmuxStr}]`);
           reg.sessions[newName] = { ...reg.sessions[existing[0]], lastSeen: now };
@@ -696,15 +708,13 @@ function scanTmuxForCC() {
       }
 
       // New session — derive name and add.
-      // Only use custom-title if transcript was found via fd (belongs to this session).
-      // Fallback transcripts may belong to another CC session sharing the same CWD.
-      const baseName = getSessionDisplayName(cwd, windowName, transcriptPath, !!fdTranscript);
+      const baseName = getSessionDisplayName(cwd, windowName, transcriptPath, useCustomTitle(!!fdTranscript));
       let name = baseName;
       let suffix = 2;
       while (reg.sessions[name]) name = `${baseName}-${suffix++}`;
 
-      reg.sessions[name] = { tmux: tmuxStr, cwd, transcriptPath, lastSeen: now };
-      logger.info(`Auto-discovered CC session: ${name} [${tmuxStr}]`);
+      reg.sessions[name] = { tmux: tmuxStr, cwd, transcriptPath, kind, lastSeen: now };
+      logger.info(`Auto-discovered ${kind} session: ${name} [${tmuxStr}]`);
     }
 
     // Prune sessions not seen in 2 scan intervals
@@ -757,12 +767,12 @@ function formatSessionList(reg) {
   const names = Object.keys(reg.sessions);
   if (names.length === 0) return '暂无发现活跃的 CC session\n（等待自动扫描，约30秒）';
   const home = homedir();
-  const lines = ['📋 CC Sessions:'];
+  const lines = ['📋 Sessions:'];
   names.forEach((name, i) => {
     const s = reg.sessions[name];
     const marker = name === reg.active ? '▶' : '○';
     const shortPath = s.cwd.replace(home, '~');
-    lines.push(`${marker} ${i + 1}. ${name}  [${s.tmux}]\n   ${shortPath}`);
+    lines.push(`${marker} ${i + 1}. ${name} (${sessionKind(s)})  [${s.tmux}]\n   ${shortPath}`);
   });
   lines.push(`\n当前: ${reg.active || '无'}`);
   lines.push('切换: #sw <名字> 或 #sw <序号>');
@@ -793,6 +803,15 @@ function getContextReplay(transcriptPath, rounds = CONTEXT_ROUNDS) {
     lines.push(`🤖 ${assistant.slice(0, 400)}`);
   }
   return lines.join('\n');
+}
+
+/** Kind-aware context replay (Claude transcript vs Codex rollout). */
+function contextReplayFor(kind, transcriptPath, rounds = CONTEXT_ROUNDS) {
+  if (kind === 'codex') {
+    const agent = getAgent('codex');
+    return agent.contextReplay(agent.parseRollout(transcriptPath), rounds);
+  }
+  return getContextReplay(transcriptPath, rounds);
 }
 
 // ── CC built-in slash commands ────────────────────────────────────────
@@ -966,9 +985,10 @@ async function handleBridgeCommand(text, sender) {
         .map(l => l.split('\t'))
         .find(([t]) => t === s.tmux)?.[1];
       if (newPanePid) {
+        const wantComm = getAgent(sessionKind(s)).comm;
         for (const pid of collectDescendants(newPanePid)) {
           try {
-            if (readFileSync(`/proc/${pid}/comm`, 'utf8').trim() === 'claude') {
+            if (getComm(pid) === wantComm) {
               writeFileSync(join(CC_WECHAT, 'cc_pid'), String(pid));
               const bridgeData = readJson(join(CC_WECHAT, 'bridge.json'), {});
               bridgeData.ccPid = parseInt(pid);
@@ -983,8 +1003,8 @@ async function handleBridgeCommand(text, sender) {
       logger.debug('Failed to update cc_pid after #sw', { error: err.message });
     }
 
-    const replay = getContextReplay(s.transcriptPath);
-    const switchMsg = `✅ 已切换到: ${targetName} [${s.tmux}]\n\n${replay}`;
+    const replay = contextReplayFor(sessionKind(s), s.transcriptPath);
+    const switchMsg = `✅ 已切换到: ${targetName} (${sessionKind(s)}) [${s.tmux}]\n\n${replay}`;
     for (const chunk of splitMessage(switchMsg)) await send(chunk);
 
     logger.info(`Switched active session to: ${targetName}`);
@@ -994,19 +1014,24 @@ async function handleBridgeCommand(text, sender) {
   // #model [selection] — text-based model switcher (bypasses TUI)
   if (cmd === '#model') {
     const arg = parts.slice(1).join(' ').trim();
+    const kind = getActiveState().kind || 'claude';
+    const models = getAgent(kind).models;
 
     if (!arg) {
-      // Show numbered model list
-      const settingsPath = join(CLAUDE_CONFIG_DIR, 'settings.json');
-      const settings = readJson(settingsPath, {});
-      const current = settings.model || 'claude-sonnet-4-6';
+      // Show numbered model list. Claude exposes the current model via
+      // settings.json; Codex stores it in config.toml (no marker shown).
+      let current = null;
+      if (kind === 'claude') {
+        const settings = readJson(join(CLAUDE_CONFIG_DIR, 'settings.json'), {});
+        current = settings.model || 'claude-sonnet-4-6';
+      }
       const lines = ['🤖 选择模型:'];
-      MODELS.forEach((m, i) => {
+      models.forEach((m, i) => {
         const marker = m.id === current ? '✅' : '  ';
         lines.push(`${marker}${i + 1}. ${m.display}`);
         lines.push(`     ${m.id}`);
       });
-      lines.push('\n回复序号或名称（如 1 或 opus）切换');
+      lines.push('\n回复序号或名称切换');
       lines.push('5分钟内有效，超时取消');
       pendingSelect = { type: 'model', expires: Date.now() + 5 * 60 * 1000 };
       await send(lines.join('\n'));
@@ -1014,9 +1039,9 @@ async function handleBridgeCommand(text, sender) {
     }
 
     // Direct selection: #model <name/number> — resolve then inject+capture
-    const resolved = resolveModel(arg);
+    const resolved = resolveModelFor(kind, arg);
     if (!resolved) {
-      const opts = MODELS.map((m, i) => `${i + 1}. ${m.display}`).join('  ');
+      const opts = models.map((m, i) => `${i + 1}. ${m.display}`).join('  ');
       await send(`未知模型: "${arg}"\n可选: ${opts}`);
       return;
     }
@@ -1028,6 +1053,7 @@ async function handleBridgeCommand(text, sender) {
       await send('❌ tmux 不可用');
       return;
     }
+    // Both Claude and Codex accept `/model <id>` as a direct argument.
     await injectSlashAndCapture(target, `/model ${resolved.id}`, send);
     return;
   }
@@ -1066,9 +1092,100 @@ function scheduleInject() {
 }
 
 // ── Hook event handlers ──────────────────────────────────────────────
+
+/**
+ * Forward a complete assistant response to WeChat and clear injection state.
+ * Shared by the Claude and Codex Stop paths.
+ */
+function pushResponse(responseText, sender) {
+  if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
+  lastPushedText         = responseText;
+  lastInjectedText       = null;
+  lastInjectedTranscript = null;
+  saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+  appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
+  for (const chunk of splitMessage(responseText)) {
+    sender.sendText(targetUserId, contextToken, chunk).catch(err => {
+      logger.error('Push to WeChat failed', { error: err.message });
+    });
+  }
+}
+
+/**
+ * Codex Stop handler. Codex rollouts use a different JSONL schema and the Stop
+ * payload carries `last_assistant_message`. We forward only WeChat-initiated
+ * turns: gate on the rollout's latest user_message matching what we injected,
+ * since Codex also fires Stop for turns the user types at the terminal.
+ */
+function onStopCodex(payload, sender, readPath) {
+  if (!lastInjectedText) {
+    logger.info('Codex Stop with no injected message, ignoring');
+    scheduleInject();
+    return;
+  }
+  const agent = getAgent('codex');
+  const entries = agent.parseRollout(readPath);
+  const latestUser = agent.latestUserMessage(entries);
+
+  // Gate against terminal-initiated turns. If the rollout's most recent user
+  // message exists and isn't ours, this Stop belongs to a terminal turn — leave
+  // lastInjectedText set; our own turn's Stop will arrive later.
+  if (latestUser !== null && latestUser !== lastInjectedText) {
+    logger.debug('Codex Stop for terminal-initiated turn, ignoring', { latestUser: latestUser.slice(0, 60) });
+    return;
+  }
+
+  const pickText = (eList) => {
+    const r = agent.responseToInjected(eList, lastInjectedText);
+    if (r?.text) return r.text;
+    if (typeof payload.last_assistant_message === 'string' && payload.last_assistant_message.trim()) {
+      return payload.last_assistant_message.trim();
+    }
+    return null;
+  };
+
+  const text = pickText(entries);
+  if (text) {
+    pushResponse(text, sender);
+    logger.info('Pushed codex response to WeChat', { chars: text.length });
+    scheduleInject();
+    return;
+  }
+
+  // No response text yet — rollout may not be flushed. Defer with a bounded poll
+  // (Codex has no Notification event to act as a later safety net).
+  const savedInjected = lastInjectedText;
+  const ORPHAN_GRACE_MS = 60_000;
+  const POLL_MS = 5_000;
+  const deadline = Date.now() + ORPHAN_GRACE_MS;
+  const poll = () => {
+    if (lastInjectedText !== savedInjected) return; // resolved elsewhere
+    const t2 = pickText(agent.parseRollout(readPath));
+    if (t2) {
+      pushResponse(t2, sender);
+      logger.info('Pushed codex response via deferred poll', { chars: t2.length });
+      return;
+    }
+    if (Date.now() >= deadline) {
+      logger.warn('Codex: no response within grace window, cleaning up');
+      if (lastInjectedText === savedInjected) {
+        if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
+        lastInjectedText       = null;
+        lastInjectedTranscript = null;
+        saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+      }
+      return;
+    }
+    setTimeout(poll, POLL_MS);
+  };
+  setTimeout(poll, POLL_MS);
+  scheduleInject();
+}
+
 async function onStop(payload, sender) {
   ccBusy = false;
   const state = getActiveState();
+  const kind = state.kind || 'claude';
   const tpath = payload.transcript_path || state.transcriptPath;
   if (!tpath) { scheduleInject(); return; }
 
@@ -1079,12 +1196,13 @@ async function onStop(payload, sender) {
   const matchesActive   = state.transcriptPath && tpath === state.transcriptPath;
   const hasExpected     = !!(lastInjectedTranscript || state.transcriptPath);
   if (hasExpected && !matchesInjected && !matchesActive) {
-    // During compaction grace period, accept any transcript from the same project
-    // (CC creates a new .jsonl after compaction, so the path changes).
-    if (lastInjectedText && Date.now() < compactionGraceUntil) {
+    // The compaction-grace and same-project acceptance branches are Claude-only:
+    // Codex rollouts live in date-based dirs, so "same dir" is NOT project identity
+    // and would wrongly accept an unrelated session's Stop.
+    if (kind === 'claude' && lastInjectedText && Date.now() < compactionGraceUntil) {
       logger.info('Accepting post-compaction transcript', { tpath: tpath.slice(-40) });
       lastInjectedTranscript = tpath;  // update to new transcript
-    } else if (lastInjectedText && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)) {
+    } else if (kind === 'claude' && lastInjectedText && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)) {
       // Same project directory but different transcript file.  The session scanner
       // may have assigned the wrong .jsonl at injection time (multiple transcripts
       // in the same project dir).  The hook's tpath is authoritative (from the CC
@@ -1103,9 +1221,14 @@ async function onStop(payload, sender) {
     lastInjectedTranscript = tpath;
   }
 
-  logger.info('Stop hook received', { transcript_path: tpath.slice(-60) });
+  logger.info('Stop hook received', { kind, transcript_path: tpath.slice(-60) });
 
   const readPath = lastInjectedTranscript || tpath;
+
+  // Codex has a distinct rollout schema and supplies last_assistant_message on
+  // the Stop payload — handle it separately and return.
+  if (kind === 'codex') { onStopCodex(payload, sender, readPath); return; }
+
   const entries = parseTranscript(readPath);
   let result = findResponseToInjected(entries, lastInjectedText);
 
@@ -1304,16 +1427,18 @@ function onPreToolUse(payload, sender) {
   // their Stop is filtered out, ccBusy gets stuck forever.
   const tpath = payload.transcript_path;
   const state = getActiveState();
+  const kind = state.kind || 'claude';
   const matchesInjected = lastInjectedTranscript && tpath === lastInjectedTranscript;
   const matchesActive   = state.transcriptPath && tpath === state.transcriptPath;
   const hasExpected     = !!(lastInjectedTranscript || state.transcriptPath);
   if (tpath && hasExpected && !matchesInjected && !matchesActive) {
-    // Check if same project dir — scanner may have assigned wrong transcript
-    if (!isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)) {
+    // Same-project acceptance is Claude-only (Codex date-dirs aren't projects).
+    if (kind === 'claude' && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)) {
+      // Same project, different transcript — accept (scanner misassignment)
+    } else {
       // Truly foreign session — don't touch ccBusy
       return undefined;
     }
-    // Same project, different transcript — accept (scanner misassignment)
   }
 
   ccBusy = true;
@@ -1330,7 +1455,9 @@ function onPreToolUse(payload, sender) {
   // ── Quiz support: forward AskUserQuestion to WeChat ──
   // Only intercept quizzes triggered by a WeChat-injected message (lastInjectedText is set).
   // Terminal-initiated quizzes are left to the terminal user.
-  if (toolName === 'AskUserQuestion' && lastInjectedText) {
+  // AskUserQuestion is a Claude Code TUI; Codex uses a different approval UX, so
+  // quiz interception is Claude-only.
+  if (kind === 'claude' && toolName === 'AskUserQuestion' && lastInjectedText) {
     const questions = toolInput.questions || [];
     if (questions.length > 0) {
       pendingQuiz = {
@@ -1348,7 +1475,9 @@ function onPreToolUse(payload, sender) {
   // Emit both the modern (hookSpecificOutput.permissionDecision) and the
   // legacy (decision: 'approve') shapes. Some Claude Code releases honor only
   // one of them — sending both works on every version we've tested without
-  // changing semantics.
+  // changing semantics. This dual emit is also load-bearing for Codex: Codex
+  // honors permissionDecision:'allow' and merely parses-but-ignores
+  // decision:'approve', so the same payload auto-approves on both agents.
   return {
     decision: 'approve',
     reason: 'wrc auto-approve',
@@ -1358,6 +1487,23 @@ function onPreToolUse(payload, sender) {
       permissionDecisionReason: 'wrc auto-approve',
     },
   };
+}
+
+/**
+ * UserPromptSubmit handler — primarily Codex's turn-start signal. Codex has no
+ * Notification event, and a pure-text turn never reaches PreToolUse, so without
+ * this a WeChat message could be injected mid-turn. Mark busy when the prompt
+ * belongs to our tracked session.
+ */
+function onUserPromptSubmit(payload) {
+  const tpath = payload.transcript_path;
+  const state = getActiveState();
+  const matchesInjected = lastInjectedTranscript && tpath === lastInjectedTranscript;
+  const matchesActive   = state.transcriptPath && tpath === state.transcriptPath;
+  const hasExpected     = !!(lastInjectedTranscript || state.transcriptPath);
+  if (tpath && hasExpected && !matchesInjected && !matchesActive) return; // foreign session
+  ccBusy = true;
+  cancelPending();
 }
 
 async function onNotification(payload, sender) {
@@ -1459,9 +1605,10 @@ function startHookServer(sender) {
       const hookType = payload._hookType || '';
       let reply;
       try {
-        if (hookType === 'stop')              onStop(payload, sender);
-        else if (hookType === 'pretooluse')   reply = onPreToolUse(payload, sender);
-        else if (hookType === 'notification') onNotification(payload, sender);
+        if (hookType === 'stop')                   onStop(payload, sender);
+        else if (hookType === 'pretooluse')        reply = onPreToolUse(payload, sender);
+        else if (hookType === 'notification')      onNotification(payload, sender);
+        else if (hookType === 'userpromptsubmit')  onUserPromptSubmit(payload);
         else logger.debug('Unknown hook type', { hookType });
       } catch (err) {
         logger.error('Hook handler error', { hookType, error: err.message });
@@ -1553,7 +1700,7 @@ function handleWeChatMessage(msg, sender) {
       logger.info('pendingSelect expired, clearing');
       pendingSelect = null;
     } else if (pendingSelect.type === 'model') {
-      const resolved = resolveModel(text.trim());
+      const resolved = resolveModelFor(getActiveState().kind || 'claude', text.trim());
       if (resolved) {
         pendingSelect = null;
         const reply = (msg) => sender.sendText(targetUserId, contextToken, msg)
@@ -1606,12 +1753,16 @@ function handleWeChatMessage(msg, sender) {
     return;
   }
 
-  // Detect CC built-in slash commands
+  // Detect built-in slash commands for the ACTIVE agent. These are handled by
+  // the agent CLI itself and never produce a forwardable transcript turn.
   const slashMatch = cmdText.match(/^\/([a-z][\w-]*)/i);
   if (slashMatch) {
     const slashName = slashMatch[1].toLowerCase();
+    const activeKind = getActiveState().kind || 'claude';
+    const builtin = activeKind === 'codex' ? getAgent('codex').builtinSlash : CC_BUILTIN_SLASH;
+    const tuiOnly = activeKind === 'codex' ? getAgent('codex').tuiOnly : CC_TUI_ONLY;
 
-    if (CC_BUILTIN_SLASH.has(slashName)) {
+    if (builtin.has(slashName)) {
       const sendReply = (msg) => sender.sendText(targetUserId, contextToken, msg)
         .catch(err => logger.error('Slash reply failed', { error: err.message }));
       const state = getActiveState();
@@ -1623,8 +1774,11 @@ function handleWeChatMessage(msg, sender) {
       }
 
       // TUI-only commands: warn user these require terminal interaction
-      if (CC_TUI_ONLY.has(slashName)) {
-        sendReply(`⚠️ /${slashName} 需要终端交互（方向键选择），无法从微信操作。\n\n可远程使用的命令:\n  /cost /usage /compact /clear /fast /effort /help /doctor /status /model`);
+      if (tuiOnly.has(slashName)) {
+        const remotable = activeKind === 'codex'
+          ? '/status /diff /mcp /ps /compact /clear /new /model /review'
+          : '/cost /usage /compact /clear /fast /effort /help /doctor /status /model';
+        sendReply(`⚠️ /${slashName} 需要终端交互（方向键选择），无法从微信操作。\n\n可远程使用的命令:\n  ${remotable}`);
         return;
       }
 
