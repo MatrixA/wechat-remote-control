@@ -1591,8 +1591,6 @@ async function onNotification(payload, sender) {
 
 // ── Hook server (Unix socket) ────────────────────────────────────────
 function startHookServer(sender) {
-  try { unlinkSync(HOOK_SOCKET); } catch {}
-
   const server = net.createServer(conn => {
     conn.on('error', () => {});
     const chunks = [];
@@ -1621,12 +1619,73 @@ function startHookServer(sender) {
     });
   });
 
-  server.listen(HOOK_SOCKET, () => {
-    if (process.platform !== 'win32') try { chmodSync(HOOK_SOCKET, 0o600); } catch {}
-    logger.info('Hook server ready at ' + HOOK_SOCKET);
-    console.log('[wrc-bridge] hook server ready at ' + HOOK_SOCKET);
+  // Singleton gate: the hook socket IS the singleton token. Only one process can
+  // bind an AF_UNIX path, so a second daemon — launched from ANY install dir
+  // (~/.claude/skills or ~/.agents/skills) — detects the live one and exits.
+  return new Promise((resolve) => {
+    let retried = false;
+
+    function onListen() {
+      if (process.platform !== 'win32') try { chmodSync(HOOK_SOCKET, 0o600); } catch {}
+      // Claim singleton ownership: write our own PID authoritatively.
+      try { writeFileSync(join(CC_WECHAT, 'bridge.pid'), String(process.pid)); } catch {}
+      logger.info('Hook server ready at ' + HOOK_SOCKET);
+      console.log('[wrc-bridge] hook server ready at ' + HOOK_SOCKET);
+      resolve(server);
+    }
+
+    server.on('error', (err) => {
+      if (err.code !== 'EADDRINUSE') {
+        logger.error('Hook server error', { error: err.message });
+        console.error('[wrc-bridge] hook server error: ' + err.message);
+        process.exit(1);
+      }
+      // Path is taken. Probe whether a live daemon owns it.
+      const probe = net.connect(HOOK_SOCKET);
+      const decideAlive = () => {
+        try { probe.destroy(); } catch {}
+        logger.info('Another bridge daemon already running, exiting');
+        console.log('[wrc-bridge] another bridge daemon already running, exiting');
+        process.exit(0);
+      };
+      probe.setTimeout(500);
+      probe.once('connect', decideAlive);
+      probe.once('timeout', decideAlive);
+      probe.once('error', () => {
+        try { probe.destroy(); } catch {}
+        // Stale socket file (no listener). Remove and retry once.
+        if (retried) {
+          logger.error('Hook socket busy after stale cleanup, exiting');
+          process.exit(1);
+        }
+        retried = true;
+        try { unlinkSync(HOOK_SOCKET); } catch {}
+        server.listen(HOOK_SOCKET, onListen);
+      });
+    });
+
+    server.listen(HOOK_SOCKET, onListen);
   });
-  return server;
+}
+
+// ── Welcome / reconnect text (agent-aware) ───────────────────────────
+// The bridge drives both Claude Code and Codex, so greetings reflect the
+// ACTIVE session's agent rather than hard-coding "Claude Code".
+function agentLabel(kind) {
+  return kind === 'codex' ? 'Codex' : 'Claude Code';
+}
+
+function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
+  const label = kind ? agentLabel(kind) : '微信远程';
+  const header = reconnect
+    ? `👋 ${label} 已重连！\n\n当前 session: ${activeName || '(unknown)'}\n\n`
+    : `👋 ${label} 已连接！\n\n`;
+  return header +
+    '可用指令：\n' +
+    '  #ls — 列出所有 session（Claude Code / Codex）\n' +
+    '  #sw <名字/序号> — 切换 session\n' +
+    '  /model — 切换模型（文字菜单，无需终端交互）\n\n' +
+    '直接发消息即注入当前 session，回复将自动转发。';
 }
 
 // ── WeChat message handler ───────────────────────────────────────────
@@ -1684,12 +1743,7 @@ function handleWeChatMessage(msg, sender) {
   if (!welcomedUsers.has(targetUserId)) {
     welcomedUsers.add(targetUserId);
     sender.sendText(targetUserId, contextToken,
-      '👋 Claude Code 已连接！\n\n' +
-      '可用指令：\n' +
-      '  #ls — 列出所有 CC sessions\n' +
-      '  #sw <名字/序号> — 切换 session\n' +
-      '  /model — 切换模型（文字菜单，无需终端交互）\n\n' +
-      '直接发消息即注入当前 CC session，回复将自动转发。'
+      buildWelcome({ reconnect: false, kind: getActiveState().kind })
     ).catch(err => logger.error('Welcome message failed', { error: err.message }));
   }
 
@@ -1825,7 +1879,7 @@ async function main() {
   wechatApi    = api;  // expose for typing indicator helpers
   const sender = createSender(api, account.accountId);
 
-  const hookServer = startHookServer(sender);
+  const hookServer = await startHookServer(sender);
 
   // Initial tmux scan then periodic
   scanTmuxForCC();
@@ -1854,12 +1908,7 @@ async function main() {
     const reg = readSessions();
     const activeName = reg.active || '(unknown)';
     sender.sendText(targetUserId, contextToken,
-      `👋 Claude Code 已重连！\n\n当前 session: ${activeName}\n\n` +
-      '可用指令：\n' +
-      '  #ls — 列出所有 CC sessions\n' +
-      '  #sw <名字/序号> — 切换 session\n' +
-      '  /model — 切换模型（文字菜单，无需终端交互）\n\n' +
-      '直接发消息即注入当前 CC session，回复将自动转发。'
+      buildWelcome({ reconnect: true, activeName, kind: getActiveState().kind })
     ).catch(err => logger.error('Startup welcome failed', { error: err.message }));
     logger.info('Sent startup welcome', { userId: targetUserId });
   }
