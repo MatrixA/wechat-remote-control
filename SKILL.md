@@ -2,11 +2,12 @@
 name: wechat-remote-control
 version: 1.0.0
 description: |
-  WeChat Remote Control for Claude Code. Three sub-commands:
+  WeChat Remote Control for Claude Code and OpenAI Codex CLI. The active agent is
+  auto-detected from the tmux pane (claude vs codex). Three sub-commands:
   - login:  Authenticate WeChat account (scan QR code). Run once before first use
             or after session expiry.
-  - attach: Register this Claude Code session as the WeChat remote target.
-            Bridge daemon starts in background; it watches the CC session file
+  - attach: Register this Claude Code / Codex session as the WeChat remote target.
+            Bridge daemon starts in background; it watches the session transcript
             and forwards assistant output to WeChat.
   - sync:   Show WeChat conversation history since last attach, for context.
   Use when stepping away from the terminal and handing off to WeChat.
@@ -29,15 +30,23 @@ Never ask the user to copy-paste and run commands themselves — handle everythi
 
 ## Architecture overview (for Claude's reference)
 
-The bridge uses a **tmux-injection** model, bundled in this skill directory.
+The bridge uses a **tmux-injection** model, bundled in this skill directory. It drives two
+coding agents — **Claude Code** (`claude`) and **OpenAI Codex CLI** (`codex`) — auto-detecting
+which one runs in each tmux pane via process ancestry. The multi-session registry records a
+`kind` per session, so claude and codex sessions can coexist and be switched with `#sw`.
 
 - **Bridge daemon** (`node src/index.js`): polls ilink WeChat API for messages, injects
-  them into the user's tmux-hosted CC session via `tmux send-keys`.
-- **Hook server**: listens on Unix socket `/tmp/cc_wechat_hook.sock`. CC hooks (PreToolUse,
-  Stop, Notification) send events here via `hook.py`.
-- **Response forwarding**: on Stop/Notification hook, reads CC transcript JSONL, finds the
-  response to the injected WeChat message, and forwards it to WeChat. Terminal-initiated
-  responses are NOT forwarded.
+  them into the user's tmux-hosted agent session via `tmux send-keys`.
+- **Hook server**: listens on Unix socket `/tmp/cc_wechat_hook.sock`. Agent hooks send events
+  here via `hook.py`. Claude Code fires PreToolUse / Stop / Notification; Codex fires
+  PreToolUse / Stop / UserPromptSubmit (Codex has no Notification event).
+- **Response forwarding**: on Stop, the bridge forwards the assistant response to the WeChat
+  message it injected. For Claude it parses the transcript JSONL; for Codex it uses the Stop
+  payload's `last_assistant_message`, gated on the rollout's latest user message matching what
+  was injected. Terminal-initiated responses are NOT forwarded.
+- **Auto-approve**: PreToolUse returns `permissionDecision: "allow"` (plus the legacy
+  `decision: "approve"`). Both agents honor this — Codex honors `permissionDecision` and
+  ignores `decision`, so one payload works for both.
 - **All state lives in one directory**: `~/.wechat-remote-control/`
   - `accounts/<accountId>.json` — WeChat credentials
   - `state.json` — tmux target, autoApprove, transcriptPath (legacy single-session)
@@ -54,18 +63,22 @@ so the pattern matches the shell itself, causing self-termination. Always use th
 `/proc` scanner shown below, in a **separate** bash call from the start command.
 
 **Environment variables this skill respects:**
-- `CLAUDECODE=1` — set by Claude Code in spawned shells. Used to confirm we are running
-  inside CC before doing anything.
 - `CLAUDE_CODE_REMOTE=true` — set in cloud sessions. The bridge cannot work in cloud
   (no local tmux), so the skill refuses early with a clear message.
 - `CLAUDE_CONFIG_DIR` — relocates `~/.claude/` (undocumented but supported by Claude
   Code; see anthropics/claude-code#3833). Both `detect.py` and the bridge daemon honour
   it when looking up `<config>/projects/<encoded-cwd>/*.jsonl` transcript files.
+- `CODEX_HOME` — relocates `~/.codex/` (documented by Codex). Both `detect.py` and the
+  bridge daemon honour it when looking up `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`
+  rollout transcripts and when merging hooks into `<home>/hooks.json`.
+- `CLAUDECODE=1` — set by Claude Code only. Treated as a hint, NOT a requirement: agent
+  kind is determined by process ancestry, since Codex does not set it.
 
 **Helpers:**
-- `detect.py` walks `/proc` (Linux) or `ps` (macOS) up from the bash subprocess to find
-  the `claude` ancestor process, then verifies it lives inside a `tmux list-panes -a`
-  pane. Used by attach Step 1 (preflight) and Step 3 (state-file writer).
+- `detect.py` walks `/proc` (Linux) or `ps` (macOS) up from the bash subprocess to find a
+  supported agent ancestor (`claude` or `codex`), reports `agent=<kind>`, then verifies it
+  lives inside a `tmux list-panes -a` pane. Used by attach Step 1 (preflight) and Step 3
+  (state-file writer).
 
 ---
 
@@ -241,21 +254,20 @@ echo "=== existing attach ==="
 cat ~/.wechat-remote-control/state.json 2>/dev/null || echo "{}"
 ```
 
-Interpret the `status=...` line from the detect block:
+Interpret the `status=...` line from the detect block. Also note the `agent=...` line
+(`claude` or `codex`) — it drives the hooks/statusLine steps below.
 
-- **`status=OK`** — proceed. The `tmux_target=...` and `cc_pid=...` values are saved
-  to `/tmp/wrc_detect.json` later in Step 3.
-- **`status=NOT_CLAUDECODE`** — the `CLAUDECODE=1` env var is missing. This shouldn't
-  happen in a real CC session; ask the user how they invoked Claude Code, then stop.
+- **`status=OK`** — proceed. The `agent=...`, `tmux_target=...` and `cc_pid=...` values are
+  saved to `/tmp/wrc_detect.json` later in Step 3.
 - **`status=REMOTE_SESSION`** — Claude Code is running as a cloud session
   (`CLAUDE_CODE_REMOTE=true`). The bridge uses local tmux + Unix sockets and cannot
   work in cloud. Stop and tell the user to use a local CC instance.
-- **`status=NO_CC_PROCESS`** — no `claude` ancestor was found in `/proc`. Stop and
-  ask the user to confirm CC was started normally (not via wrapper scripts).
+- **`status=NO_AGENT_PROCESS`** — no `claude` or `codex` ancestor was found. Stop and ask
+  the user to confirm the agent was started normally (not via wrapper scripts).
 - **`status=NO_TMUX`** — `tmux` is not installed. Install it yourself (don't push the
-  work to the user), then fall through to the `CC_NOT_IN_TMUX` instructions below
-  (because the user still needs to restart CC inside a tmux session — installing tmux
-  doesn't move the already-running CC into one):
+  work to the user), then fall through to the `AGENT_NOT_IN_TMUX` instructions below
+  (because the user still needs to restart the agent inside a tmux session — installing
+  tmux doesn't move the already-running agent into one):
 
   ```bash
   if command -v apt-get >/dev/null; then sudo -n apt-get install -y -qq tmux 2>&1 | tail -3 || apt-get install -y -qq tmux 2>&1 | tail -3
@@ -266,19 +278,19 @@ Interpret the `status=...` line from the detect block:
   fi
   ```
 
-- **`status=CC_NOT_IN_TMUX`** (or after installing tmux above) — **DO NOT silently
+- **`status=AGENT_NOT_IN_TMUX`** (or after installing tmux above) — **DO NOT silently
   create a tmux session and proceed.** The bridge injects keystrokes into the tmux
-  pane where CC actually lives; injecting into a different pane silently sends keys
-  nowhere, and we cannot move an already-running CC into a new tmux session. Output
-  exactly:
+  pane where the agent actually lives; injecting into a different pane silently sends keys
+  nowhere, and we cannot move an already-running agent into a new tmux session. Substitute
+  the detected agent's launch command (`claude` or `codex`) into the message and output:
 
-  > 检测到 Claude Code 不在 tmux 内运行。WeChat Remote Control 必须把 CC 跑在 tmux 里
-  > 才能转发消息（桥接靠 `tmux send-keys` 把微信消息注入 CC 所在面板）。
+  > 检测到 agent（Claude Code / Codex）不在 tmux 内运行。WeChat Remote Control 必须把它跑在
+  > tmux 里才能转发消息（桥接靠 `tmux send-keys` 把微信消息注入 agent 所在面板）。
   >
   > 请：
-  > 1. 退出当前 CC 会话（Ctrl-D 或 `/exit`）
+  > 1. 退出当前会话（Ctrl-D 或 `/exit`）
   > 2. 启动 tmux：`tmux new -s cc`
-  > 3. 在 tmux 里重新运行 `claude`
+  > 3. 在 tmux 里重新运行 `claude`（或 `codex`）
   > 4. 重新执行 `/wechat-remote-control`
 
   Then stop. Do not proceed.
@@ -298,9 +310,10 @@ Default: **Y** (override). If user says no, stop.
 
 ### Step 3: Write state.json, bridge.json, sessions.json
 
-`detect.py json` returns a single JSON blob with `cc_pid`, `cwd`, `tmux_target`, and
-`transcript`. We feed that into a small writer script that updates the runtime state
-files. The transcript path respects `CLAUDE_CONFIG_DIR` if set.
+`detect.py json` returns a single JSON blob with `agent`, `cc_pid`, `cwd`, `tmux_target`,
+and `transcript`. We feed that into a small writer script that updates the runtime state
+files. The transcript path respects `CLAUDE_CONFIG_DIR` / `CODEX_HOME` if set, and the
+session entry records `kind` (`claude` or `codex`).
 
 ```bash
 python3 $HOME/.claude/skills/wechat-remote-control/detect.py json > /tmp/wrc_detect.json
@@ -340,11 +353,13 @@ sp = os.path.join(d, 'sessions.json')
 sessions = json.load(open(sp)) if os.path.exists(sp) else {'active': None, 'sessions': {}}
 sessions.setdefault('sessions', {})
 
+kind = info.get('agent', 'claude')
 matched = None
 for name, s in sessions['sessions'].items():
     if s.get('tmux') == target:
         matched = name
         s['transcriptPath'] = info.get('transcript')
+        s['kind'] = kind
         s['lastSeen'] = int(time.time() * 1000)
         break
 
@@ -364,6 +379,7 @@ if not matched:
     sessions['sessions'][matched] = {
         'tmux': target, 'cwd': info['cwd'],
         'transcriptPath': info.get('transcript'),
+        'kind': kind,
         'lastSeen': int(time.time() * 1000),
     }
 
@@ -373,32 +389,71 @@ print(f'OK: target={target} active={matched} ccPid={info["cc_pid"]}')
 PY
 ```
 
-### Step 4: Configure hooks in settings.json
+### Step 4: Configure agent hooks (merge-safe)
 
-Read `~/.claude/settings.json`. Merge the hooks — do not overwrite other settings.
+The hook config file and event set depend on the detected agent:
 
-Target hooks config:
-```json
-{
-  "hooks": {
-    "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 $HOME/.claude/skills/wechat-remote-control/hook.py pretooluse"}]}],
-    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 $HOME/.claude/skills/wechat-remote-control/hook.py stop"}]}],
-    "Notification": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 $HOME/.claude/skills/wechat-remote-control/hook.py notification"}]}]
-  }
-}
-```
+- **claude** → `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/settings.json`), events
+  `PreToolUse` / `Stop` / `Notification`.
+- **codex** → `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`), events
+  `PreToolUse` / `Stop` / `UserPromptSubmit` (Codex has no `Notification` event).
 
-If hooks are already present with the same commands, skip this step.
-
-### Step 5: Configure status line in settings.json
-
-Check if `statusLine` is already configured. If not (or if the command points elsewhere),
-merge it into `~/.claude/settings.json` without overwriting other settings:
+Both files use the same nested `hooks` schema. The writer below **merges** — it never
+overwrites other settings or other tools' hook blocks, and it dedupes by our `hook.py`
+command so re-running attach is idempotent. It reads the agent kind from the Step-3 detect
+blob:
 
 ```bash
+python3 - <<'PY'
+import json, os
+info = json.load(open('/tmp/wrc_detect.json'))
+kind = info.get('agent', 'claude')
+cmd_base = os.path.expanduser('~/.claude/skills/wechat-remote-control/hook.py')
+
+if kind == 'codex':
+    cfg_dir = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
+    path = os.path.join(cfg_dir, 'hooks.json')
+    events = {'PreToolUse': 'pretooluse', 'Stop': 'stop', 'UserPromptSubmit': 'userpromptsubmit'}
+else:
+    cfg_dir = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
+    path = os.path.join(cfg_dir, 'settings.json')
+    events = {'PreToolUse': 'pretooluse', 'Stop': 'stop', 'Notification': 'notification'}
+
+os.makedirs(cfg_dir, exist_ok=True)
+cfg = json.load(open(path)) if os.path.exists(path) else {}
+hooks = cfg.setdefault('hooks', {})
+
+added = []
+for event, arg in events.items():
+    command = f'python3 {cmd_base} {arg}'
+    groups = hooks.setdefault(event, [])
+    # Dedup: skip if any existing handler already runs our hook.py.
+    exists = any(
+        'wechat-remote-control/hook.py' in (h.get('command') or '')
+        for g in groups for h in g.get('hooks', [])
+    )
+    if not exists:
+        groups.append({'matcher': '', 'hooks': [{'type': 'command', 'command': command}]})
+        added.append(event)
+
+with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+print(f'OK kind={kind} file={path} added={added or "none (already present)"}')
+PY
+```
+
+### Step 5: Configure status line (Claude only)
+
+Codex has no status-line hook mechanism, so **skip this step entirely when `agent=codex`.**
+For Claude, check if `statusLine` is already configured; if not (or if the command points
+elsewhere), merge it into `$CLAUDE_CONFIG_DIR/settings.json` without overwriting other
+settings:
+
+```bash
+# Run only when agent=claude.
 python3 -c "
 import json, os
-path = os.path.expanduser('~/.claude/settings.json')
+path = os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude'), 'settings.json')
 settings = json.load(open(path)) if os.path.exists(path) else {}
 desired = {
     'type': 'command',
@@ -461,16 +516,20 @@ If FAILED: read the last 30 lines of `/tmp/cc_wechat_bridge.log` and diagnose.
 ```
 WeChat Remote Control activated
 
+Agent: <Claude Code | Codex>
 Tmux target: <session>:<window>.<pane>
 Auto-approve: on
 Bridge: running (PID <pid>)
 Transcript: <transcript path>
 
 You can leave the terminal now. WeChat messages will be injected into this
-CC session via tmux. CC responses triggered by WeChat will be forwarded back.
+agent session via tmux. Responses triggered by WeChat will be forwarded back.
 
 Terminal-initiated responses are NOT forwarded to WeChat.
 ```
+
+For Claude, a status-line indicator shows bridge state in the terminal; Codex has no
+status line, so that indicator is Claude-only.
 
 ---
 

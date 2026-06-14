@@ -11,3 +11,9 @@ export const CLAUDE_PROJECTS_DIR = join(CLAUDE_CONFIG_DIR, 'projects');
 export function encodeCwd(cwd) {
     return cwd.replace(/[^\p{L}\p{N}-]/gu, '-');
 }
+// OpenAI Codex CLI reads CODEX_HOME to relocate ~/.codex/ (documented). Honour it
+// exactly as we honour CLAUDE_CONFIG_DIR so Codex rollout transcripts are found.
+export const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex');
+// Codex stores rollout transcripts under <CODEX_HOME>/sessions/YYYY/MM/DD/, named
+// rollout-<ISO-ts>-<uuid>.jsonl. Unlike Claude Code there is no cwd-encoded dir.
+export const CODEX_SESSIONS_DIR = join(CODEX_HOME, 'sessions');

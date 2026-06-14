@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Detect Claude Code's runtime context: cc_pid, tmux pane, cwd, transcript path.
+"""Detect a coding agent's runtime context: pid, kind, tmux pane, cwd, transcript.
+
+Supports both Claude Code (`claude`) and OpenAI Codex CLI (`codex`). The agent
+kind is discovered by walking the process ancestry — the CLAUDECODE env var is
+only a hint, since Codex does not set it.
 
 Subcommands:
-    detect.py preflight  → key=value report (or NOT_CLAUDECODE / NO_CC_PROCESS / NO_TMUX / CC_NOT_IN_TMUX)
-    detect.py json       → JSON object with cc_pid, tmux_*, cwd, transcript
+    detect.py preflight  → key=value report (status / agent / cc_pid / tmux_* / transcript)
+                           error codes: REMOTE_SESSION / NO_AGENT_PROCESS / NO_TMUX / AGENT_NOT_IN_TMUX
+    detect.py json       → JSON object with status, agent, cc_pid, agent_pid, tmux_*, cwd, transcript
 
 Cross-platform: prefers /proc on Linux, falls back to ps/lsof on macOS.
 """
@@ -64,16 +69,25 @@ def get_cwd(p):
     return ""
 
 
-def find_cc_pid(start=None):
-    """Walk parents from $PPID until a process with cmdline 'claude' is found."""
+# Process command basenames that identify a supported agent.
+AGENT_COMMS = {"claude": "claude", "codex": "codex"}
+
+
+def find_agent_pid(start=None):
+    """Walk parents from $PPID until a supported agent process is found.
+
+    Returns (pid, kind) where kind is 'claude' or 'codex', or (None, None).
+    """
     p = start or int(os.environ.get("PPID", os.getppid()))
     for _ in range(20):
-        if get_cmd(p) == "claude":
-            return p
+        cmd = get_cmd(p)
+        for kind, comm in AGENT_COMMS.items():
+            if cmd == comm:
+                return p, kind
         p = get_ppid(p)
         if p <= 1:
-            return None
-    return None
+            return None, None
+    return None, None
 
 
 def list_tmux_panes():
@@ -122,21 +136,120 @@ def claude_config_dir():
     return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
 
-def find_transcript(cc_pid):
-    """Locate Claude Code's active transcript JSONL.
+def codex_home():
+    """Resolve Codex CLI's config root.
+
+    Codex reads `CODEX_HOME` to relocate ~/.codex/ (documented). Rollout
+    transcripts live under <CODEX_HOME>/sessions/YYYY/MM/DD/.
+    """
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def list_open_jsonl(pid, under):
+    """Return open .jsonl files held by `pid` whose path starts with `under`.
+
+    Linux: read /proc/<pid>/fd symlinks. macOS: parse `lsof -p`.
+    """
+    paths = []
+    fd_dir = f"/proc/{pid}/fd"
+    if os.path.isdir(fd_dir):
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd))
+                except OSError:
+                    continue
+                if target.endswith(".jsonl") and target.startswith(under):
+                    paths.append(target)
+        except OSError:
+            pass
+        return paths
+    # macOS / no /proc — use lsof
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-p", str(pid), "-Fn"], stderr=subprocess.DEVNULL
+        ).decode()
+        for line in out.splitlines():
+            if line.startswith("n"):
+                name = line[1:]
+                if name.endswith(".jsonl") and name.startswith(under):
+                    paths.append(name)
+    except Exception:
+        pass
+    return paths
+
+
+def _rollout_cwd(path):
+    """Read the cwd from a rollout's first-line session_meta, or None."""
+    try:
+        with open(path) as f:
+            first = f.readline()
+        obj = json.loads(first)
+        if obj.get("type") == "session_meta":
+            return obj.get("payload", {}).get("cwd")
+    except Exception:
+        pass
+    return None
+
+
+def find_codex_transcript(pid):
+    """Locate a Codex CLI rollout JSONL for the given process.
 
     Order of resolution:
+      1. CODEX_TRANSCRIPT_PATH env var (future-proof, parity with Claude).
+      2. The .jsonl the codex process currently holds open under <home>/sessions/.
+      3. The most recently modified rollout-*.jsonl whose session_meta cwd matches
+         the process cwd (avoids picking an unrelated session from the same day).
+    """
+    env_path = os.environ.get("CODEX_TRANSCRIPT_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    sessions_root = os.path.join(codex_home(), "sessions")
+
+    # (2) open-fd scan — the precise path
+    for p in list_open_jsonl(pid, sessions_root):
+        return p
+
+    # (3) fallback: newest rollout whose session_meta cwd matches the process cwd
+    if not os.path.isdir(sessions_root):
+        return None
+    cwd = get_cwd(pid)
+    candidates = []
+    for root, _dirs, files in os.walk(sessions_root):
+        for name in files:
+            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                continue
+            full = os.path.join(root, name)
+            try:
+                candidates.append((os.path.getmtime(full), full))
+            except OSError:
+                continue
+    candidates.sort(reverse=True)
+    for _mtime, full in candidates:
+        if not cwd or _rollout_cwd(full) == cwd:
+            return full
+    return None
+
+
+def find_transcript(pid, kind="claude"):
+    """Locate the active transcript JSONL for an agent process.
+
+    Claude Code resolution:
       1. CLAUDE_TRANSCRIPT_PATH env var (future-proof — Claude Code does not
          currently expose it, but we honour it if it ever appears).
       2. The most recently modified .jsonl in <config_dir>/projects/<encoded(cwd)>/
-         where cwd is the CC process's working directory and config_dir respects
+         where cwd is the process's working directory and config_dir respects
          CLAUDE_CONFIG_DIR.
     """
+    if kind == "codex":
+        return find_codex_transcript(pid)
+
     env_path = os.environ.get("CLAUDE_TRANSCRIPT_PATH")
     if env_path and os.path.exists(env_path):
         return env_path
 
-    cwd = get_cwd(cc_pid)
+    cwd = get_cwd(pid)
     if not cwd:
         return None
     proj = os.path.join(claude_config_dir(), "projects", encode_cwd(cwd))
@@ -159,29 +272,33 @@ def find_transcript(cc_pid):
 
 
 def detect():
-    """Return (status, info_dict). status is 'OK' or an error code."""
-    if os.environ.get("CLAUDECODE") != "1":
-        return "NOT_CLAUDECODE", {}
+    """Return (status, info_dict). status is 'OK' or an error code.
+
+    Agent kind is determined by process ancestry (claude vs codex). CLAUDECODE
+    is not required — Codex does not set it.
+    """
     if os.environ.get("CLAUDE_CODE_REMOTE") == "true":
         # Cloud sessions have no local terminal/tmux, so the bridge cannot work.
         return "REMOTE_SESSION", {}
-    cc_pid = find_cc_pid()
-    if not cc_pid:
-        return "NO_CC_PROCESS", {}
+    agent_pid, kind = find_agent_pid()
+    if not agent_pid:
+        return "NO_AGENT_PROCESS", {}
     panes = list_tmux_panes()
     if panes is None:
-        return "NO_TMUX", {"cc_pid": cc_pid}
-    pane = find_tmux_pane(cc_pid, panes)
+        return "NO_TMUX", {"agent": kind, "cc_pid": agent_pid, "agent_pid": agent_pid}
+    pane = find_tmux_pane(agent_pid, panes)
     if not pane:
-        return "CC_NOT_IN_TMUX", {"cc_pid": cc_pid}
+        return "AGENT_NOT_IN_TMUX", {"agent": kind, "cc_pid": agent_pid, "agent_pid": agent_pid}
     return "OK", {
-        "cc_pid": cc_pid,
-        "cwd": get_cwd(cc_pid),
+        "agent": kind,
+        "cc_pid": agent_pid,      # legacy key (status.sh, attach writer)
+        "agent_pid": agent_pid,   # neutral alias
+        "cwd": get_cwd(agent_pid),
         "tmux_session": pane[0],
         "tmux_window": pane[1],
         "tmux_pane": pane[2],
         "tmux_target": f"{pane[0]}:{pane[1]}.{pane[2]}",
-        "transcript": find_transcript(cc_pid),
+        "transcript": find_transcript(agent_pid, kind),
     }
 
 
