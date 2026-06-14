@@ -1,7 +1,7 @@
 import { statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
 import { watch as fsWatch } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { CLAUDE_PROJECTS_DIR, encodeCwd } from './constants.js';
 import { logger } from './logger.js';
 import { readBridge } from './bridge.js';
 const DEBOUNCE_MS = 1500;
@@ -11,9 +11,7 @@ const MAX_MESSAGE_LENGTH = 2048;
 // Helpers
 // ---------------------------------------------------------------------------
 function getSessionFilePath(cwd, sessionId) {
-    const encoded = cwd.replace(/\//g, '-');
-    const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
-    return join(claudeDir, 'projects', encoded, `${sessionId}.jsonl`);
+    return join(CLAUDE_PROJECTS_DIR, encodeCwd(cwd), `${sessionId}.jsonl`);
 }
 function extractTextsFromNewLines(lines) {
     const texts = [];
