@@ -476,6 +476,13 @@ If `ALREADY_SET`, skip silently.
 The bridge is a singleton service. Check if it's already running via PID file before starting.
 Never kill a healthy bridge just because attach was called again.
 
+The daemon **self-enforces** singleton at the OS level by binding the hook socket
+`/tmp/cc_wechat_hook.sock`: if a live daemon already owns it (even one launched from a
+different install dir, e.g. `~/.agents/skills` for Codex vs `~/.claude/skills` for Claude
+Code), a second `node src/index.js` detects it and exits immediately. The PID check below
+is just an optimization to avoid spawning a doomed process. The daemon writes its own PID
+to `bridge.pid` once it successfully binds, so that file always points at the real singleton.
+
 **Check existing daemon:**
 
 ```bash
@@ -498,15 +505,23 @@ echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
 
 ```bash
 nohup node $HOME/.claude/skills/wechat-remote-control/src/index.js >> /tmp/cc_wechat_bridge.log 2>&1 &
-NEW_PID=$!
-echo $NEW_PID > $HOME/.wechat-remote-control/bridge.pid
-echo "PID=$NEW_PID"
+echo "launched PID=$!"
 ```
 
-**Verify** (after ~3 seconds):
+Do NOT write `bridge.pid` here — the daemon writes its own PID once it wins the
+singleton. (A redundant launch self-exits without touching `bridge.pid`, so the file
+always points at the live daemon.)
+
+**Verify** (after ~3 seconds) — check the live daemon, not the launched PID, since a
+redundant launch self-exiting is a *success*, not a failure:
 
 ```bash
-kill -0 <NEW_PID> 2>/dev/null && echo "running" || echo "FAILED"
+PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "running PID=$(cat "$PID_FILE")"
+else
+    echo "FAILED"
+fi
 ```
 
 If FAILED: read the last 30 lines of `/tmp/cc_wechat_bridge.log` and diagnose.
