@@ -1,7 +1,6 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
-import { homedir } from 'node:os';
-import { DATA_DIR } from './constants.js';
+import { DATA_DIR, CLAUDE_PROJECTS_DIR, encodeCwd } from './constants.js';
 import { logger } from './logger.js';
 const BRIDGE_FILE = join(DATA_DIR, 'bridge.json');
 export function readBridge() {
@@ -27,14 +26,12 @@ export function writeBridge(data) {
 }
 /**
  * Find the most recently modified session JSONL in the Claude project directory for a given cwd.
- * Claude encodes the project path by replacing all '/' with '-'.
- * e.g. /mnt/data/playground → -mnt-data-playground
+ * Claude encodes the project path by replacing every non-alphanumeric char with '-' (see encodeCwd).
+ * e.g. /mnt/data/play.ground → -mnt-data-play-ground
  */
 export function getLatestSessionId(cwd) {
     try {
-        const encoded = cwd.replace(/\//g, '-');
-        const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
-        const projectDir = join(claudeDir, 'projects', encoded);
+        const projectDir = join(CLAUDE_PROJECTS_DIR, encodeCwd(cwd));
         const files = readdirSync(projectDir)
             .filter(f => f.endsWith('.jsonl'))
             .map(f => ({

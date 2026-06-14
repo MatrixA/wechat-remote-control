@@ -1,7 +1,7 @@
 import { statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
 import { watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { CLAUDE_PROJECTS_DIR, encodeCwd } from './constants.js';
 import { logger } from './logger.js';
 import { readBridge } from './bridge.js';
 import type { AccountData } from './wechat/accounts.js';
@@ -16,8 +16,7 @@ const MAX_MESSAGE_LENGTH = 2048;
 // ---------------------------------------------------------------------------
 
 function getSessionFilePath(cwd: string, sessionId: string): string {
-  const encoded = cwd.replace(/\//g, '-');
-  return join(homedir(), '.claude', 'projects', encoded, `${sessionId}.jsonl`);
+  return join(CLAUDE_PROJECTS_DIR, encodeCwd(cwd), `${sessionId}.jsonl`);
 }
 
 function extractTextsFromNewLines(lines: string[]): string[] {

@@ -93,8 +93,10 @@ SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name "login.js" 2>/dev/null \
   | grep "wechat-remote-control/dist/wechat/login.js" | head -1 \
   | sed 's|/dist/wechat/login.js||')
 echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
-test -d "$SKILL_DIR/node_modules/qrcode" && echo "qrcode: OK" || echo "qrcode: missing"
 ```
+
+The QR generator is built into the skill (`dist/wechat/qrcode.js`, zero external deps),
+so there is no `npm install` step for QR rendering.
 
 **If `NO_NODE` or `NO_NPM`:** install them yourself — don't push the work onto the user.
 Try the system package manager that's available, in this order, and stop on first success:
@@ -114,11 +116,7 @@ Node 12), tell the user to upgrade via nvm or NodeSource — older Node breaks E
 the bridge uses. If `INSTALL_FAILED` or `NO_PKG_MGR`, ask the user to install Node ≥ 18
 manually then re-run **login**.
 
-Note the SKILL_DIR value. If qrcode is missing, install it (quietly):
-
-```bash
-cd "$SKILL_DIR" && npm install --production --ignore-scripts --no-audit --no-fund 2>&1 | tail -3
-```
+Note the SKILL_DIR value.
 
 ### Step 3: Launch background QR-login process (auto-retries on expiry)
 
@@ -135,18 +133,14 @@ QR_RESULT=/tmp/wrc_qr_result.json
 rm -f "$QR_INFO" "$QR_RESULT"
 
 nohup node --input-type=module -e "
-  import { createRequire } from 'module';
   import { writeFileSync } from 'fs';
   import { startQrLogin, waitForQrScan } from 'SKILL_DIR/dist/wechat/login.js';
-  const require = createRequire('SKILL_DIR/package.json');
-  let QRCode = null; try { QRCode = require('qrcode'); } catch {}
-  const renderQr = (url) => QRCode
-    ? new Promise(r => QRCode.toString(url, { type:'utf8', small:true, margin:0 }, (e,s)=>r(e?null:s)))
-    : Promise.resolve(null);
+  import { renderTerminalQr } from 'SKILL_DIR/dist/wechat/qrcode.js';
+  const renderQr = (url) => { try { return renderTerminalQr(url); } catch { return null; } };
 
   for (let attempt = 1; attempt <= 5; attempt++) {
     const { qrcodeUrl, qrcodeId } = await startQrLogin();
-    const qrcodeText = await renderQr(qrcodeUrl);
+    const qrcodeText = renderQr(qrcodeUrl);
     writeFileSync('$QR_INFO', JSON.stringify({ qrcodeUrl, qrcodeId, qrcodeText, attempt, ts: Date.now() }));
     try {
       const result = await waitForQrScan(qrcodeId);
