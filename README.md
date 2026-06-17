@@ -65,6 +65,25 @@
 
 ---
 
+## 代理环境
+
+如果你的终端必须经本地代理才能联网，在启动 skill 的**同一个 shell** 里 export 代理地址即可：
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890   # 换成你的代理
+export HTTP_PROXY=http://127.0.0.1:7890
+# export NO_PROXY=localhost,127.0.0.1       # 可选：排除内网地址
+```
+
+skill 的登录进程与 bridge daemon 已默认带上 `NODE_USE_ENV_PROXY=1`，Node 内置 `fetch`
+会自动按上述环境变量走代理，无需改代码。注意：
+
+- 该开关的 `fetch` 支持需要 **Node ≥ 24**（或 **≥ 22.21**）；更低版本会静默忽略，代理不生效，需先升级 Node。
+- 未设置任何代理变量时该开关是无副作用的 no-op，普通直连用户不受影响。
+- 代理需放行微信域名 `ilinkai.weixin.qq.com` 与 `novac2c.cdn.weixin.qq.com`。
+
+---
+
 ## 安装
 
 ### 方式一：`npx skills`（推荐）

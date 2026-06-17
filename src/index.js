@@ -6,8 +6,9 @@
  * back to WeChat.  Hook events arrive over a Unix socket from hook.py.
  *
  * Multi-session support:
- *   #ls           — list all discovered CC sessions
- *   #sw <n|name>  — switch active session (resets injection state, replays context)
+ *   #ls            — list all discovered CC sessions
+ *   #sw <n|name>   — switch active session (resets injection state, replays context)
+ *   #rename <name> — rename the active session (tmux window + registry, pinned)
  */
 
 import net from 'node:net';
@@ -696,8 +697,11 @@ function scanTmuxForCC() {
           }
         }
         // Refresh name in case user renamed after initial registration.
+        // A pinned name (set via #rename) wins over any auto-derived name, so
+        // the rescan never reverts an explicit /rename.
+        const pinned = reg.sessions[existing[0]].pinnedName;
         const nameTranscript = fdTranscript || reg.sessions[existing[0]].transcriptPath;
-        const newName = getSessionDisplayName(cwd, windowName, nameTranscript, useCustomTitle(!!fdTranscript));
+        const newName = pinned || getSessionDisplayName(cwd, windowName, nameTranscript, useCustomTitle(!!fdTranscript));
         if (newName !== existing[0] && !reg.sessions[newName]) {
           logger.info(`Session renamed: ${existing[0]} → ${newName} [${tmuxStr}]`);
           reg.sessions[newName] = { ...reg.sessions[existing[0]], lastSeen: now };
@@ -775,7 +779,8 @@ function formatSessionList(reg) {
     lines.push(`${marker} ${i + 1}. ${name} (${sessionKind(s)})  [${s.tmux}]\n   ${shortPath}`);
   });
   lines.push(`\n当前: ${reg.active || '无'}`);
-  lines.push('切换: #sw <名字> 或 #sw <序号>');
+  lines.push('切换: /sw <名字> 或 /sw <序号>');
+  lines.push('改名: /rename <新名字>');
   return lines.join('\n');
 }
 
@@ -1011,6 +1016,41 @@ async function handleBridgeCommand(text, sender) {
     return;
   }
 
+  // #rename <newname> — rename the active session (tmux window + registry).
+  // The name is pinned so periodic rescans (scanTmuxForCC) won't revert it.
+  if (cmd === '#rename' || cmd === '#mv') {
+    const newName = parts.slice(1).join(' ').trim();
+    if (!newName) { await send('用法: /rename <新名字>'); return; }
+    // tmux window targets use ':' and '.' as separators; reject them in names.
+    if (/[:.\n\t]/.test(newName)) { await send('名字不能包含 : . 制表符或换行'); return; }
+
+    const reg = readSessions();
+    const oldName = reg.active;
+    if (!oldName || !reg.sessions[oldName]) { await send('当前没有活动 session'); return; }
+    if (newName === oldName) { await send(`已经叫 ${newName} 了`); return; }
+    if (reg.sessions[newName]) { await send(`已存在同名 session: ${newName}`); return; }
+
+    const s = reg.sessions[oldName];
+    // Rename the actual tmux window (target-window is session:window, drop .pane).
+    // rename-window also disables automatic-rename for that window, so it sticks.
+    const windowTarget = s.tmux.split('.')[0];
+    try {
+      execFileSync('tmux', ['rename-window', '-t', windowTarget, newName], { stdio: 'ignore' });
+    } catch (err) {
+      logger.error('tmux rename-window failed', { error: err.message, target: windowTarget });
+      // Non-fatal — the registry rename below still makes #ls/#sw use the new name.
+    }
+
+    reg.sessions[newName] = { ...s, pinnedName: newName, lastSeen: Date.now() };
+    delete reg.sessions[oldName];
+    reg.active = newName;
+    writeSessions(reg);
+
+    logger.info(`Session renamed via #rename: ${oldName} → ${newName} [${s.tmux}]`);
+    await send(`✅ 已重命名: ${oldName} → ${newName} [${s.tmux}]`);
+    return;
+  }
+
   // #model [selection] — text-based model switcher (bypasses TUI)
   if (cmd === '#model') {
     const arg = parts.slice(1).join(' ').trim();
@@ -1058,7 +1098,7 @@ async function handleBridgeCommand(text, sender) {
     return;
   }
 
-  await send(`未知指令: ${text}\n可用:\n  #ls — 列出 sessions\n  #sw <名字/序号> — 切换\n  #model — 切换模型`);
+  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换\n  /rename <新名字> — 重命名\n  /model — 切换模型`);
 }
 
 // ── Injection state machine ──────────────────────────────────────────
@@ -1682,8 +1722,9 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
     : `👋 ${label} 已连接！\n\n`;
   return header +
     '可用指令：\n' +
-    '  #ls — 列出所有 session（Claude Code / Codex）\n' +
-    '  #sw <名字/序号> — 切换 session\n' +
+    '  /ls — 列出所有 session（Claude Code / Codex）\n' +
+    '  /sw <名字/序号> — 切换 session\n' +
+    '  /rename <新名字> — 重命名当前 session\n' +
     '  /model — 切换模型（文字菜单，无需终端交互）\n\n' +
     '直接发消息即注入当前 session，回复将自动转发。';
 }
@@ -1797,6 +1838,10 @@ function handleWeChatMessage(msg, sender) {
     cmdText = '#ls';
   } else if (/^\/sw(\s|$)/i.test(cmdText)) {
     cmdText = '#sw' + cmdText.slice(3);
+  } else if (/^\/rename(\s|$)/i.test(cmdText)) {
+    cmdText = '#rename' + cmdText.slice(7);
+  } else if (/^\/mv(\s|$)/i.test(cmdText)) {
+    cmdText = '#rename' + cmdText.slice(3);
   } else if (/^\/model(\s|$)/i.test(cmdText)) {
     cmdText = '#model' + cmdText.slice(6);
   }

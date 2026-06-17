@@ -58,6 +58,27 @@ When you're away from your terminal but a Claude Code task is still running — 
 
 ---
 
+## Behind a proxy / 代理环境
+
+If your terminal can only reach the internet through a local proxy, export the proxy in
+the **same shell** you launch the skill from:
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy
+export HTTP_PROXY=http://127.0.0.1:7890
+# export NO_PROXY=localhost,127.0.0.1       # optional: bypass intranet hosts
+```
+
+The login process and the bridge daemon launch with `NODE_USE_ENV_PROXY=1` by default, so
+Node's built-in `fetch` automatically routes through those variables — no code changes
+needed. Notes:
+
+- `fetch` support for this flag requires **Node ≥ 24** (or **≥ 22.21**); older Node silently ignores it, so the proxy won't take effect — upgrade Node first.
+- With no proxy vars set the flag is a harmless no-op; direct-connection users are unaffected.
+- The proxy must allow the WeChat hosts `ilinkai.weixin.qq.com` and `novac2c.cdn.weixin.qq.com`.
+
+---
+
 ## Install as a Claude Code Skill / 作为 Claude Code Skill 安装
 
 ### Option A — `npx skills` (recommended / 推荐)
