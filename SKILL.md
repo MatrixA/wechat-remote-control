@@ -129,6 +129,28 @@ Node 12), tell the user to upgrade via nvm or NodeSource — older Node breaks E
 the bridge uses. If `INSTALL_FAILED` or `NO_PKG_MGR`, ask the user to install Node ≥ 18
 manually then re-run **login**.
 
+**Proxy support check.** All login/bridge networking uses Node's built-in `fetch`, which
+only honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` when launched with `NODE_USE_ENV_PROXY=1`
+(this skill sets that flag by default). The flag's `fetch` support requires Node **≥ 24.0**
+or **≥ 22.21**; on older Node it is silently ignored. Run:
+
+```bash
+NODE_VER=$(node -p 'process.versions.node' 2>/dev/null)
+MAJ=${NODE_VER%%.*}; REST=${NODE_VER#*.}; MIN=${REST%%.*}
+if [ "$MAJ" -ge 24 ] 2>/dev/null || { [ "$MAJ" -eq 22 ] && [ "$MIN" -ge 21 ]; } 2>/dev/null; then
+  echo "PROXY_ENV_SUPPORTED=1 (Node $NODE_VER)"
+else
+  echo "PROXY_ENV_SUPPORTED=0 (Node $NODE_VER)"
+fi
+```
+
+If `PROXY_ENV_SUPPORTED=0` **and** this terminal can only reach the internet through a
+local proxy, warn the user: the built-in `fetch` on this Node version cannot use proxy
+environment variables, so login/bridge will fail — they must upgrade to Node ≥ 24 (or
+≥ 22.21) via nvm/NodeSource. If `=1`, no action needed: it's enabled by default, and the
+user only needs to `export HTTPS_PROXY=…` (and optionally `HTTP_PROXY`/`NO_PROXY`) in the
+same shell. (No proxy env vars set → the flag is a harmless no-op.)
+
 Note the SKILL_DIR value.
 
 ### Step 3: Launch background QR-login process (auto-retries on expiry)
@@ -145,7 +167,7 @@ QR_INFO=/tmp/wrc_qr_info.json
 QR_RESULT=/tmp/wrc_qr_result.json
 rm -f "$QR_INFO" "$QR_RESULT"
 
-nohup node --input-type=module -e "
+NODE_USE_ENV_PROXY=1 nohup node --input-type=module -e "
   import { writeFileSync } from 'fs';
   import { startQrLogin, waitForQrScan } from 'SKILL_DIR/dist/wechat/login.js';
   import { renderTerminalQr } from 'SKILL_DIR/dist/wechat/qrcode.js';
@@ -504,7 +526,7 @@ echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
 **Only if BRIDGE_RUNNING=0 — start daemon** (separate bash call):
 
 ```bash
-nohup node $HOME/.claude/skills/wechat-remote-control/src/index.js >> /tmp/cc_wechat_bridge.log 2>&1 &
+NODE_USE_ENV_PROXY=1 nohup node $HOME/.claude/skills/wechat-remote-control/src/index.js >> /tmp/cc_wechat_bridge.log 2>&1 &
 echo "launched PID=$!"
 ```
 
