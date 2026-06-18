@@ -26,6 +26,13 @@ import { extractText as extractItemText } from '../dist/wechat/media.js';
 import { MessageType, MessageItemType } from '../dist/wechat/types.js';
 import { logger } from '../dist/logger.js';
 import {
+  splitMessage,
+  textFromContent,
+  findResponseToInjected,
+  findLastCompleteResponse,
+  transcriptHasUserText,
+} from '../dist/message.js';
+import {
   getAgent, sessionKind, resolveModelFor,
   CODEX_SESSIONS, findCodexTranscriptByPid, findLatestCodexRollout,
 } from './agents.js';
@@ -43,7 +50,6 @@ const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.cla
 const CLAUDE_PROJECTS = join(CLAUDE_CONFIG_DIR, 'projects');
 // Codex CLI rollout transcripts live under <CODEX_HOME>/sessions/ (CODEX_SESSIONS
 // is resolved env-aware in agents.js and re-used here for transcript discovery).
-const MAX_MSG_LEN    = 2048;
 const INJECT_DELAY   = 500;    // ms to wait after Stop before injecting
 const SCAN_INTERVAL  = 30_000; // ms between tmux auto-discovery scans
 const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switch
@@ -58,7 +64,16 @@ const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh',
 let lastInjectedText       = null;
 let lastInjectedTranscript = null;  // transcript path of the session we injected into
 let lastPushedText         = null;
-let pendingText            = null;   // queued WeChat text awaiting injection
+// FIFO queue of WeChat messages awaiting injection. Each item carries its reply
+// target (userId/contextToken) captured at receive time, so the eventual response
+// is forwarded to the right conversation even if newer messages arrive meanwhile.
+// Replaces the old single `pendingText` slot, which silently dropped a second
+// message that arrived while CC was busy.
+let pendingQueue           = [];     // Array<{ text, userId, contextToken }>
+// Reply target of the message currently injected and awaiting a response.
+let injectedUserId         = '';
+let injectedContextToken   = '';
+let orphanPollText         = null;   // injectedText of the in-flight 5-min orphan poll (dedup, B5)
 let pendingSelect          = null;   // { type, expires } — waiting for user to pick from a menu
 let pendingQuiz            = null;   // { questions, questionIndex, expires } — AskUserQuestion forwarding
 let compactionGraceUntil   = 0;     // ms timestamp — accept any same-project transcript until this time
@@ -74,6 +89,16 @@ const TYPING_TICKET_TTL  = 12 * 3600_000; // cache ticket for 12 hours
 let typingTicketCache    = null;     // { ticket, userId, fetchedAt }
 let typingRefreshTimer   = null;     // setInterval handle
 let wechatApi            = null;     // WeChatApi instance, set in main()
+let wechatSender         = null;     // createSender() result, set in main() (for timer-driven sends)
+
+// ── Progress heartbeat state ─────────────────────────────────────────
+// The typing indicator dies client-side after ~15s, so on multi-minute tool
+// loops the user is left staring at silence wondering if the bridge crashed.
+// A periodic "still working (N tools)" message keeps them informed (C1/H7).
+const HEARTBEAT_MS       = 25_000;
+let heartbeatTimer       = null;
+let turnToolCount        = 0;        // tools called during the current WeChat turn
+let turnLastTool         = '';       // name of the most recent tool
 
 // ── Typing indicator helpers ─────────────────────────────────────────
 // Learned from wong2/weixin-agent-sdk: getConfig → typing_ticket, then
@@ -121,6 +146,33 @@ function stopTypingIndicator(api, userId) {
   }
 }
 
+// ── Progress heartbeat ───────────────────────────────────────────────
+// Started when a WeChat-initiated message is injected; ticks every HEARTBEAT_MS
+// while the turn is still in flight, pushing a short progress line. Self-stops
+// once the turn resolves (lastInjectedText cleared) so a forgotten call site can
+// never leave it running.
+function startHeartbeat() {
+  stopHeartbeat();
+  turnToolCount = 0;
+  turnLastTool  = '';
+  heartbeatTimer = setInterval(() => {
+    if (!lastInjectedText) { stopHeartbeat(); return; }
+    if (pendingQuiz || pendingSelect) return;      // user is being asked something — don't nag
+    if (!wechatSender) return;
+    const userId   = injectedUserId || targetUserId;
+    const ctxToken = injectedContextToken || contextToken;
+    if (!userId) return;
+    const body = turnToolCount > 0
+      ? `🔧 处理中：已调用 ${turnToolCount} 个工具${turnLastTool ? `，最近 ${turnLastTool}` : ''}`
+      : '🔧 仍在处理中…';
+    wechatSender.sendText(userId, ctxToken, body).catch(() => {});
+  }, HEARTBEAT_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+
 // ── JSON helpers ─────────────────────────────────────────────────────
 function readJson(path, fallback) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; }
@@ -133,6 +185,14 @@ function writeJson(path, data) {
 
 // ── State helpers ────────────────────────────────────────────────────
 function readState()    { return readJson(STATE_FILE, {}); }
+// Record / clear a best-effort diagnostic flag when the hook server can't bind.
+// Surfaced in logs and state.json so a silent startup failure is at least traceable.
+function markBridgeStartFailed(reason) {
+  try { const st = readState(); st.bridgeStartError = reason; st.bridgeStartErrorAt = Date.now(); writeJson(STATE_FILE, st); } catch {}
+}
+function clearBridgeStartError() {
+  try { const st = readState(); if (st.bridgeStartError) { delete st.bridgeStartError; delete st.bridgeStartErrorAt; writeJson(STATE_FILE, st); } } catch {}
+}
 function loadSession()  { return readJson(SESSION_FILE, {}); }
 function saveSession(obj) { writeJson(SESSION_FILE, obj); }
 function readSessions() { return readJson(SESSIONS_FILE, { active: null, sessions: {} }); }
@@ -360,81 +420,8 @@ function parseTranscript(filePath) {
   } catch { return []; }
 }
 
-function textFromContent(content) {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.filter(b => b.type === 'text' && b.text).map(b => b.text).join('');
-  }
-  return null;
-}
-
-/**
- * Find the assistant response to an injected user message in the transcript.
- * Returns { text, complete } where complete=true means the last assistant turn
- * had stop_reason==='end_turn' (natural completion), or null if no response found.
- * When complete=false, CC was likely interrupted mid-agentic-loop (e.g. context
- * overflow / compaction) and the text is only a partial intermediate response.
- */
-function findResponseToInjected(entries, injectedText) {
-  if (!injectedText) return null;
-  let userIdx = -1;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.type === 'user') {
-      const text = textFromContent(e.message?.content);
-      if (text === injectedText) { userIdx = i; break; }
-    }
-  }
-  if (userIdx === -1) return null;
-
-  // Collect all assistant text after the injected message, tracking the last end_turn.
-  // In a multi-turn agentic loop, the LAST end_turn entry contains the final response.
-  let lastEndTurnText = null;
-  let lastText = null;
-  for (let i = userIdx + 1; i < entries.length; i++) {
-    const e = entries[i];
-    if (e.type === 'user' && typeof e.message?.content === 'string') break;
-    if (e.type === 'assistant') {
-      const t = textFromContent(e.message?.content);
-      if (t) lastText = t;
-      if (e.message?.stop_reason === 'end_turn' && t) lastEndTurnText = t;
-    }
-  }
-
-  if (lastEndTurnText) return { text: lastEndTurnText, complete: true };
-  if (lastText) return { text: lastText, complete: false };
-  return null;
-}
-
-/**
- * Post-compaction fallback: find the last complete (end_turn) assistant response
- * in the transcript. Used when the injected text was summarized away by compaction.
- */
-function findLastCompleteResponse(entries) {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.type === 'assistant' && e.message?.stop_reason === 'end_turn') {
-      const t = textFromContent(e.message.content);
-      if (t) return { text: t, complete: true };
-    }
-  }
-  return null;
-}
-
-// ── Message splitting ────────────────────────────────────────────────
-function splitMessage(text, maxLen = MAX_MSG_LEN) {
-  if (text.length <= maxLen) return [text];
-  const chunks = [];
-  let rem = text;
-  while (rem.length > 0) {
-    if (rem.length <= maxLen) { chunks.push(rem); break; }
-    let idx = rem.lastIndexOf('\n', maxLen);
-    if (idx < maxLen * 0.3) idx = maxLen;
-    chunks.push(rem.slice(0, idx));
-    rem = rem.slice(idx).replace(/^\n+/, '');
-  }
-  return chunks;
-}
+// textFromContent / findResponseToInjected / findLastCompleteResponse /
+// splitMessage now live in src/message.ts (pure + unit-tested), imported above.
 
 // ── Multi-session: discovery ─────────────────────────────────────────
 
@@ -462,8 +449,11 @@ function findLatestTranscript(cwd) {
 }
 
 /**
- * Get a CC process's start time in epoch ms via /proc/<pid>/stat.
- * Field 22 (starttime) is clock ticks since boot; CLK_TCK=100 on x86_64 Linux.
+ * Get a CC process's start time in epoch ms.
+ * Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot; CLK_TCK=100).
+ * macOS / no /proc: fall back to `ps -o lstart=` (e.g. "Wed Jun 18 10:23:45 2026").
+ * Without the fallback, macOS multi-session-same-cwd disambiguation silently
+ * degraded to newest-by-mtime, routing messages to the wrong session (B8/M7).
  */
 function getProcessStartTimeMs(pid) {
   try {
@@ -474,7 +464,15 @@ function getProcessStartTimeMs(pid) {
     const uptime = parseFloat(readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
     const bootMs = Date.now() - uptime * 1000;
     return bootMs + (startTicks / 100) * 1000;
-  } catch { return null; }
+  } catch {}
+  try {
+    const lstart = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const ms = Date.parse(lstart);
+    return Number.isNaN(ms) ? null : ms;
+  } catch {}
+  return null;
 }
 
 /**
@@ -498,15 +496,14 @@ function findTranscriptForProcess(panePid, cwd) {
 
   if (transcripts.length <= 1) return transcripts[0]?.path ?? null;
 
-  // Find the CC process PID and its start time
+  // Find the CC process PID and its start time. Use getComm() (which has a macOS
+  // `ps` fallback) rather than reading /proc directly, so this works off Linux.
   let ccStartMs = null;
   for (const pid of collectDescendants(panePid)) {
-    try {
-      if (readFileSync(`/proc/${pid}/comm`, 'utf8').trim() === 'claude') {
-        ccStartMs = getProcessStartTimeMs(pid);
-        break;
-      }
-    } catch {}
+    if (getComm(pid) === 'claude') {
+      ccStartMs = getProcessStartTimeMs(pid);
+      break;
+    }
   }
 
   if (!ccStartMs) return findLatestTranscript(cwd);
@@ -571,26 +568,48 @@ function detectPaneAgent(panePid) {
   return found;
 }
 
+/** macOS fallback: find an open .jsonl transcript via `lsof -p <pid> -Fn`. */
+function lsofTranscript(pid) {
+  try {
+    const out = execFileSync('lsof', ['-p', String(pid), '-Fn'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    for (const line of out.split('\n')) {
+      if (line[0] !== 'n') continue;          // -Fn prefixes file paths with 'n'
+      const path = line.slice(1);
+      if (path.endsWith('.jsonl') && path.startsWith(CLAUDE_PROJECTS)) return path;
+    }
+  } catch {}
+  return null;
+}
+
 /**
  * Find the transcript file actually held open by the CC process running in a
  * given tmux pane.  Walks the process tree rooted at panePid and checks each
- * descendant's open file descriptors via /proc/<pid>/fd.
- * Returns null if nothing is found (e.g. non-Linux, or no CC in that pane).
+ * descendant's open file descriptors: /proc/<pid>/fd on Linux, `lsof` on macOS.
+ * Returns null if nothing is found (no CC in that pane, or lsof unavailable).
  */
 function findTranscriptByPid(panePid) {
   try {
     for (const pid of collectDescendants(panePid)) {
-      const fdDir = `/proc/${pid}/fd`;
+      let procFdReadable = false;
       try {
-        for (const fd of readdirSync(fdDir)) {
+        const fds = readdirSync(`/proc/${pid}/fd`);
+        procFdReadable = true;
+        for (const fd of fds) {
           try {
-            const target = readlinkSync(join(fdDir, fd));
+            const target = readlinkSync(join(`/proc/${pid}/fd`, fd));
             if (target.endsWith('.jsonl') && target.startsWith(CLAUDE_PROJECTS)) {
               return target;
             }
           } catch {}
         }
       } catch {}
+      // No /proc (macOS) → try lsof for this pid's open files.
+      if (!procFdReadable) {
+        const viaLsof = lsofTranscript(pid);
+        if (viaLsof) return viaLsof;
+      }
     }
   } catch {}
   return null;
@@ -973,10 +992,22 @@ async function handleBridgeCommand(text, sender) {
     reg.active = targetName;
     writeSessions(reg);
 
-    // Reset injection state for the new session
+    // Reset injection state for the new session. Clearing lastInjectedText +
+    // pendingQueue means any in-flight Stop / orphan poll from the OLD session is
+    // dropped rather than mis-routed to the new one (B2/H4 — together with the
+    // transcriptHasInjectedUser guard in onStop). Stop the old typing indicator (B7).
+    if (wechatApi && (injectedUserId || targetUserId)) {
+      stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
+    }
+    stopHeartbeat();
     lastInjectedText       = null;
     lastInjectedTranscript = null;
-    lastPushedText = null;
+    lastPushedText         = null;
+    injectedUserId         = '';
+    injectedContextToken   = '';
+    orphanPollText         = null;
+    pendingQueue           = [];
+    cancelPending();
     saveSession({ targetUserId, lastInjectedText: null });
 
     // Update cc_pid to the CC process in the new session's pane
@@ -1108,47 +1139,97 @@ function cancelPending() {
 
 function scheduleInject() {
   cancelPending();
-  if (!pendingText) return;
+  // One turn at a time: never inject while a previous message is still awaiting
+  // its response (lastInjectedText set). The Stop handler clears it and re-calls
+  // scheduleInject() to drain the next queued message in order.
+  if (lastInjectedText) return;
+  if (pendingQueue.length === 0) return;
   injectTimer = setTimeout(() => {
+    if (lastInjectedText || pendingQueue.length === 0) return;
     const state = getActiveState();
     const target = tmuxTarget(state);
     if (!target || !paneExists(target)) {
       logger.warn('Cannot inject: tmux target unavailable', { target });
       return;
     }
-    const text = pendingText;
-    pendingText = null;
+    const item = pendingQueue.shift();
     try {
-      sendKeys(target, text);
-      lastInjectedText       = text;
+      sendKeys(target, item.text);
+      lastInjectedText       = item.text;
       lastInjectedTranscript = state.transcriptPath || null;
+      injectedUserId         = item.userId;
+      injectedContextToken   = item.contextToken;
       saveSession({ targetUserId, lastInjectedText, lastInjectedTranscript });
-      appendHistory({ type: 'user_wechat', text });
-      logger.info('Injected WeChat message', { chars: text.length, transcript: lastInjectedTranscript?.slice(-40) });
+      appendHistory({ type: 'user_wechat', text: item.text });
+      startHeartbeat();  // progress pings until this turn resolves (C1/H7)
+      logger.info('Injected WeChat message', { chars: item.text.length, queued: pendingQueue.length, transcript: lastInjectedTranscript?.slice(-40) });
     } catch (err) {
+      // Re-queue at the head so the message is not lost on a transient tmux error.
+      pendingQueue.unshift(item);
       logger.error('tmux inject failed', { error: err.message });
     }
   }, INJECT_DELAY);
+}
+
+// ── WeChat send with retry ───────────────────────────────────────────
+// WeChat sends are otherwise fire-and-forget; without retry a transient network
+// blip / session hiccup silently drops an assistant reply. Bounded exponential
+// backoff, then a best-effort "delivery failed" notice so the user isn't left
+// believing the turn produced nothing.
+async function sendChunkWithRetry(sender, userId, ctxToken, text, attempts = 3) {
+  let delay = 500;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await sender.sendText(userId, ctxToken, text);
+      return true;
+    } catch (err) {
+      logger.warn('sendText failed', { attempt: i, error: err.message });
+      if (i < attempts) { await new Promise(r => setTimeout(r, delay)); delay *= 2; }
+    }
+  }
+  logger.error('sendText permanently failed after retries', { chars: text.length });
+  return false;
+}
+
+/**
+ * Forward a full assistant response to a captured reply target: split into
+ * chunks (prefixed [i/n] when more than one), each sent with retry. On any
+ * permanent chunk failure, send one best-effort notice.
+ */
+async function forwardResponse(sender, userId, ctxToken, fullText) {
+  const chunks = splitMessage(fullText);
+  let anyFailed = false;
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
+    const ok = await sendChunkWithRetry(sender, userId, ctxToken, prefix + chunks[i]);
+    if (!ok) anyFailed = true;
+  }
+  if (anyFailed) {
+    sender.sendText(userId, ctxToken, '⚠️ 部分回复发送失败，请回终端查看完整结果').catch(() => {});
+  }
 }
 
 // ── Hook event handlers ──────────────────────────────────────────────
 
 /**
  * Forward a complete assistant response to WeChat and clear injection state.
- * Shared by the Claude and Codex Stop paths.
+ * Uses the reply target (userId/contextToken) captured at injection time — NOT
+ * the live globals — so a newer incoming message can't redirect this reply to
+ * the wrong conversation. Shared by every Claude/Codex forward path.
  */
 function pushResponse(responseText, sender) {
-  if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
+  const userId   = injectedUserId || targetUserId;
+  const ctxToken = injectedContextToken || contextToken;
+  stopHeartbeat();
+  if (wechatApi) stopTypingIndicator(wechatApi, userId);
   lastPushedText         = responseText;
   lastInjectedText       = null;
   lastInjectedTranscript = null;
+  injectedUserId         = '';
+  injectedContextToken   = '';
   saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
   appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
-  for (const chunk of splitMessage(responseText)) {
-    sender.sendText(targetUserId, contextToken, chunk).catch(err => {
-      logger.error('Push to WeChat failed', { error: err.message });
-    });
-  }
+  forwardResponse(sender, userId, ctxToken, responseText);
 }
 
 /**
@@ -1202,24 +1283,45 @@ function onStopCodex(payload, sender, readPath) {
     if (lastInjectedText !== savedInjected) return; // resolved elsewhere
     const t2 = pickText(agent.parseRollout(readPath));
     if (t2) {
+      orphanPollText = null;
       pushResponse(t2, sender);
       logger.info('Pushed codex response via deferred poll', { chars: t2.length });
+      scheduleInject();
       return;
     }
     if (Date.now() >= deadline) {
       logger.warn('Codex: no response within grace window, cleaning up');
+      orphanPollText = null;
       if (lastInjectedText === savedInjected) {
-        if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
+        if (wechatApi) stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
         lastInjectedText       = null;
         lastInjectedTranscript = null;
+        injectedUserId         = '';
+        injectedContextToken   = '';
         saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+        scheduleInject();
       }
       return;
     }
     setTimeout(poll, POLL_MS);
   };
-  setTimeout(poll, POLL_MS);
+  // B5: dedup — one poll chain per injected message.
+  if (orphanPollText !== savedInjected) {
+    orphanPollText = savedInjected;
+    setTimeout(poll, POLL_MS);
+  }
   scheduleInject();
+}
+
+/**
+ * Does `tpath` actually contain our injected user message? Used to gate the
+ * "same project dir, different file" acceptance: without this, a late Stop from
+ * a DIFFERENT session sharing the cwd (e.g. right after #sw) is wrongly accepted
+ * and the response search runs against the wrong transcript (H4).
+ */
+function transcriptHasInjectedUser(tpath, injectedText) {
+  if (!tpath || !injectedText) return false;
+  return transcriptHasUserText(parseTranscript(tpath), injectedText);
 }
 
 async function onStop(payload, sender) {
@@ -1242,11 +1344,14 @@ async function onStop(payload, sender) {
     if (kind === 'claude' && lastInjectedText && Date.now() < compactionGraceUntil) {
       logger.info('Accepting post-compaction transcript', { tpath: tpath.slice(-40) });
       lastInjectedTranscript = tpath;  // update to new transcript
-    } else if (kind === 'claude' && lastInjectedText && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)) {
-      // Same project directory but different transcript file.  The session scanner
-      // may have assigned the wrong .jsonl at injection time (multiple transcripts
-      // in the same project dir).  The hook's tpath is authoritative (from the CC
-      // process itself), so accept it and update.
+    } else if (kind === 'claude' && lastInjectedText
+               && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)
+               && transcriptHasInjectedUser(tpath, lastInjectedText)) {
+      // Same project dir, different file, AND this transcript actually contains our
+      // injected message → the scanner picked the wrong .jsonl at injection time and
+      // the hook's tpath is authoritative. Accept it. (If it does NOT contain our
+      // message it belongs to a different session sharing the cwd — fall through to
+      // ignore, preventing the H4 mis-route after #sw.)
       logger.info('Stop from same project, accepting transcript switch', { tpath: tpath.slice(-40), was: (lastInjectedTranscript || state.transcriptPath)?.slice(-40) });
       lastInjectedTranscript = tpath;
     } else {
@@ -1298,17 +1403,7 @@ async function onStop(payload, sender) {
 
   // ── Path A: Complete response → forward to WeChat
   if (responseText && responseComplete && lastInjectedText) {
-    if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
-    lastPushedText         = responseText;
-    lastInjectedText       = null;
-    lastInjectedTranscript = null;
-    saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
-    appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
-    for (const chunk of splitMessage(responseText)) {
-      sender.sendText(targetUserId, contextToken, chunk).catch(err => {
-        logger.error('Push to WeChat failed', { error: err.message });
-      });
-    }
+    pushResponse(responseText, sender);
     logger.info('Pushed response to WeChat', { chars: responseText.length });
     scheduleInject();
     return;
@@ -1334,19 +1429,9 @@ async function onStop(payload, sender) {
       const retryEntries = parseTranscript(savedReadPath);
       const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
       if (retryResult?.text && retryResult.complete) {
-        logger.info('Found complete response via deferred retry', { chars: retryResult.text.length });
-        if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
-        lastPushedText         = retryResult.text;
-        lastInjectedText       = null;
-        lastInjectedTranscript = null;
-        saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
-        appendHistory({ type: 'assistant', text: retryResult.text.slice(0, 500) });
-        for (const chunk of splitMessage(retryResult.text)) {
-          sender.sendText(targetUserId, contextToken, chunk).catch(err => {
-            logger.error('Push to WeChat failed', { error: err.message });
-          });
-        }
+        pushResponse(retryResult.text, sender);
         logger.info('Pushed response to WeChat via deferred retry', { chars: retryResult.text.length });
+        scheduleInject();
       }
     }, 3000);
 
@@ -1363,18 +1448,7 @@ async function onStop(payload, sender) {
       const retryEntries = parseTranscript(readPath);
       result = findResponseToInjected(retryEntries, lastInjectedText);
       if (result?.text && result.complete) {
-        logger.info('Found response after 500ms retry', { chars: result.text.length });
-        if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
-        lastPushedText         = result.text;
-        lastInjectedText       = null;
-        lastInjectedTranscript = null;
-        saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
-        appendHistory({ type: 'assistant', text: result.text.slice(0, 500) });
-        for (const chunk of splitMessage(result.text)) {
-          sender.sendText(targetUserId, contextToken, chunk).catch(err => {
-            logger.error('Push to WeChat failed', { error: err.message });
-          });
-        }
+        pushResponse(result.text, sender);
         logger.info('Pushed response to WeChat via retry', { chars: result.text.length });
         scheduleInject();
         return;
@@ -1420,40 +1494,38 @@ async function onStop(payload, sender) {
           const retryEntries = parseTranscript(savedReadPath);
           const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
           if (retryResult?.text && retryResult.complete) {
-            logger.info('Found complete response via deferred orphan poll', {
-              chars: retryResult.text.length,
-            });
-            if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
-            lastPushedText         = retryResult.text;
-            lastInjectedText       = null;
-            lastInjectedTranscript = null;
-            saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
-            appendHistory({ type: 'assistant', text: retryResult.text.slice(0, 500) });
-            for (const chunk of splitMessage(retryResult.text)) {
-              sender.sendText(targetUserId, contextToken, chunk).catch(err => {
-                logger.error('Push to WeChat failed', { error: err.message });
-              });
-            }
+            orphanPollText = null;
+            pushResponse(retryResult.text, sender);
             logger.info('Pushed response to WeChat via deferred orphan poll', {
               chars: retryResult.text.length,
             });
+            scheduleInject();
             return;
           }
           if (Date.now() >= deadline) {
             logger.warn('No response found within grace window, cleaning up', {
               lastInjected: savedInjectedText.slice(0, 60), graceMs: ORPHAN_GRACE_MS,
             });
+            orphanPollText = null;
             if (lastInjectedText === savedInjectedText) {
-              if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
+              if (wechatApi) stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
               lastInjectedText       = null;
               lastInjectedTranscript = null;
+              injectedUserId         = '';
+              injectedContextToken   = '';
               saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+              scheduleInject();
             }
             return;
           }
           setTimeout(poll, POLL_INTERVAL_MS);
         };
-        setTimeout(poll, POLL_INTERVAL_MS);
+        // B5: dedup — only one orphan poll chain per injected message, so repeated
+        // Stops for the same unresolved turn don't accumulate timer closures.
+        if (orphanPollText !== savedInjectedText) {
+          orphanPollText = savedInjectedText;
+          setTimeout(poll, POLL_INTERVAL_MS);
+        }
       }
     }
   }
@@ -1491,6 +1563,9 @@ function onPreToolUse(payload, sender) {
   let desc = `${toolName}`;
   if (toolName === 'Bash' && toolInput.command) desc = `bash: \`${toolInput.command.slice(0, 120)}\``;
   else if (toolInput.file_path) desc = `${toolName}(${toolInput.file_path})`;
+
+  // Track tool activity for the progress heartbeat (only our in-flight turn).
+  if (lastInjectedText) { turnToolCount++; turnLastTool = toolName; }
 
   // ── Quiz support: forward AskUserQuestion to WeChat ──
   // Only intercept quizzes triggered by a WeChat-injected message (lastInjectedText is set).
@@ -1576,50 +1651,44 @@ async function onNotification(payload, sender) {
       if (readPath) {
         const entries = parseTranscript(readPath);
         result = findResponseToInjected(entries, lastInjectedText);
-        // If not found, try other transcripts in the same project dir
+        // If not found, try the single newest OTHER transcript in the same project
+        // dir, in case the scanner assigned the wrong .jsonl at injection time.
+        // B6: only the newest alt (not 3) — this runs synchronously on the hook
+        // event loop, so reading several large transcripts here stalls the daemon.
         if (!result) {
           try {
             const projDir = dirname(readPath);
-            const otherFiles = readdirSync(projDir)
+            const altPath = readdirSync(projDir)
               .filter(f => f.endsWith('.jsonl') && join(projDir, f) !== readPath)
               .map(f => ({ path: join(projDir, f), mtime: statSync(join(projDir, f)).mtimeMs }))
-              .sort((a, b) => b.mtime - a.mtime);
-            for (const { path: altPath } of otherFiles.slice(0, 3)) {
-              const altEntries = parseTranscript(altPath);
-              result = findResponseToInjected(altEntries, lastInjectedText);
+              .sort((a, b) => b.mtime - a.mtime)[0]?.path;
+            if (altPath) {
+              result = findResponseToInjected(parseTranscript(altPath), lastInjectedText);
               if (result?.text) {
                 logger.info('Found response in alt transcript during idle cleanup', { altPath: altPath.slice(-40) });
                 lastInjectedTranscript = altPath;
-                break;
               }
             }
           } catch {}
         }
       }
       if (result?.text) {
-          logger.info('Found response in idle cleanup', { chars: result.text.length, complete: result.complete });
-          if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
-          lastPushedText         = result.text;
-          lastInjectedText       = null;
-          lastInjectedTranscript = null;
-          saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
-          appendHistory({ type: 'assistant', text: result.text.slice(0, 500) });
-          for (const chunk of splitMessage(result.text)) {
-            sender.sendText(targetUserId, contextToken, chunk).catch(err => {
-              logger.error('Push to WeChat failed', { error: err.message });
-            });
-          }
-          logger.info('Pushed response to WeChat via idle cleanup', { chars: result.text.length });
+          pushResponse(result.text, sender);
+          logger.info('Pushed response to WeChat via idle cleanup', { chars: result.text.length, complete: result.complete });
           scheduleInject();
           return;
       }
       logger.warn('CC idle but lastInjectedText still set, cleaning up', {
         lastInjected: lastInjectedText.slice(0, 60),
       });
-      if (wechatApi) stopTypingIndicator(wechatApi, targetUserId);
+      orphanPollText = null;
+      if (wechatApi) stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
       lastInjectedText       = null;
       lastInjectedTranscript = null;
+      injectedUserId         = '';
+      injectedContextToken   = '';
       saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+      scheduleInject();
     } else {
       logger.info('Notification (logged, not pushed): ' + msg);
     }
@@ -1663,12 +1732,14 @@ function startHookServer(sender) {
   // bind an AF_UNIX path, so a second daemon — launched from ANY install dir
   // (~/.claude/skills or ~/.agents/skills) — detects the live one and exits.
   return new Promise((resolve) => {
-    let retried = false;
+    let retries = 0;
+    const MAX_RETRIES = 3;
 
     function onListen() {
       if (process.platform !== 'win32') try { chmodSync(HOOK_SOCKET, 0o600); } catch {}
       // Claim singleton ownership: write our own PID authoritatively.
       try { writeFileSync(join(CC_WECHAT, 'bridge.pid'), String(process.pid)); } catch {}
+      clearBridgeStartError();
       logger.info('Hook server ready at ' + HOOK_SOCKET);
       console.log('[wrc-bridge] hook server ready at ' + HOOK_SOCKET);
       resolve(server);
@@ -1676,8 +1747,11 @@ function startHookServer(sender) {
 
     server.on('error', (err) => {
       if (err.code !== 'EADDRINUSE') {
-        logger.error('Hook server error', { error: err.message });
+        // e.g. EACCES / EIO — not recoverable by retry. Record + exit loudly so
+        // the failure is traceable rather than a silent dead bridge.
+        logger.error('Hook server error (fatal)', { code: err.code, error: err.message });
         console.error('[wrc-bridge] hook server error: ' + err.message);
+        markBridgeStartFailed(`bind failed: ${err.code || err.message}`);
         process.exit(1);
       }
       // Path is taken. Probe whether a live daemon owns it.
@@ -1693,14 +1767,18 @@ function startHookServer(sender) {
       probe.once('timeout', decideAlive);
       probe.once('error', () => {
         try { probe.destroy(); } catch {}
-        // Stale socket file (no listener). Remove and retry once.
-        if (retried) {
-          logger.error('Hook socket busy after stale cleanup, exiting');
+        // Stale socket file (no live listener). Remove and retry with bounded
+        // backoff — covers the race where another daemon rebinds between our
+        // unlink and listen, instead of giving up after a single attempt.
+        if (retries >= MAX_RETRIES) {
+          logger.error('Hook socket busy after stale cleanup, giving up', { retries });
+          console.error('[wrc-bridge] hook socket busy after stale cleanup, giving up');
+          markBridgeStartFailed('hook socket busy after stale cleanup');
           process.exit(1);
         }
-        retried = true;
+        retries++;
         try { unlinkSync(HOOK_SOCKET); } catch {}
-        server.listen(HOOK_SOCKET, onListen);
+        setTimeout(() => server.listen(HOOK_SOCKET, onListen), 200 * retries);
       });
     });
 
@@ -1758,7 +1836,7 @@ function handleWeChatMessage(msg, sender) {
   );
 
   if (hasImage && textParts.length === 0) {
-    sender.sendText(targetUserId, contextToken, '⚠️ 图片消息暂不支持在 bridge 模式下处理，请使用 daemon 模式或发送文字')
+    sender.sendText(targetUserId, contextToken, '⚠️ 暂不支持图片消息，请发送文字（或语音，会自动转成文字）')
       .catch(err => logger.error('Image notice failed', { error: err.message }));
     return;
   }
@@ -1794,6 +1872,7 @@ function handleWeChatMessage(msg, sender) {
     if (Date.now() > pendingSelect.expires) {
       logger.info('pendingSelect expired, clearing');
       pendingSelect = null;
+      sender.sendText(targetUserId, contextToken, '⏰ 模型菜单已超时取消，本条按普通消息处理').catch(() => {});
     } else if (pendingSelect.type === 'model') {
       const resolved = resolveModelFor(getActiveState().kind || 'claude', text.trim());
       if (resolved) {
@@ -1820,6 +1899,7 @@ function handleWeChatMessage(msg, sender) {
     if (Date.now() > pendingQuiz.expires) {
       logger.info('pendingQuiz expired, clearing');
       pendingQuiz = null;
+      sender.sendText(targetUserId, contextToken, '⏰ 问卷已超时取消，本条按普通消息处理').catch(() => {});
     } else {
       handleQuizResponse(text, sender);
       return;
@@ -1888,8 +1968,10 @@ function handleWeChatMessage(msg, sender) {
     // Not a known built-in → probably a skill → inject normally (produces transcript)
   }
 
-  // Regular message or skill — queue for tmux injection
-  pendingText = text;
+  // Regular message or skill — enqueue for tmux injection. Capture the reply
+  // target NOW so a later message can't steal this turn's response, and so a
+  // busy-time second message no longer overwrites the first (H2/H3).
+  pendingQueue.push({ text, userId: targetUserId, contextToken });
 
   // Start typing indicator immediately (fire-and-forget, non-blocking)
   if (wechatApi && targetUserId) {
@@ -1901,7 +1983,7 @@ function handleWeChatMessage(msg, sender) {
   if (!ccBusy) {
     scheduleInject();
   } else {
-    logger.info('CC busy, queued for injection after Stop');
+    logger.info('CC busy, message queued for injection after Stop', { queued: pendingQueue.length });
   }
 }
 
@@ -1923,6 +2005,7 @@ async function main() {
   const api    = new WeChatApi(account.botToken, account.baseUrl);
   wechatApi    = api;  // expose for typing indicator helpers
   const sender = createSender(api, account.accountId);
+  wechatSender = sender;  // expose for timer-driven sends (progress heartbeat)
 
   const hookServer = await startHookServer(sender);
 

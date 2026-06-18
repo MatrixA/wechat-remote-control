@@ -37,8 +37,10 @@ const CODEX_SESSIONS    = join(CODEX_HOME, 'sessions');
 export { CLAUDE_PROJECTS, CODEX_SESSIONS };
 
 // ── Model lists ──────────────────────────────────────────────────────
+// Claude model identifiers (last verified 2026-06-18). Opus 4.8 is the current
+// flagship; Sonnet 4.6 balances speed/intelligence; Haiku 4.5 is the fast tier.
 export const CLAUDE_MODELS = [
-  { id: 'claude-opus-4-6',           display: 'Opus 4.6',   short: 'opus'   },
+  { id: 'claude-opus-4-8',           display: 'Opus 4.8',   short: 'opus'   },
   { id: 'claude-sonnet-4-6',         display: 'Sonnet 4.6', short: 'sonnet' },
   { id: 'claude-haiku-4-5-20251001', display: 'Haiku 4.5',  short: 'haiku'  },
 ];
@@ -97,22 +99,42 @@ function collectDescendants(rootPid) {
 
 /**
  * Find the rollout .jsonl held open by the codex process in a tmux pane, by
- * scanning open file descriptors via /proc (Linux only). Returns null on macOS
- * or when nothing matches — callers fall back to findLatestCodexRollout.
+ * scanning open file descriptors: /proc/<pid>/fd on Linux, `lsof` on macOS.
+ * Returns null when nothing matches — callers fall back to findLatestCodexRollout.
  */
+function lsofCodexRollout(pid) {
+  try {
+    const out = execFileSync('lsof', ['-p', String(pid), '-Fn'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    for (const line of out.split('\n')) {
+      if (line[0] !== 'n') continue;          // -Fn prefixes file paths with 'n'
+      const path = line.slice(1);
+      if (path.endsWith('.jsonl') && path.startsWith(CODEX_SESSIONS)) return path;
+    }
+  } catch {}
+  return null;
+}
+
 export function findCodexTranscriptByPid(panePid) {
   for (const pid of collectDescendants(panePid)) {
-    const fdDir = `/proc/${pid}/fd`;
+    let procFdReadable = false;
     try {
-      for (const fd of readdirSync(fdDir)) {
+      const fds = readdirSync(`/proc/${pid}/fd`);
+      procFdReadable = true;
+      for (const fd of fds) {
         try {
-          const target = readlinkSync(join(fdDir, fd));
+          const target = readlinkSync(join(`/proc/${pid}/fd`, fd));
           if (target.endsWith('.jsonl') && target.startsWith(CODEX_SESSIONS)) {
             return target;
           }
         } catch {}
       }
     } catch {}
+    if (!procFdReadable) {
+      const viaLsof = lsofCodexRollout(pid);
+      if (viaLsof) return viaLsof;
+    }
   }
   return null;
 }
