@@ -41,7 +41,7 @@ export async function waitForQrScan(qrcodeId) {
         }
         catch (e) {
             clearTimeout(timer);
-            if (e.name === 'AbortError' || e.code === 'ETIMEDOUT') {
+            if (e?.name === 'AbortError' || e?.code === 'ETIMEDOUT') {
                 logger.info('QR poll timed out, retrying');
                 continue;
             }
