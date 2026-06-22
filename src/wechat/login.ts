@@ -69,7 +69,7 @@ export async function waitForQrScan(qrcodeId: string): Promise<AccountData> {
       res = await fetch(url, { signal: controller.signal });
     } catch (e: any) {
       clearTimeout(timer);
-      if (e.name === 'AbortError' || e.code === 'ETIMEDOUT') {
+      if (e?.name === 'AbortError' || e?.code === 'ETIMEDOUT') {
         logger.info('QR poll timed out, retrying');
         continue;
       }

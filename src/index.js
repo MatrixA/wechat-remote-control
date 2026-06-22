@@ -253,7 +253,21 @@ function stripAnsi(str) {
  * Fallback for when the transcript has no entry (CLI errors, unknown skills, etc.).
  */
 function sendKeys(target, text) {
+  // Strip control chars but KEEP newlines (\x0a) — a multi-line WeChat message
+  // must reach the agent as one prompt, not be fragmented per line.
   const safe = text.replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '');
+  if (safe.includes('\n')) {
+    // `send-keys -l` delivers each embedded newline as a literal Return, so the
+    // agent submits after the first line and the rest lands as separate prompts.
+    // Use a tmux paste buffer with bracketed paste (-p) instead: the CC/Codex TUI
+    // inserts the newlines verbatim, then a single Enter submits the whole message.
+    // (-p only brackets when the pane's app enabled bracketed-paste mode, which
+    // both agents do; -d deletes the temp buffer after pasting.)
+    execFileSync('tmux', ['set-buffer', '-b', 'wrc-inject', safe]);
+    execFileSync('tmux', ['paste-buffer', '-d', '-p', '-b', 'wrc-inject', '-t', target]);
+    execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
+    return;
+  }
   execFileSync('tmux', ['send-keys', '-l', '-t', target, safe]);
   execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
 }
@@ -1000,6 +1014,11 @@ async function handleBridgeCommand(text, sender) {
       stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
     }
     stopHeartbeat();
+    // The new session's busy state is unknown, and lastInjectedText is the real
+    // per-turn serializer. Leaving the OLD session's ccBusy=true here strands the
+    // next WeChat message forever: an idle just-switched session fires no Stop, so
+    // nothing would ever clear the flag and `if (!ccBusy) scheduleInject()` never runs.
+    ccBusy                 = false;
     lastInjectedText       = null;
     lastInjectedTranscript = null;
     lastPushedText         = null;
@@ -1356,6 +1375,10 @@ async function onStop(payload, sender) {
       lastInjectedTranscript = tpath;
     } else {
       logger.debug('Stop from foreign session, ignoring', { tpath: tpath.slice(-60), injected: lastInjectedTranscript?.slice(-40), active: state.transcriptPath?.slice(-40) });
+      // ccBusy was cleared unconditionally at the top of onStop, so a message
+      // queued for the ACTIVE session while busy must get a chance to drain now —
+      // scheduleInject() is self-guarded (no-op if lastInjectedText set or queue empty).
+      scheduleInject();
       return;
     }
   }

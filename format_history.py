@@ -8,9 +8,19 @@ if not os.path.exists(path):
     print('没有找到微信会话记录。')
     sys.exit(0)
 
-lines = open(path).read().strip().split('\n')
-lines = [l for l in lines if l.strip()]
-entries = [json.loads(l) for l in lines[-60:]]  # last 60 entries
+with open(path) as f:
+    lines = [l for l in f.read().strip().split('\n') if l.strip()]
+
+# Tolerate corrupted/partial lines (e.g. half-written on crash) and entries
+# missing 'ts' — skip them rather than crashing this display-only helper.
+entries = []
+for l in lines[-60:]:  # last 60 entries
+    try:
+        e = json.loads(l)
+    except ValueError:
+        continue
+    if isinstance(e, dict) and 'ts' in e:
+        entries.append(e)
 
 if not entries:
     print('没有找到微信会话记录。')
