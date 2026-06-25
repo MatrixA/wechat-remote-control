@@ -1,0 +1,114 @@
+/**
+ * Telegram Bot API HTTP client.
+ *
+ * Mirrors the structure of WeChatApi (built-in fetch + AbortController), with one
+ * critical difference: Telegram puts the bot token in the URL path
+ * (`/bot<token>/<method>`). We therefore NEVER log the full URL — only the method
+ * name — and expose redactUrl() for any defensive logging elsewhere.
+ */
+import type {
+  TgResponse, TgUser, TgUpdate, TgMessage, TgInlineKeyboardMarkup, TgBotCommand,
+} from './types.js';
+import { logger } from '../logger.js';
+
+export const DEFAULT_TELEGRAM_BASE = 'https://api.telegram.org';
+
+/** Strip the bot token from a Telegram API URL so it is safe to log. */
+export function redactUrl(url: string): string {
+  return url.replace(/\/bot[^/]+\//, '/bot***/');
+}
+
+export interface SendMessageOpts {
+  parse_mode?: 'HTML' | 'MarkdownV2';
+  reply_markup?: TgInlineKeyboardMarkup;
+  disable_web_page_preview?: boolean;
+}
+
+export class TelegramApi {
+  private readonly token: string;
+  private readonly baseUrl: string;
+
+  constructor(token: string, baseUrl: string = DEFAULT_TELEGRAM_BASE) {
+    this.token = token;
+    this.baseUrl = baseUrl.replace(/\/+$/, '');
+  }
+
+  private async request<T>(method: string, body: unknown, timeoutMs = 15_000): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const url = `${this.baseUrl}/bot${this.token}/${method}`;
+
+    // Log the method only — the URL contains the token.
+    logger.debug('Telegram API request', { method });
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      const json = (await res.json()) as TgResponse<T>;
+      if (!json.ok) {
+        throw new Error(`Telegram ${method} failed: ${json.error_code ?? '?'} ${json.description ?? ''}`.trim());
+      }
+      return json.result as T;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new Error(`Telegram ${method} timed out after ${timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Confirm the token and return the bot's own user record. */
+  getMe(): Promise<TgUser> {
+    return this.request<TgUser>('getMe', {}, 10_000);
+  }
+
+  /** Long-poll for updates. The server holds the connection up to `timeout` seconds. */
+  getUpdates(opts: { offset?: number; timeout?: number; allowed_updates?: string[] }): Promise<TgUpdate[]> {
+    const timeout = opts.timeout ?? 30;
+    return this.request<TgUpdate[]>(
+      'getUpdates',
+      { offset: opts.offset, timeout, allowed_updates: opts.allowed_updates },
+      (timeout + 10) * 1000,
+    );
+  }
+
+  sendMessage(chatId: string, text: string, opts: SendMessageOpts = {}): Promise<TgMessage> {
+    return this.request<TgMessage>('sendMessage', {
+      chat_id: chatId,
+      text,
+      parse_mode: opts.parse_mode,
+      reply_markup: opts.reply_markup,
+      disable_web_page_preview: opts.disable_web_page_preview ?? true,
+    });
+  }
+
+  editMessageText(chatId: string, messageId: number, text: string, opts: SendMessageOpts = {}): Promise<unknown> {
+    return this.request('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: opts.parse_mode,
+      reply_markup: opts.reply_markup,
+      disable_web_page_preview: opts.disable_web_page_preview ?? true,
+    });
+  }
+
+  sendChatAction(chatId: string, action = 'typing'): Promise<unknown> {
+    return this.request('sendChatAction', { chat_id: chatId, action }, 10_000);
+  }
+
+  setMyCommands(commands: TgBotCommand[]): Promise<unknown> {
+    return this.request('setMyCommands', { commands }, 10_000);
+  }
+
+  answerCallbackQuery(callbackQueryId: string, text?: string): Promise<unknown> {
+    return this.request('answerCallbackQuery', { callback_query_id: callbackQueryId, text }, 10_000);
+  }
+}

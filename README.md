@@ -53,6 +53,25 @@
 
 ---
 
+## 也支持 Telegram
+
+同一套机制（tmux 注入、hook 转发、多 session、自动放行）现在可以接入 **Telegram bot**——IM 层已抽象成
+`Transport` 接口（`src/transport/`），微信和 Telegram 各是一个 adapter，核心代码只面对一个不透明的回复 `target`。
+
+- **登录**：`/wechat-remote-control login --telegram` —— 在 **@BotFather** 创建 bot、拿到 token 粘贴给我，
+  再在 Telegram 里给 bot 发 `/start`。第一个跟 bot 说话的会话会被**锁定**为唯一授权会话（其他人发消息一律忽略；
+  bot token 等同于终端控制权，请妥善保管）。
+- **启动**：`attach` 时守护进程按 `WCC_TRANSPORT` 环境变量 > `--telegram/--wechat` > 已有凭据 自动选择 IM。
+- **充分利用 Telegram 原生能力**（微信不支持的能力自动回退到文字菜单）：
+  - 原生命令菜单（`setMyCommands`）：`/ls` `/sw` `/model`
+  - `/model`、`/sw` 用**内联键盘**点选切换；`AskUserQuestion` 问卷渲染成**选项按钮**（多选可勾选后「完成」）
+  - 长任务进度用**编辑同一条消息**的方式刷新「🔧 处理中…」，不再刷屏
+  - 打字状态用 `sendChatAction`；输出用 HTML 渲染（代码块转 `<pre><code>`），按 4096 上限分片
+- **数据目录**：Telegram 凭据存在 `~/.wechat-remote-control/telegram/account.json`（含锁定的 chat id），
+  长轮询游标存 `telegram/offset.json`；微信文件原样不动，完全向后兼容。
+
+---
+
 ## 依赖
 
 - **macOS 或 Linux**，本机装好 `tmux`

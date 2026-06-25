@@ -2,15 +2,16 @@
 name: wechat-remote-control
 version: 1.0.0
 description: |
-  WeChat Remote Control for Claude Code and OpenAI Codex CLI. The active agent is
-  auto-detected from the tmux pane (claude vs codex). Three sub-commands:
-  - login:  Authenticate WeChat account (scan QR code). Run once before first use
-            or after session expiry.
-  - attach: Register this Claude Code / Codex session as the WeChat remote target.
+  Remote Control for Claude Code and OpenAI Codex CLI over WeChat OR Telegram.
+  The active agent is auto-detected from the tmux pane (claude vs codex); the IM
+  transport is selected by --telegram / --wechat (default: WeChat). Sub-commands:
+  - login:  Authenticate the chosen IM. WeChat = scan a QR code; Telegram = paste
+            a BotFather token, then /start the bot. Run once before first use.
+  - attach: Register this Claude Code / Codex session as the remote target.
             Bridge daemon starts in background; it watches the session transcript
-            and forwards assistant output to WeChat.
-  - sync:   Show WeChat conversation history since last attach, for context.
-  Use when stepping away from the terminal and handing off to WeChat.
+            and forwards assistant output to the IM.
+  - sync:   Show conversation history since last attach, for context.
+  Use when stepping away from the terminal and handing off to WeChat / Telegram.
 allowed-tools:
   - Bash
   - Read
@@ -22,6 +23,15 @@ allowed-tools:
 Determine whether the user wants **login**, **attach**, or **sync**, then follow the steps below.
 
 If the user just says `/wechat-remote-control` with no args, default to **attach**.
+
+**Choosing the IM transport.** This skill bridges to **WeChat** (default) or **Telegram**.
+Decide the transport from the user's request:
+- "telegram" / "tg" / "--telegram" → **Telegram** (see *login — Telegram* below; the
+  daemon runs with `WCC_TRANSPORT=telegram`).
+- otherwise → **WeChat** (the original flow).
+The bridge daemon auto-detects the transport at startup (`WCC_TRANSPORT` env > `--telegram`/
+`--wechat` argv > whichever credentials exist on disk > WeChat). When both a WeChat account and
+a Telegram account exist, set `WCC_TRANSPORT` explicitly so the right one starts.
 
 **Key principle:** When any step encounters a problem, fix it directly by running commands.
 Never ask the user to copy-paste and run commands themselves — handle everything here.
@@ -49,6 +59,8 @@ which one runs in each tmux pane via process ancestry. The multi-session registr
   ignores `decision`, so one payload works for both.
 - **All state lives in one directory**: `~/.wechat-remote-control/`
   - `accounts/<accountId>.json` — WeChat credentials
+  - `telegram/account.json` — Telegram bot token + locked `allowedChatId`;
+    `telegram/offset.json` — Telegram long-poll cursor (Telegram transport only)
   - `state.json` — tmux target, autoApprove, transcriptPath (legacy single-session)
   - `sessions.json` — multi-session registry (active session + per-tmux-target metadata)
   - `ilink_session.json` — ilink long-poll session cache
@@ -82,7 +94,9 @@ so the pattern matches the shell itself, causing self-termination. Always use th
 
 ---
 
-## login — Authenticate WeChat account
+## login (WeChat) — Authenticate WeChat account
+
+Use this for the **WeChat** transport. For **Telegram**, skip to *login (Telegram)* below.
 
 Run this once before first use, or whenever the bridge reports session expiry.
 
@@ -255,6 +269,80 @@ If no files: retry from Step 3. Otherwise confirm login success.
 
 ---
 
+## login (Telegram) — Authenticate a Telegram bot
+
+Use this for the **Telegram** transport. A Telegram bot authenticates with a token from
+**@BotFather** (no QR). After verifying the token, the user opens the bot and sends `/start`;
+the first chat to message the bot is captured and **locked** as the only authorized chat.
+
+> **Security:** the bot token grants control of the terminal. Treat it as a secret. The bridge
+> only ever accepts messages from the single locked chat; anyone else who finds the bot is ignored.
+
+### Step 1: Resolve the skill dir and ensure Node (same as WeChat login Step 2)
+
+```bash
+SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name "login.js" 2>/dev/null \
+  | grep "wechat-remote-control/dist/telegram/login.js" | head -1 \
+  | sed 's|/dist/telegram/login.js||')
+echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
+command -v node >/dev/null && node --version || echo "NO_NODE"
+```
+
+If `dist/telegram/login.js` is missing, run `npm install --production` in the skill dir first
+(its `postinstall` runs `tsc`). If `NO_NODE`, install Node ≥ 18 as in WeChat login Step 2.
+
+### Step 2: Get a bot token
+
+Tell the user, then wait for them to paste the token:
+
+> 请在 Telegram 里打开 **@BotFather**，发送 `/newbot`（或对已有 bot 用 `/token`），
+> 按提示设置名称，拿到形如 `123456789:AA....` 的 **bot token**，发给我。
+
+### Step 3: Verify the token
+
+Replace `SKILL_DIR` and `THE_TOKEN`, then run:
+
+```bash
+NODE_USE_ENV_PROXY=1 node --input-type=module -e "
+  import { verifyToken } from 'SKILL_DIR/dist/telegram/login.js';
+  const r = await verifyToken(process.argv[1]);
+  console.log(JSON.stringify({ ok: true, username: r.username }));
+" "THE_TOKEN" 2>&1 || echo "TOKEN_REJECTED"
+```
+
+On `{"ok":true,"username":"..."}` the token is saved to
+`~/.wechat-remote-control/telegram/account.json`. On `TOKEN_REJECTED`, ask the user to re-check
+the token. Tell the user the bot handle: **https://t.me/<username>**.
+
+### Step 4: Capture the authorized chat (user sends /start)
+
+Ask the user to open `https://t.me/<username>` and send `/start` (or any message). Then run a
+background capture loop that waits for that first message and locks the chat:
+
+```bash
+NODE_USE_ENV_PROXY=1 node --input-type=module -e "
+  import { loadTelegramAccount } from 'SKILL_DIR/dist/telegram/auth.js';
+  import { captureAuthorizedChat } from 'SKILL_DIR/dist/telegram/login.js';
+  const acct = loadTelegramAccount();
+  const r = await captureAuthorizedChat(acct.botToken, { timeoutMs: 180000 });
+  console.log(JSON.stringify({ ok: true, chatId: r.chatId, username: r.username }));
+" 2>&1 || echo "CAPTURE_TIMEOUT"
+```
+
+On `{"ok":true,"chatId":"..."}`, login is complete and the bridge is locked to that chat.
+On `CAPTURE_TIMEOUT`, ask the user to send `/start` and re-run this step.
+
+### Step 5: Verify
+
+```bash
+cat ~/.wechat-remote-control/telegram/account.json 2>/dev/null | grep -o '"allowedChatId"' || echo "NOT_LOCKED"
+```
+
+If present, confirm success and tell the user to run **attach** (with Telegram). If `NOT_LOCKED`,
+re-run Step 4.
+
+---
+
 ## attach — Register this session as WeChat remote target
 
 ### Step 1: Pre-flight checks (run all in one bash call)
@@ -288,7 +376,10 @@ echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND} (agent=$AGENT)"
 echo "=== bridge installed ==="
 test -f "$SKILL_DIR/src/index.js" && echo "OK" || echo "NOT_FOUND"
 echo "=== account ==="
-ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null | head -1 || echo "NOT_FOUND"
+WACCT=$(ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null | head -1)
+TGACCT=$([ -f ~/.wechat-remote-control/telegram/account.json ] && echo ~/.wechat-remote-control/telegram/account.json)
+echo "wechat=${WACCT:-none} telegram=${TGACCT:-none}"
+[ -z "$WACCT" ] && [ -z "$TGACCT" ] && echo "NOT_FOUND"
 echo "=== detect ==="
 python3 "$SKILL_DIR/detect.py" preflight
 echo "=== existing attach ==="
@@ -338,7 +429,9 @@ Interpret the `status=...` line from the detect block. Also note the `agent=...`
 
 **Other early stops:**
 - **bridge NOT_FOUND** — tell user the bridge is not installed, stop.
-- **account NOT_FOUND** — run **login** flow first, then return.
+- **account NOT_FOUND** (both `wechat=none` and `telegram=none`) — run the matching **login**
+  flow first (WeChat QR or Telegram token), then return. If only one of them is present, that
+  transport will be used; the daemon launch below detects which.
 
 ### Step 2: Check for existing attach — prompt for override
 
@@ -586,9 +679,20 @@ echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
 # with a find fallback. For Codex the daemon lives under ~/.agents/skills, not ~/.claude.
 SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
 [ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name index.js 2>/dev/null | grep "wechat-remote-control/src/index.js" | head -1 | sed 's|/src/index.js||')
-NODE_USE_ENV_PROXY=1 nohup node "$SKILL_DIR/src/index.js" >> /tmp/cc_wechat_bridge.log 2>&1 &
-echo "launched PID=$! (SKILL_DIR=$SKILL_DIR)"
+# Transport: explicit WCC_TRANSPORT env wins; else auto-detect (Telegram only when a
+# Telegram account exists AND no WeChat account does). An empty value is a safe no-op —
+# the daemon applies the same heuristic internally.
+TRANSPORT="${WCC_TRANSPORT:-}"
+if [ -z "$TRANSPORT" ] && [ -f "$HOME/.wechat-remote-control/telegram/account.json" ] \
+   && ! ls "$HOME/.wechat-remote-control/accounts/"*.json >/dev/null 2>&1; then
+  TRANSPORT=telegram
+fi
+WCC_TRANSPORT="$TRANSPORT" NODE_USE_ENV_PROXY=1 nohup node "$SKILL_DIR/src/index.js" >> /tmp/cc_wechat_bridge.log 2>&1 &
+echo "launched PID=$! (SKILL_DIR=$SKILL_DIR transport=${TRANSPORT:-auto})"
 ```
+
+To force a transport when both accounts exist, run attach in a shell with
+`export WCC_TRANSPORT=telegram` (or `wechat`) set first.
 
 Do NOT write `bridge.pid` here — the daemon writes its own PID once it wins the
 singleton. (A redundant launch self-exits without touching `bridge.pid`, so the file
@@ -611,18 +715,19 @@ If FAILED: read the last 30 lines of `/tmp/cc_wechat_bridge.log` and diagnose.
 ### Step 7: Report success
 
 ```
-WeChat Remote Control activated
+Remote Control activated
 
 Agent: <Claude Code | Codex>
+IM: <WeChat | Telegram>
 Tmux target: <session>:<window>.<pane>
 Auto-approve: on
 Bridge: running (PID <pid>)
 Transcript: <transcript path>
 
-You can leave the terminal now. WeChat messages will be injected into this
-agent session via tmux. Responses triggered by WeChat will be forwarded back.
+You can leave the terminal now. Messages from the IM will be injected into this
+agent session via tmux. Responses they trigger will be forwarded back.
 
-Terminal-initiated responses are NOT forwarded to WeChat.
+Terminal-initiated responses are NOT forwarded to the IM.
 ```
 
 For Claude, a status-line indicator shows bridge state in the terminal; Codex has no
