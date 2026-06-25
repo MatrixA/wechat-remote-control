@@ -2,7 +2,7 @@
   "name": "wechat-remote-control",
   "version": "1.0.0",
   "private": true,
-  "description": "Chat with Claude Code from WeChat - a Claude Code Skill that bridges personal WeChat to local Claude Code",
+  "description": "Chat with Claude Code / Codex from WeChat or Telegram - a skill that bridges a personal WeChat or Telegram bot to a local tmux-hosted agent session",
   "type": "module",
   "scripts": {
     "build": "tsc",
@@ -16,8 +16,11 @@
   },
   "keywords": [
     "wechat",
+    "telegram",
+    "telegram-bot",
     "claude-code",
     "claude",
+    "codex",
     "bridge",
     "chat",
     "skill"

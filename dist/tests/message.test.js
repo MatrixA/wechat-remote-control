@@ -39,6 +39,17 @@ test('splitMessage balances code fences across chunk boundaries', () => {
     assert.ok(chunks[0].startsWith('```'));
     assert.ok(chunks[chunks.length - 1].trimEnd().endsWith('```'));
 });
+test('splitMessage chunks at a Telegram-sized 4096 limit, fences balanced', () => {
+    const code = Array(400).fill('const x = 1;').join('\n'); // ~5200 chars
+    const text = '```ts\n' + code + '\n```';
+    const chunks = splitMessage(text, 4096);
+    assert.ok(chunks.length > 1, 'expected multiple 4096-sized chunks');
+    for (const c of chunks) {
+        assert.ok(c.length <= 4096, `chunk too long: ${c.length}`);
+        const fences = (c.match(/^```/gm) || []).length;
+        assert.strictEqual(fences % 2, 0, 'unbalanced fences');
+    }
+});
 // ── textFromContent ──────────────────────────────────────────────────
 test('textFromContent handles string and block-array content', () => {
     assert.strictEqual(textFromContent('plain'), 'plain');

@@ -1,9 +1,11 @@
 /**
- * wrc-bridge: WeChat Remote Control bridge for Claude Code.
+ * wrc-bridge: Remote Control bridge for Claude Code / Codex.
  *
- * Injects WeChat messages into a tmux-hosted CC session via send-keys,
- * watches the CC transcript for assistant responses, and forwards them
- * back to WeChat.  Hook events arrive over a Unix socket from hook.py.
+ * Injects messages from an IM (WeChat or Telegram) into a tmux-hosted agent
+ * session via send-keys, watches the agent transcript for assistant responses,
+ * and forwards them back to the IM. The IM is abstracted behind the Transport
+ * interface (src/transport/), so the core deals only in an opaque reply target.
+ * Hook events arrive over a Unix socket from hook.py.
  *
  * Multi-session support:
  *   #ls            — list all discovered CC sessions
@@ -17,13 +19,9 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
 
-// Reuse compiled dist/ modules for WeChat API
-import { WeChatApi } from '../dist/wechat/api.js';
-import { loadLatestAccount } from '../dist/wechat/accounts.js';
-import { createSender } from '../dist/wechat/send.js';
-import { createMonitor } from '../dist/wechat/monitor.js';
-import { extractText as extractItemText } from '../dist/wechat/media.js';
-import { MessageType, MessageItemType } from '../dist/wechat/types.js';
+// Pluggable IM transport (WeChat / Telegram). The core never references a
+// specific IM — it talks to the Transport interface and an opaque reply target.
+import { createTransport, resolveTransportName } from '../dist/transport/index.js';
 import { logger } from '../dist/logger.js';
 import {
   splitMessage,
@@ -64,32 +62,26 @@ const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh',
 let lastInjectedText       = null;
 let lastInjectedTranscript = null;  // transcript path of the session we injected into
 let lastPushedText         = null;
-// FIFO queue of WeChat messages awaiting injection. Each item carries its reply
-// target (userId/contextToken) captured at receive time, so the eventual response
-// is forwarded to the right conversation even if newer messages arrive meanwhile.
-// Replaces the old single `pendingText` slot, which silently dropped a second
-// message that arrived while CC was busy.
-let pendingQueue           = [];     // Array<{ text, userId, contextToken }>
-// Reply target of the message currently injected and awaiting a response.
-let injectedUserId         = '';
-let injectedContextToken   = '';
+// FIFO queue of messages awaiting injection. Each item carries its opaque reply
+// target captured at receive time, so the eventual response is forwarded to the
+// right conversation even if newer messages arrive meanwhile. Replaces the old
+// single `pendingText` slot, which silently dropped a second message that
+// arrived while CC was busy.
+let pendingQueue           = [];     // Array<{ text, target }>
+// Opaque reply target of the message currently injected and awaiting a response.
+let injectedTarget         = '';
 let orphanPollText         = null;   // injectedText of the in-flight 5-min orphan poll (dedup, B5)
 let pendingSelect          = null;   // { type, expires } — waiting for user to pick from a menu
 let pendingQuiz            = null;   // { questions, questionIndex, expires } — AskUserQuestion forwarding
 let compactionGraceUntil   = 0;     // ms timestamp — accept any same-project transcript until this time
 let injectTimer      = null;
 let ccBusy           = false;
-let contextToken     = '';     // latest WeChat context_token for pushes
-let targetUserId     = '';     // WeChat user to push to
+let lastTarget       = '';     // most recent inbound reply target (opaque)
+let lastUserKey      = '';     // stable user id of the most recent inbound (welcome dedup)
 const welcomedUsers  = new Set(); // users already sent a welcome this process run
 
-// ── Typing indicator state ───────────────────────────────────────────
-const TYPING_REFRESH_MS  = 10_000;   // WeChat server-side typing timeout ~15s
-const TYPING_TICKET_TTL  = 12 * 3600_000; // cache ticket for 12 hours
-let typingTicketCache    = null;     // { ticket, userId, fetchedAt }
-let typingRefreshTimer   = null;     // setInterval handle
-let wechatApi            = null;     // WeChatApi instance, set in main()
-let wechatSender         = null;     // createSender() result, set in main() (for timer-driven sends)
+// ── Transport (WeChat / Telegram), set in main() ─────────────────────
+let transport            = null;
 
 // ── Progress heartbeat state ─────────────────────────────────────────
 // The typing indicator dies client-side after ~15s, so on multi-minute tool
@@ -97,54 +89,14 @@ let wechatSender         = null;     // createSender() result, set in main() (fo
 // A periodic "still working (N tools)" message keeps them informed (C1/H7).
 const HEARTBEAT_MS       = 25_000;
 let heartbeatTimer       = null;
-let turnToolCount        = 0;        // tools called during the current WeChat turn
+let heartbeatTarget      = '';       // target the heartbeat sends/edits to
+let heartbeatMsgId       = null;     // message id to edit (edit-capable transports)
+let turnToolCount        = 0;        // tools called during the current turn
 let turnLastTool         = '';       // name of the most recent tool
 
-// ── Typing indicator helpers ─────────────────────────────────────────
-// Learned from wong2/weixin-agent-sdk: getConfig → typing_ticket, then
-// sendTyping(status=1) on interval, sendTyping(status=2) to cancel.
-
-async function ensureTypingTicket(api, userId, ctxToken) {
-  if (typingTicketCache &&
-      typingTicketCache.userId === userId &&
-      Date.now() - typingTicketCache.fetchedAt < TYPING_TICKET_TTL) {
-    return typingTicketCache.ticket;
-  }
-  try {
-    const resp = await api.getConfig(userId, ctxToken);
-    const ticket = resp?.typing_ticket;
-    if (ticket) {
-      typingTicketCache = { ticket, userId, fetchedAt: Date.now() };
-      logger.info('Typing ticket obtained');
-      return ticket;
-    }
-  } catch (err) {
-    logger.debug('Failed to get typing ticket', { error: err.message });
-  }
-  return null;
-}
-
-function startTypingIndicator(api, userId) {
-  stopTypingIndicator(api, userId);  // clear any existing
-  const ticket = typingTicketCache?.ticket;
-  if (!ticket) return;
-  const send = () => api.sendTyping(userId, ticket, 1).catch(() => {});
-  send();  // immediate first call
-  typingRefreshTimer = setInterval(send, TYPING_REFRESH_MS);
-  logger.info('Typing indicator started');
-}
-
-function stopTypingIndicator(api, userId) {
-  if (typingRefreshTimer) {
-    clearInterval(typingRefreshTimer);
-    typingRefreshTimer = null;
-  }
-  const ticket = typingTicketCache?.ticket;
-  if (ticket && userId) {
-    api.sendTyping(userId, ticket, 2).catch(() => {});
-    logger.info('Typing indicator cancelled');
-  }
-}
+// The typing indicator is now owned by each transport adapter (WeChat's
+// getConfig→ticket dance, Telegram's sendChatAction). The core just calls
+// transport.sendTyping(target, on).
 
 // ── Progress heartbeat ───────────────────────────────────────────────
 // Started when a WeChat-initiated message is injected; ticks every HEARTBEAT_MS
@@ -153,24 +105,37 @@ function stopTypingIndicator(api, userId) {
 // never leave it running.
 function startHeartbeat() {
   stopHeartbeat();
-  turnToolCount = 0;
-  turnLastTool  = '';
+  turnToolCount   = 0;
+  turnLastTool    = '';
+  heartbeatTarget = injectedTarget || lastTarget;
+  heartbeatMsgId  = null;
   heartbeatTimer = setInterval(() => {
     if (!lastInjectedText) { stopHeartbeat(); return; }
     if (pendingQuiz || pendingSelect) return;      // user is being asked something — don't nag
-    if (!wechatSender) return;
-    const userId   = injectedUserId || targetUserId;
-    const ctxToken = injectedContextToken || contextToken;
-    if (!userId) return;
+    if (!transport) return;
+    const target = injectedTarget || lastTarget || heartbeatTarget;
+    if (!target) return;
     const body = turnToolCount > 0
       ? `🔧 处理中：已调用 ${turnToolCount} 个工具${turnLastTool ? `，最近 ${turnLastTool}` : ''}`
       : '🔧 仍在处理中…';
-    wechatSender.sendText(userId, ctxToken, body).catch(() => {});
+    // Edit-capable transports (Telegram) update ONE status message in place
+    // instead of sending a new line every tick.
+    if (transport.caps.editMessages && heartbeatMsgId) {
+      transport.editText(target, heartbeatMsgId, body).catch(async () => {
+        const s = await transport.sendText(target, body).catch(() => null);
+        heartbeatMsgId = s?.messageId ?? null;
+      });
+    } else {
+      transport.sendText(target, body).then(s => {
+        if (transport.caps.editMessages) heartbeatMsgId = s?.messageId ?? null;
+      }).catch(() => {});
+    }
   }, HEARTBEAT_MS);
 }
 
 function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  heartbeatMsgId = null;
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────
@@ -313,20 +278,34 @@ function tryAutoConfirmCompaction(target) {
 }
 
 /**
- * Format an AskUserQuestion question and send it to WeChat as a numbered menu.
+ * Forward an AskUserQuestion question to the IM. On transports with inline
+ * keyboards (Telegram) each option is a tap-able button (callback_data
+ * `quiz:<qIdx>:<optIdx>`, plus a "完成" button for multi-select); otherwise a
+ * numbered text menu (WeChat). In both cases a typed custom answer also works.
  */
-function sendQuizToWeChat(question, sender) {
+function sendQuiz(question, replyTarget, qIdx) {
+  if (transport.caps.inlineKeyboards) {
+    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${qIdx}:${i}` }]);
+    let text;
+    if (question.multiSelect) {
+      rows.push([{ label: '✅ 完成', data: `quiz:${qIdx}:done` }]);
+      text = `❓ ${question.question}\n\n（多选：点选切换，选好后按"完成"，或直接输入自定义回答）`;
+    } else {
+      text = `❓ ${question.question}\n\n（点选项，或直接输入自定义回答）`;
+    }
+    transport.sendButtons(replyTarget, text, rows)
+      .catch(err => logger.error('Quiz push failed', { error: err.message }));
+    return;
+  }
   const lines = [`❓ ${question.question}`];
   question.options.forEach((opt, i) => {
     const desc = opt.description ? ` — ${opt.description}` : '';
     lines.push(`  ${i + 1}. ${opt.label}${desc}`);
   });
-  if (question.multiSelect) {
-    lines.push(`\n回复序号（可多选，如 "1,3"），或直接输入自定义回答`);
-  } else {
-    lines.push(`\n回复序号选择，或直接输入自定义回答`);
-  }
-  sender.sendText(targetUserId, contextToken, lines.join('\n'))
+  lines.push(question.multiSelect
+    ? `\n回复序号（可多选，如 "1,3"），或直接输入自定义回答`
+    : `\n回复序号选择，或直接输入自定义回答`);
+  transport.sendText(replyTarget, lines.join('\n'))
     .catch(err => logger.error('Quiz push failed', { error: err.message }));
 }
 
@@ -389,11 +368,12 @@ function injectQuizAnswer(target, question, input) {
 }
 
 /**
- * Handle a WeChat reply to a pending quiz.
+ * Handle a typed reply to a pending quiz (button taps go through handleCallback).
+ * `replyTarget` is the opaque IM target; `target` below is the tmux pane.
  */
-function handleQuizResponse(text, sender) {
+function handleQuizResponse(text, replyTarget) {
   const q = pendingQuiz.questions[pendingQuiz.questionIndex];
-  const send = (msg) => sender.sendText(targetUserId, contextToken, msg)
+  const send = (msg) => transport.sendText(replyTarget, msg)
     .catch(err => logger.error('Quiz reply failed', { error: err.message }));
 
   const state = getActiveState();
@@ -414,14 +394,20 @@ function handleQuizResponse(text, sender) {
     logger.error('Quiz inject failed', { error: err.message });
   }
 
-  // Advance to next question or clear quiz state
+  advanceQuiz(replyTarget);
+}
+
+/** Advance to the next quiz question (or clear state). Shared by text + callback paths. */
+function advanceQuiz(replyTarget) {
   pendingQuiz.questionIndex++;
   if (pendingQuiz.questionIndex >= pendingQuiz.questions.length) {
     pendingQuiz = null;
   } else {
-    // Send next question to WeChat (CC TUI shows next question immediately)
     setTimeout(() => {
-      if (pendingQuiz) sendQuizToWeChat(pendingQuiz.questions[pendingQuiz.questionIndex], sender);
+      if (pendingQuiz) {
+        pendingQuiz.selected = new Set();
+        sendQuiz(pendingQuiz.questions[pendingQuiz.questionIndex], replyTarget, pendingQuiz.questionIndex);
+      }
     }, 800);
   }
 }
@@ -952,7 +938,7 @@ async function injectSlashAndCapture(target, command, send) {
     .trim();
 
   if (output && output.length > 2) {
-    const chunks = splitMessage(output);
+    const chunks = splitMessage(output, transport.caps.maxMessageLen);
     for (const chunk of chunks) {
       await send(chunk);
     }
@@ -963,29 +949,124 @@ async function injectSlashAndCapture(target, command, send) {
   appendHistory({ type: 'slash_command', command, output: output?.slice(0, 200) });
 }
 
-async function handleBridgeCommand(text, sender) {
-  const send = (msg) => sender.sendText(targetUserId, contextToken, msg)
+/** Inline-keyboard rows for the session list (one button per session). */
+function sessionButtons(reg) {
+  return Object.keys(reg.sessions).map((name, i) => {
+    const s = reg.sessions[name];
+    const marker = name === reg.active ? '▶ ' : '';
+    return [{ label: `${marker}${i + 1}. ${name} (${sessionKind(s)})`, data: `sw:${i}` }];
+  });
+}
+
+/** Inline-keyboard rows for the model list (one button per model). */
+function modelButtons(models, current) {
+  return models.map((m, i) => [{ label: `${m.id === current ? '✅ ' : ''}${i + 1}. ${m.display}`, data: `model:${i}` }]);
+}
+
+/**
+ * Perform a session switch (shared by the #sw command and the sw:<idx> button
+ * callback). Resets injection state so any in-flight Stop / orphan poll from the
+ * OLD session is dropped rather than mis-routed to the new one (B2/H4), then
+ * replays recent context.
+ */
+async function performSwitch(targetName, send) {
+  const reg = readSessions();
+  if (!targetName || !reg.sessions[targetName]) {
+    await send(`找不到 session: "${targetName}"\n\n${formatSessionList(reg)}`);
+    return;
+  }
+  if (targetName === reg.active) { await send(`已经在 ${targetName} 了`); return; }
+
+  reg.active = targetName;
+  writeSessions(reg);
+
+  // Stop the old turn's typing indicator + heartbeat before clearing state (B7).
+  if (injectedTarget || lastTarget) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
+  stopHeartbeat();
+  // ccBusy must reset: an idle just-switched session fires no Stop, so leaving the
+  // OLD session's ccBusy=true would strand the next message forever.
+  ccBusy                 = false;
+  lastInjectedText       = null;
+  lastInjectedTranscript = null;
+  lastPushedText         = null;
+  injectedTarget         = '';
+  orphanPollText         = null;
+  pendingQueue           = [];
+  cancelPending();
+  saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null });
+
+  // Update cc_pid to the agent process in the new session's pane so status.sh
+  // reflects the correct active session in each terminal.
+  const s = reg.sessions[targetName];
+  try {
+    const paneLines = execFileSync('tmux', [
+      'list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n');
+    const newPanePid = paneLines
+      .map(l => l.split('\t'))
+      .find(([t]) => t === s.tmux)?.[1];
+    if (newPanePid) {
+      const wantComm = getAgent(sessionKind(s)).comm;
+      for (const pid of collectDescendants(newPanePid)) {
+        try {
+          if (getComm(pid) === wantComm) {
+            writeFileSync(join(CC_WECHAT, 'cc_pid'), String(pid));
+            const bridgeData = readJson(join(CC_WECHAT, 'bridge.json'), {});
+            bridgeData.ccPid = parseInt(pid);
+            writeJson(join(CC_WECHAT, 'bridge.json'), bridgeData);
+            logger.info('Updated cc_pid after switch', { pid, session: targetName });
+            break;
+          }
+        } catch {}
+      }
+    }
+  } catch (err) {
+    logger.debug('Failed to update cc_pid after switch', { error: err.message });
+  }
+
+  const replay = contextReplayFor(sessionKind(s), s.transcriptPath);
+  const switchMsg = `✅ 已切换到: ${targetName} (${sessionKind(s)}) [${s.tmux}]\n\n${replay}`;
+  for (const chunk of splitMessage(switchMsg, transport.caps.maxMessageLen)) await send(chunk);
+  logger.info(`Switched active session to: ${targetName}`);
+}
+
+async function handleBridgeCommand(text, replyTarget) {
+  const send = (msg) => transport.sendText(replyTarget, msg)
     .catch(err => logger.error('Bridge command reply failed', { error: err.message }));
 
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
-  // #ls / #sessions — list all sessions
+  // #ls / #sessions — list all sessions (with tap-to-switch buttons where supported)
   if (cmd === '#ls' || cmd === '#sessions') {
     const reg = readSessions();
-    await send(formatSessionList(reg));
+    const list = formatSessionList(reg);
+    if (transport.caps.inlineKeyboards && Object.keys(reg.sessions).length > 0) {
+      await transport.sendButtons(replyTarget, list, sessionButtons(reg))
+        .catch(err => logger.error('Session list push failed', { error: err.message }));
+    } else {
+      await send(list);
+    }
     return;
   }
 
   // #sw <name|number> — switch active session
   if (cmd === '#sw') {
     const arg = parts.slice(1).join(' ').trim();
-    if (!arg) { await send('用法: #sw <session名> 或 #sw <序号>'); return; }
+    if (!arg) {
+      const reg = readSessions();
+      if (transport.caps.inlineKeyboards && Object.keys(reg.sessions).length > 0) {
+        await transport.sendButtons(replyTarget, formatSessionList(reg), sessionButtons(reg))
+          .catch(err => logger.error('Session list push failed', { error: err.message }));
+      } else {
+        await send(`${formatSessionList(reg)}\n\n用法: /sw <名字/序号>`);
+      }
+      return;
+    }
 
     const reg = readSessions();
     const names = Object.keys(reg.sessions);
     let targetName = null;
-
     const num = parseInt(arg, 10);
     if (!isNaN(num) && num >= 1 && num <= names.length) {
       targetName = names[num - 1];
@@ -993,76 +1074,11 @@ async function handleBridgeCommand(text, sender) {
       targetName = names.find(n => n.toLowerCase() === arg.toLowerCase())
         ?? names.find(n => n.toLowerCase().includes(arg.toLowerCase()));
     }
-
     if (!targetName) {
       await send(`找不到 session: "${arg}"\n\n${formatSessionList(reg)}`);
       return;
     }
-    if (targetName === reg.active) {
-      await send(`已经在 ${targetName} 了`);
-      return;
-    }
-
-    reg.active = targetName;
-    writeSessions(reg);
-
-    // Reset injection state for the new session. Clearing lastInjectedText +
-    // pendingQueue means any in-flight Stop / orphan poll from the OLD session is
-    // dropped rather than mis-routed to the new one (B2/H4 — together with the
-    // transcriptHasInjectedUser guard in onStop). Stop the old typing indicator (B7).
-    if (wechatApi && (injectedUserId || targetUserId)) {
-      stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
-    }
-    stopHeartbeat();
-    // The new session's busy state is unknown, and lastInjectedText is the real
-    // per-turn serializer. Leaving the OLD session's ccBusy=true here strands the
-    // next WeChat message forever: an idle just-switched session fires no Stop, so
-    // nothing would ever clear the flag and `if (!ccBusy) scheduleInject()` never runs.
-    ccBusy                 = false;
-    lastInjectedText       = null;
-    lastInjectedTranscript = null;
-    lastPushedText         = null;
-    injectedUserId         = '';
-    injectedContextToken   = '';
-    orphanPollText         = null;
-    pendingQueue           = [];
-    cancelPending();
-    saveSession({ targetUserId, lastInjectedText: null });
-
-    // Update cc_pid to the CC process in the new session's pane
-    // so status.sh reflects the correct active session in each terminal.
-    const s = reg.sessions[targetName];
-    try {
-      const paneLines = execFileSync('tmux', [
-        'list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}',
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n');
-      const newPanePid = paneLines
-        .map(l => l.split('\t'))
-        .find(([t]) => t === s.tmux)?.[1];
-      if (newPanePid) {
-        const wantComm = getAgent(sessionKind(s)).comm;
-        for (const pid of collectDescendants(newPanePid)) {
-          try {
-            if (getComm(pid) === wantComm) {
-              writeFileSync(join(CC_WECHAT, 'cc_pid'), String(pid));
-              const bridgeData = readJson(join(CC_WECHAT, 'bridge.json'), {});
-              bridgeData.ccPid = parseInt(pid);
-              writeJson(join(CC_WECHAT, 'bridge.json'), bridgeData);
-              logger.info('Updated cc_pid after #sw', { pid, session: targetName });
-              break;
-            }
-          } catch {}
-        }
-      }
-    } catch (err) {
-      logger.debug('Failed to update cc_pid after #sw', { error: err.message });
-    }
-
-    const replay = contextReplayFor(sessionKind(s), s.transcriptPath);
-    const switchMsg = `✅ 已切换到: ${targetName} (${sessionKind(s)}) [${s.tmux}]\n\n${replay}`;
-    for (const chunk of splitMessage(switchMsg)) await send(chunk);
-
-    logger.info(`Switched active session to: ${targetName}`);
+    await performSwitch(targetName, send);
     return;
   }
 
@@ -1108,12 +1124,19 @@ async function handleBridgeCommand(text, sender) {
     const models = getAgent(kind).models;
 
     if (!arg) {
-      // Show numbered model list. Claude exposes the current model via
-      // settings.json; Codex stores it in config.toml (no marker shown).
+      // Claude exposes the current model via settings.json; Codex stores it in
+      // config.toml (no marker shown).
       let current = null;
       if (kind === 'claude') {
         const settings = readJson(join(CLAUDE_CONFIG_DIR, 'settings.json'), {});
         current = settings.model || 'claude-sonnet-4-6';
+      }
+      pendingSelect = { type: 'model', expires: Date.now() + 5 * 60 * 1000 };
+      // Tap-able buttons (Telegram) or a numbered text menu (WeChat).
+      if (transport.caps.inlineKeyboards) {
+        await transport.sendButtons(replyTarget, '🤖 选择模型（5 分钟内有效）:', modelButtons(models, current))
+          .catch(err => logger.error('Model menu push failed', { error: err.message }));
+        return;
       }
       const lines = ['🤖 选择模型:'];
       models.forEach((m, i) => {
@@ -1123,7 +1146,6 @@ async function handleBridgeCommand(text, sender) {
       });
       lines.push('\n回复序号或名称切换');
       lines.push('5分钟内有效，超时取消');
-      pendingSelect = { type: 'model', expires: Date.now() + 5 * 60 * 1000 };
       await send(lines.join('\n'));
       return;
     }
@@ -1151,6 +1173,95 @@ async function handleBridgeCommand(text, sender) {
   await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换\n  /rename <新名字> — 重命名\n  /model — 切换模型`);
 }
 
+/**
+ * Handle an inline-keyboard button tap (Telegram). Decodes the index-encoded
+ * callback data (`model:<i>` / `sw:<i>` / `quiz:<qIdx>:<optIdx|done>`) and routes
+ * into the SAME handlers the text path uses. Stale taps (expired menu / removed
+ * session / wrong question) are acknowledged gracefully without mis-injecting.
+ */
+async function handleCallback(inbound) {
+  const data = inbound.callbackData || '';
+  const replyTarget = inbound.target;
+  const ack = (msg) => transport.answerCallback(inbound.replyToken, msg).catch(() => {});
+  const send = (m) => transport.sendText(replyTarget, m).catch(() => {});
+
+  // ── model:<idx> ──
+  if (data.startsWith('model:')) {
+    if (!pendingSelect || pendingSelect.type !== 'model' || Date.now() > pendingSelect.expires) {
+      pendingSelect = null; ack('菜单已过期'); return;
+    }
+    const idx = parseInt(data.slice(6), 10);
+    const kind = getActiveState().kind || 'claude';
+    const models = getAgent(kind).models;
+    if (isNaN(idx) || idx < 0 || idx >= models.length) { ack('无效选项'); return; }
+    const resolved = models[idx];
+    pendingSelect = null;
+    ack(`切换到 ${resolved.display}`);
+    const tmux = tmuxTarget(getActiveState());
+    if (tmux && paneExists(tmux)) await injectSlashAndCapture(tmux, `/model ${resolved.id}`, send);
+    else send('❌ tmux 不可用');
+    return;
+  }
+
+  // ── sw:<idx> ──
+  if (data.startsWith('sw:')) {
+    const idx = parseInt(data.slice(3), 10);
+    const names = Object.keys(readSessions().sessions);
+    if (isNaN(idx) || idx < 0 || idx >= names.length) { ack('该 session 已不存在'); return; }
+    ack(`切换到 ${names[idx]}`);
+    await performSwitch(names[idx], send);
+    return;
+  }
+
+  // ── quiz:<qIdx>:<optIdx|done> ──
+  if (data.startsWith('quiz:')) {
+    if (!pendingQuiz || Date.now() > pendingQuiz.expires) { pendingQuiz = null; ack('问卷已过期'); return; }
+    const segs = data.split(':');
+    const qIdx = parseInt(segs[1], 10);
+    const rest = segs[2];
+    if (qIdx !== pendingQuiz.questionIndex) { ack('该问题已过期'); return; }
+    const q = pendingQuiz.questions[pendingQuiz.questionIndex];
+    const tmux = tmuxTarget(getActiveState());
+
+    if (q.multiSelect) {
+      if (rest === 'done') {
+        const sel = [...(pendingQuiz.selected || new Set())].sort((a, b) => a - b);
+        if (sel.length === 0) { ack('请至少选择一项'); return; }
+        if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); pendingQuiz = null; return; }
+        try {
+          const selected = injectQuizAnswer(tmux, q, sel.map(n => n + 1).join(','));
+          ack('已提交'); send(`✅ ${selected}`);
+          appendHistory({ type: 'quiz_answer', question: q.question, answer: selected });
+        } catch (err) { ack('注入失败'); send(`❌ 注入失败: ${err.message}`); }
+        advanceQuiz(replyTarget);
+        return;
+      }
+      const optIdx = parseInt(rest, 10);
+      if (isNaN(optIdx) || optIdx < 0 || optIdx >= q.options.length) { ack('无效选项'); return; }
+      if (!pendingQuiz.selected) pendingQuiz.selected = new Set();
+      if (pendingQuiz.selected.has(optIdx)) pendingQuiz.selected.delete(optIdx);
+      else pendingQuiz.selected.add(optIdx);
+      const chosen = [...pendingQuiz.selected].sort((a, b) => a - b).map(i => q.options[i].label).join(', ');
+      ack(chosen ? `已选: ${chosen}` : '已清空');
+      return;
+    }
+
+    // single-select
+    const optIdx = parseInt(rest, 10);
+    if (isNaN(optIdx) || optIdx < 0 || optIdx >= q.options.length) { ack('无效选项'); return; }
+    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); pendingQuiz = null; return; }
+    try {
+      const selected = injectQuizAnswer(tmux, q, String(optIdx + 1));
+      ack(selected); send(`✅ ${selected}`);
+      appendHistory({ type: 'quiz_answer', question: q.question, answer: selected });
+    } catch (err) { ack('注入失败'); send(`❌ 注入失败: ${err.message}`); }
+    advanceQuiz(replyTarget);
+    return;
+  }
+
+  ack(); // unknown callback — just clear the client spinner
+}
+
 // ── Injection state machine ──────────────────────────────────────────
 function cancelPending() {
   if (injectTimer) { clearTimeout(injectTimer); injectTimer = null; }
@@ -1176,12 +1287,11 @@ function scheduleInject() {
       sendKeys(target, item.text);
       lastInjectedText       = item.text;
       lastInjectedTranscript = state.transcriptPath || null;
-      injectedUserId         = item.userId;
-      injectedContextToken   = item.contextToken;
-      saveSession({ targetUserId, lastInjectedText, lastInjectedTranscript });
+      injectedTarget         = item.target;
+      saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText, lastInjectedTranscript });
       appendHistory({ type: 'user_wechat', text: item.text });
       startHeartbeat();  // progress pings until this turn resolves (C1/H7)
-      logger.info('Injected WeChat message', { chars: item.text.length, queued: pendingQueue.length, transcript: lastInjectedTranscript?.slice(-40) });
+      logger.info('Injected message', { chars: item.text.length, queued: pendingQueue.length, transcript: lastInjectedTranscript?.slice(-40) });
     } catch (err) {
       // Re-queue at the head so the message is not lost on a transient tmux error.
       pendingQueue.unshift(item);
@@ -1190,16 +1300,16 @@ function scheduleInject() {
   }, INJECT_DELAY);
 }
 
-// ── WeChat send with retry ───────────────────────────────────────────
-// WeChat sends are otherwise fire-and-forget; without retry a transient network
-// blip / session hiccup silently drops an assistant reply. Bounded exponential
-// backoff, then a best-effort "delivery failed" notice so the user isn't left
-// believing the turn produced nothing.
-async function sendChunkWithRetry(sender, userId, ctxToken, text, attempts = 3) {
+// ── Send with retry ──────────────────────────────────────────────────
+// Sends are otherwise fire-and-forget; without retry a transient network blip /
+// session hiccup silently drops an assistant reply. Bounded exponential backoff,
+// then a best-effort "delivery failed" notice so the user isn't left believing
+// the turn produced nothing.
+async function sendChunkWithRetry(target, text, attempts = 3) {
   let delay = 500;
   for (let i = 1; i <= attempts; i++) {
     try {
-      await sender.sendText(userId, ctxToken, text);
+      await transport.sendText(target, text);
       return true;
     } catch (err) {
       logger.warn('sendText failed', { attempt: i, error: err.message });
@@ -1215,40 +1325,41 @@ async function sendChunkWithRetry(sender, userId, ctxToken, text, attempts = 3) 
  * chunks (prefixed [i/n] when more than one), each sent with retry. On any
  * permanent chunk failure, send one best-effort notice.
  */
-async function forwardResponse(sender, userId, ctxToken, fullText) {
-  const chunks = splitMessage(fullText);
+async function forwardResponse(target, fullText) {
+  const chunks = splitMessage(fullText, transport.caps.maxMessageLen);
   let anyFailed = false;
   for (let i = 0; i < chunks.length; i++) {
     const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
-    const ok = await sendChunkWithRetry(sender, userId, ctxToken, prefix + chunks[i]);
+    const ok = await sendChunkWithRetry(target, prefix + chunks[i]);
     if (!ok) anyFailed = true;
   }
   if (anyFailed) {
-    sender.sendText(userId, ctxToken, '⚠️ 部分回复发送失败，请回终端查看完整结果').catch(() => {});
+    transport.sendText(target, '⚠️ 部分回复发送失败，请回终端查看完整结果').catch(() => {});
   }
 }
 
 // ── Hook event handlers ──────────────────────────────────────────────
 
 /**
- * Forward a complete assistant response to WeChat and clear injection state.
- * Uses the reply target (userId/contextToken) captured at injection time — NOT
- * the live globals — so a newer incoming message can't redirect this reply to
- * the wrong conversation. Shared by every Claude/Codex forward path.
+ * Forward a complete assistant response to the IM and clear injection state.
+ * Uses the reply target captured at injection time (injectedTarget) — NOT the
+ * live "latest" target — so a newer incoming message can't redirect this reply
+ * to the wrong conversation. Shared by every Claude/Codex forward path.
  */
-function pushResponse(responseText, sender) {
-  const userId   = injectedUserId || targetUserId;
-  const ctxToken = injectedContextToken || contextToken;
+function pushResponse(responseText) {
+  const target = injectedTarget || lastTarget;
   stopHeartbeat();
-  if (wechatApi) stopTypingIndicator(wechatApi, userId);
+  if (transport && target) transport.sendTyping(target, false).catch(() => {});
   lastPushedText         = responseText;
   lastInjectedText       = null;
   lastInjectedTranscript = null;
-  injectedUserId         = '';
-  injectedContextToken   = '';
-  saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+  injectedTarget         = '';
+  saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
   appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
-  forwardResponse(sender, userId, ctxToken, responseText);
+  // target is always set in the normal flow (every queued message carries one),
+  // but guard defensively so we never call forwardResponse with an empty target.
+  if (target) forwardResponse(target, responseText);
+  else logger.error('pushResponse: no reply target, dropping forward', { chars: responseText.length });
 }
 
 /**
@@ -1257,7 +1368,7 @@ function pushResponse(responseText, sender) {
  * turns: gate on the rollout's latest user_message matching what we injected,
  * since Codex also fires Stop for turns the user types at the terminal.
  */
-function onStopCodex(payload, sender, readPath) {
+function onStopCodex(payload, readPath) {
   if (!lastInjectedText) {
     logger.info('Codex Stop with no injected message, ignoring');
     scheduleInject();
@@ -1286,8 +1397,8 @@ function onStopCodex(payload, sender, readPath) {
 
   const text = pickText(entries);
   if (text) {
-    pushResponse(text, sender);
-    logger.info('Pushed codex response to WeChat', { chars: text.length });
+    pushResponse(text);
+    logger.info('Pushed codex response', { chars: text.length });
     scheduleInject();
     return;
   }
@@ -1303,7 +1414,7 @@ function onStopCodex(payload, sender, readPath) {
     const t2 = pickText(agent.parseRollout(readPath));
     if (t2) {
       orphanPollText = null;
-      pushResponse(t2, sender);
+      pushResponse(t2);
       logger.info('Pushed codex response via deferred poll', { chars: t2.length });
       scheduleInject();
       return;
@@ -1312,12 +1423,11 @@ function onStopCodex(payload, sender, readPath) {
       logger.warn('Codex: no response within grace window, cleaning up');
       orphanPollText = null;
       if (lastInjectedText === savedInjected) {
-        if (wechatApi) stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
+        if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
         lastInjectedText       = null;
         lastInjectedTranscript = null;
-        injectedUserId         = '';
-        injectedContextToken   = '';
-        saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+        injectedTarget         = '';
+        saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
         scheduleInject();
       }
       return;
@@ -1343,7 +1453,7 @@ function transcriptHasInjectedUser(tpath, injectedText) {
   return transcriptHasUserText(parseTranscript(tpath), injectedText);
 }
 
-async function onStop(payload, sender) {
+async function onStop(payload) {
   ccBusy = false;
   const state = getActiveState();
   const kind = state.kind || 'claude';
@@ -1395,7 +1505,7 @@ async function onStop(payload, sender) {
 
   // Codex has a distinct rollout schema and supplies last_assistant_message on
   // the Stop payload — handle it separately and return.
-  if (kind === 'codex') { onStopCodex(payload, sender, readPath); return; }
+  if (kind === 'codex') { onStopCodex(payload, readPath); return; }
 
   const entries = parseTranscript(readPath);
   let result = findResponseToInjected(entries, lastInjectedText);
@@ -1426,8 +1536,8 @@ async function onStop(payload, sender) {
 
   // ── Path A: Complete response → forward to WeChat
   if (responseText && responseComplete && lastInjectedText) {
-    pushResponse(responseText, sender);
-    logger.info('Pushed response to WeChat', { chars: responseText.length });
+    pushResponse(responseText);
+    logger.info('Pushed response', { chars: responseText.length });
     scheduleInject();
     return;
   }
@@ -1452,8 +1562,8 @@ async function onStop(payload, sender) {
       const retryEntries = parseTranscript(savedReadPath);
       const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
       if (retryResult?.text && retryResult.complete) {
-        pushResponse(retryResult.text, sender);
-        logger.info('Pushed response to WeChat via deferred retry', { chars: retryResult.text.length });
+        pushResponse(retryResult.text);
+        logger.info('Pushed response via deferred retry', { chars: retryResult.text.length });
         scheduleInject();
       }
     }, 3000);
@@ -1471,8 +1581,8 @@ async function onStop(payload, sender) {
       const retryEntries = parseTranscript(readPath);
       result = findResponseToInjected(retryEntries, lastInjectedText);
       if (result?.text && result.complete) {
-        pushResponse(result.text, sender);
-        logger.info('Pushed response to WeChat via retry', { chars: result.text.length });
+        pushResponse(result.text);
+        logger.info('Pushed response via retry', { chars: result.text.length });
         scheduleInject();
         return;
       }
@@ -1518,8 +1628,8 @@ async function onStop(payload, sender) {
           const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
           if (retryResult?.text && retryResult.complete) {
             orphanPollText = null;
-            pushResponse(retryResult.text, sender);
-            logger.info('Pushed response to WeChat via deferred orphan poll', {
+            pushResponse(retryResult.text);
+            logger.info('Pushed response via deferred orphan poll', {
               chars: retryResult.text.length,
             });
             scheduleInject();
@@ -1531,12 +1641,11 @@ async function onStop(payload, sender) {
             });
             orphanPollText = null;
             if (lastInjectedText === savedInjectedText) {
-              if (wechatApi) stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
+              if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
               lastInjectedText       = null;
               lastInjectedTranscript = null;
-              injectedUserId         = '';
-              injectedContextToken   = '';
-              saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+              injectedTarget         = '';
+              saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
               scheduleInject();
             }
             return;
@@ -1556,7 +1665,7 @@ async function onStop(payload, sender) {
   scheduleInject();
 }
 
-function onPreToolUse(payload, sender) {
+function onPreToolUse(payload) {
   // Only mark CC busy if this is from our tracked session (or no session filter).
   // Foreign CC sessions fire PreToolUse too; if we set ccBusy=true for them but
   // their Stop is filtered out, ccBusy gets stuck forever.
@@ -1590,21 +1699,24 @@ function onPreToolUse(payload, sender) {
   // Track tool activity for the progress heartbeat (only our in-flight turn).
   if (lastInjectedText) { turnToolCount++; turnLastTool = toolName; }
 
-  // ── Quiz support: forward AskUserQuestion to WeChat ──
-  // Only intercept quizzes triggered by a WeChat-injected message (lastInjectedText is set).
+  // ── Quiz support: forward AskUserQuestion to the IM ──
+  // Only intercept quizzes triggered by an IM-injected message (lastInjectedText is set).
   // Terminal-initiated quizzes are left to the terminal user.
   // AskUserQuestion is a Claude Code TUI; Codex uses a different approval UX, so
   // quiz interception is Claude-only.
   if (kind === 'claude' && toolName === 'AskUserQuestion' && lastInjectedText) {
     const questions = toolInput.questions || [];
     if (questions.length > 0) {
+      const quizTarget = injectedTarget || lastTarget;
       pendingQuiz = {
         questions,
         questionIndex: 0,
         expires: Date.now() + 5 * 60 * 1000, // 5 min timeout
+        target: quizTarget,
+        selected: new Set(),
       };
-      sendQuizToWeChat(questions[0], sender);
-      logger.info('Quiz forwarded to WeChat', { numQuestions: questions.length, q: questions[0].question.slice(0, 80) });
+      sendQuiz(questions[0], quizTarget, 0);
+      logger.info('Quiz forwarded', { numQuestions: questions.length, q: questions[0].question.slice(0, 80) });
     }
   }
 
@@ -1644,12 +1756,12 @@ function onUserPromptSubmit(payload) {
   cancelPending();
 }
 
-async function onNotification(payload, sender) {
+async function onNotification(payload) {
   const msg = payload.message || '';
 
   if (msg.includes('waiting for your input')) {
     // CC is idle. Two cases:
-    // 1. Quiz pending → already forwarded to WeChat, just wait for user reply
+    // 1. Quiz pending → already forwarded to the IM, just wait for user reply
     // 2. Compaction prompt → auto-confirm so CC can continue
     // 3. lastInjectedText still set → CC stopped without triggering Stop
     //    (shouldn't happen, but clean up to avoid stuck state)
@@ -1696,8 +1808,8 @@ async function onNotification(payload, sender) {
         }
       }
       if (result?.text) {
-          pushResponse(result.text, sender);
-          logger.info('Pushed response to WeChat via idle cleanup', { chars: result.text.length, complete: result.complete });
+          pushResponse(result.text);
+          logger.info('Pushed response via idle cleanup', { chars: result.text.length, complete: result.complete });
           scheduleInject();
           return;
       }
@@ -1705,12 +1817,11 @@ async function onNotification(payload, sender) {
         lastInjected: lastInjectedText.slice(0, 60),
       });
       orphanPollText = null;
-      if (wechatApi) stopTypingIndicator(wechatApi, injectedUserId || targetUserId);
+      if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
       lastInjectedText       = null;
       lastInjectedTranscript = null;
-      injectedUserId         = '';
-      injectedContextToken   = '';
-      saveSession({ targetUserId, lastInjectedText: null, lastInjectedTranscript: null });
+      injectedTarget         = '';
+      saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
       scheduleInject();
     } else {
       logger.info('Notification (logged, not pushed): ' + msg);
@@ -1722,7 +1833,7 @@ async function onNotification(payload, sender) {
 }
 
 // ── Hook server (Unix socket) ────────────────────────────────────────
-function startHookServer(sender) {
+function startHookServer() {
   const server = net.createServer(conn => {
     conn.on('error', () => {});
     const chunks = [];
@@ -1735,9 +1846,9 @@ function startHookServer(sender) {
       const hookType = payload._hookType || '';
       let reply;
       try {
-        if (hookType === 'stop')                   onStop(payload, sender);
-        else if (hookType === 'pretooluse')        reply = onPreToolUse(payload, sender);
-        else if (hookType === 'notification')      onNotification(payload, sender);
+        if (hookType === 'stop')                   onStop(payload);
+        else if (hookType === 'pretooluse')        reply = onPreToolUse(payload);
+        else if (hookType === 'notification')      onNotification(payload);
         else if (hookType === 'userpromptsubmit')  onUserPromptSubmit(payload);
         else logger.debug('Unknown hook type', { hookType });
       } catch (err) {
@@ -1830,133 +1941,92 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
     '直接发消息即注入当前 session，回复将自动转发。';
 }
 
-// ── WeChat message handler ───────────────────────────────────────────
-function handleWeChatMessage(msg, sender) {
-  if (msg.message_type !== MessageType.USER) return;
-  if (!msg.from_user_id || !msg.item_list) return;
+// ── Inbound message handler (transport-agnostic) ─────────────────────
+// Operates on the normalised InboundMessage from any transport. The reply
+// destination is the opaque `inbound.target`; the core never inspects it.
+function onInboundMessage(inbound) {
+  lastTarget  = inbound.target;
+  lastUserKey = inbound.userKey;
+  const replyTarget = inbound.target;
 
-  targetUserId = msg.from_user_id;
-  contextToken = msg.context_token ?? '';
-
-  // Extract text from all items (includes voice ASR text)
-  const textParts = [];
-  for (const item of msg.item_list) {
-    const t = extractItemText(item);
-    if (t) textParts.push(t);
-    // Extract voice ASR text if available
-    if (item.type === MessageItemType.VOICE) {
-      const voiceText = item.voice_item?.text ?? item.voice_item?.voice_text;
-      if (voiceText) textParts.push(voiceText);
-    }
-  }
-
-  // Notify about non-text media (image/file/video without text)
-  const hasImage = msg.item_list.some(i => i.type === MessageItemType.IMAGE);
-  const hasFile = msg.item_list.some(i => i.type === MessageItemType.FILE);
-  const hasVideo = msg.item_list.some(i => i.type === MessageItemType.VIDEO);
-  const hasVoiceNoText = msg.item_list.some(i =>
-    i.type === MessageItemType.VOICE && !i.voice_item?.text && !i.voice_item?.voice_text
-  );
-
-  if (hasImage && textParts.length === 0) {
-    sender.sendText(targetUserId, contextToken, '⚠️ 暂不支持图片消息，请发送文字（或语音，会自动转成文字）')
-      .catch(err => logger.error('Image notice failed', { error: err.message }));
+  // Button taps (Telegram) → callback dispatcher.
+  if (inbound.kind === 'callback') {
+    handleCallback(inbound).catch(err => logger.error('Callback handler error', { error: err.message }));
     return;
   }
-  if (hasVoiceNoText) {
-    sender.sendText(targetUserId, contextToken, '⚠️ 语音无法识别文字，请使用文字消息')
-      .catch(err => logger.error('Voice notice failed', { error: err.message }));
-    if (textParts.length === 0) return;
-  }
-  if (hasFile) {
-    const fileName = msg.item_list.find(i => i.type === MessageItemType.FILE)?.file_item?.file_name;
-    textParts.push(`[收到文件: ${fileName ?? '未知文件'}]`);
-  }
-  if (hasVideo) {
-    textParts.push('[收到视频]');
+
+  // Unsupported media → notice only.
+  if (inbound.kind === 'unsupported_media') {
+    if (inbound.mediaNote) transport.sendText(replyTarget, inbound.mediaNote).catch(() => {});
+    return;
   }
 
-  const text = textParts.join('\n');
+  const text = inbound.text;
   if (!text) return;
 
-  logger.info('WeChat message', { from: targetUserId, text: text.slice(0, 80) });
+  // A side-channel notice may accompany injectable text (e.g. WeChat voice-no-ASR).
+  if (inbound.mediaNote) transport.sendText(replyTarget, inbound.mediaNote).catch(() => {});
 
-  // Send welcome to first-time users (once per bridge process run)
-  if (!welcomedUsers.has(targetUserId)) {
-    welcomedUsers.add(targetUserId);
-    sender.sendText(targetUserId, contextToken,
-      buildWelcome({ reconnect: false, kind: getActiveState().kind })
-    ).catch(err => logger.error('Welcome message failed', { error: err.message }));
+  logger.info('Inbound message', { from: inbound.userKey, text: text.slice(0, 80) });
+
+  // Welcome first-time users (once per bridge process run).
+  if (!welcomedUsers.has(inbound.userKey)) {
+    welcomedUsers.add(inbound.userKey);
+    transport.sendText(replyTarget, buildWelcome({ reconnect: false, kind: getActiveState().kind }))
+      .catch(err => logger.error('Welcome message failed', { error: err.message }));
   }
 
-  // Consume a pending interactive selection (e.g. /model menu).
-  // If expired or unresolvable, clear state and fall through to normal injection.
+  // Consume a pending /model text selection (button taps go through handleCallback).
   if (pendingSelect) {
     if (Date.now() > pendingSelect.expires) {
       logger.info('pendingSelect expired, clearing');
       pendingSelect = null;
-      sender.sendText(targetUserId, contextToken, '⏰ 模型菜单已超时取消，本条按普通消息处理').catch(() => {});
+      transport.sendText(replyTarget, '⏰ 模型菜单已超时取消，本条按普通消息处理').catch(() => {});
     } else if (pendingSelect.type === 'model') {
       const resolved = resolveModelFor(getActiveState().kind || 'claude', text.trim());
       if (resolved) {
         pendingSelect = null;
-        const reply = (msg) => sender.sendText(targetUserId, contextToken, msg)
+        const reply = (m) => transport.sendText(replyTarget, m)
           .catch(err => logger.error('Model select reply failed', { error: err.message }));
-        const state = getActiveState();
-        const target = tmuxTarget(state);
-        if (target && paneExists(target)) {
-          injectSlashAndCapture(target, `/model ${resolved.id}`, reply);
-        } else {
-          reply('❌ tmux 不可用');
-        }
+        const tmux = tmuxTarget(getActiveState());
+        if (tmux && paneExists(tmux)) injectSlashAndCapture(tmux, `/model ${resolved.id}`, reply);
+        else reply('❌ tmux 不可用');
         return;
       }
-      // Unrecognised input — cancel selection, fall through to normal injection
+      // Unrecognised input — cancel selection, fall through to normal injection.
       pendingSelect = null;
       logger.info('pendingSelect: unrecognised input, cancelled');
     }
   }
 
-  // ── Consume a pending quiz (AskUserQuestion) response ──
+  // Consume a pending quiz (typed answer).
   if (pendingQuiz) {
     if (Date.now() > pendingQuiz.expires) {
       logger.info('pendingQuiz expired, clearing');
       pendingQuiz = null;
-      sender.sendText(targetUserId, contextToken, '⏰ 问卷已超时取消，本条按普通消息处理').catch(() => {});
+      transport.sendText(replyTarget, '⏰ 问卷已超时取消，本条按普通消息处理').catch(() => {});
     } else {
-      handleQuizResponse(text, sender);
+      handleQuizResponse(text, replyTarget);
       return;
     }
   }
 
   // ── Route slash commands ─────────────────────────────────────────
-  // CC built-in commands never produce JSONL transcript entries.
-  // We intercept them at bridge level: /model → native handler,
-  // TUI-only commands → warn, text-output commands → inject + capture pane.
-  // Non-built-in /xxx (skills) pass through to normal tmux injection.
+  // Agent built-in commands never produce JSONL transcript entries; we intercept
+  // them: bridge meta-commands (#-prefixed), TUI-only → warn, text-output →
+  // inject + capture pane. Non-built-in /xxx (skills) pass through to injection.
   let cmdText = text.trim();
+  if (/^\/ls\b/i.test(cmdText) || /^\/sessions\b/i.test(cmdText)) cmdText = '#ls';
+  else if (/^\/sw(\s|$)/i.test(cmdText)) cmdText = '#sw' + cmdText.slice(3);
+  else if (/^\/rename(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(7);
+  else if (/^\/mv(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(3);
+  else if (/^\/model(\s|$)/i.test(cmdText)) cmdText = '#model' + cmdText.slice(6);
 
-  // Bridge meta-commands (aliases)
-  if (/^\/ls\b/i.test(cmdText) || /^\/sessions\b/i.test(cmdText)) {
-    cmdText = '#ls';
-  } else if (/^\/sw(\s|$)/i.test(cmdText)) {
-    cmdText = '#sw' + cmdText.slice(3);
-  } else if (/^\/rename(\s|$)/i.test(cmdText)) {
-    cmdText = '#rename' + cmdText.slice(7);
-  } else if (/^\/mv(\s|$)/i.test(cmdText)) {
-    cmdText = '#rename' + cmdText.slice(3);
-  } else if (/^\/model(\s|$)/i.test(cmdText)) {
-    cmdText = '#model' + cmdText.slice(6);
-  }
-
-  // Bridge commands (# prefix) — handled entirely by bridge
   if (cmdText.startsWith('#')) {
-    handleBridgeCommand(cmdText, sender);
+    handleBridgeCommand(cmdText, replyTarget);
     return;
   }
 
-  // Detect built-in slash commands for the ACTIVE agent. These are handled by
-  // the agent CLI itself and never produce a forwardable transcript turn.
   const slashMatch = cmdText.match(/^\/([a-z][\w-]*)/i);
   if (slashMatch) {
     const slashName = slashMatch[1].toLowerCase();
@@ -1965,82 +2035,66 @@ function handleWeChatMessage(msg, sender) {
     const tuiOnly = activeKind === 'codex' ? getAgent('codex').tuiOnly : CC_TUI_ONLY;
 
     if (builtin.has(slashName)) {
-      const sendReply = (msg) => sender.sendText(targetUserId, contextToken, msg)
+      const sendReply = (m) => transport.sendText(replyTarget, m)
         .catch(err => logger.error('Slash reply failed', { error: err.message }));
-      const state = getActiveState();
-      const target = tmuxTarget(state);
+      const tmux = tmuxTarget(getActiveState());
+      if (!tmux || !paneExists(tmux)) { sendReply('❌ tmux 不可用'); return; }
 
-      if (!target || !paneExists(target)) {
-        sendReply('❌ tmux 不可用');
-        return;
-      }
-
-      // TUI-only commands: warn user these require terminal interaction
       if (tuiOnly.has(slashName)) {
         const remotable = activeKind === 'codex'
           ? '/status /diff /mcp /ps /compact /clear /new /model /review'
           : '/cost /usage /compact /clear /fast /effort /help /doctor /status /model';
-        sendReply(`⚠️ /${slashName} 需要终端交互（方向键选择），无法从微信操作。\n\n可远程使用的命令:\n  ${remotable}`);
+        sendReply(`⚠️ /${slashName} 需要终端交互（方向键选择），无法远程操作。\n\n可远程使用的命令:\n  ${remotable}`);
         return;
       }
-
-      // Text-output built-in: inject + capture pane output
-      injectSlashAndCapture(target, cmdText, sendReply);
+      injectSlashAndCapture(tmux, cmdText, sendReply);
       return;
     }
     // Not a known built-in → probably a skill → inject normally (produces transcript)
   }
 
-  // Regular message or skill — enqueue for tmux injection. Capture the reply
-  // target NOW so a later message can't steal this turn's response, and so a
-  // busy-time second message no longer overwrites the first (H2/H3).
-  pendingQueue.push({ text, userId: targetUserId, contextToken });
+  // Regular message or skill — enqueue for injection. Capture the reply target NOW
+  // so a later message can't steal this turn's response (H2/H3).
+  pendingQueue.push({ text, target: replyTarget });
 
-  // Start typing indicator immediately (fire-and-forget, non-blocking)
-  if (wechatApi && targetUserId) {
-    ensureTypingTicket(wechatApi, targetUserId, contextToken)
-      .then(() => startTypingIndicator(wechatApi, targetUserId))
-      .catch(() => {});
-  }
+  // Show a typing indicator immediately (fire-and-forget).
+  if (transport.caps.typingIndicator) transport.sendTyping(replyTarget, true).catch(() => {});
 
-  if (!ccBusy) {
-    scheduleInject();
-  } else {
-    logger.info('CC busy, message queued for injection after Stop', { queued: pendingQueue.length });
-  }
+  if (!ccBusy) scheduleInject();
+  else logger.info('CC busy, message queued for injection after Stop', { queued: pendingQueue.length });
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
+// Native command menu (Telegram setMyCommands). Each entry, when tapped, sends
+// the "/<command>" text which the slash-alias router maps to a bridge command.
+const MENU_COMMANDS = [
+  { command: 'ls',    description: '列出所有 session' },
+  { command: 'sw',    description: '切换 session' },
+  { command: 'model', description: '切换模型' },
+];
+
 async function main() {
   mkdirSync(CC_WECHAT, { recursive: true });
 
-  const account = loadLatestAccount();
-  if (!account) {
-    console.error('No account found. Run login first.');
-    process.exit(1);
-  }
+  const transportName = resolveTransportName();
+  transport = await createTransport(transportName);
 
   const session = loadSession();
-  targetUserId           = session.targetUserId || '';
+  lastTarget             = session.target || '';
+  lastUserKey            = session.userKey || '';
   lastInjectedText       = session.lastInjectedText || null;
   lastInjectedTranscript = session.lastInjectedTranscript || null;
 
-  const api    = new WeChatApi(account.botToken, account.baseUrl);
-  wechatApi    = api;  // expose for typing indicator helpers
-  const sender = createSender(api, account.accountId);
-  wechatSender = sender;  // expose for timer-driven sends (progress heartbeat)
-
-  const hookServer = await startHookServer(sender);
+  const hookServer = await startHookServer();
 
   // Initial tmux scan then periodic
   scanTmuxForCC();
   setInterval(scanTmuxForCC, SCAN_INTERVAL);
 
-  const state  = getActiveState();
-  const target = tmuxTarget(state);
+  const target = tmuxTarget(getActiveState());
   const reg    = readSessions();
-  console.log(`[wrc-bridge] active session: ${reg.active || 'NONE'} → ${target || 'NONE'}`);
-  logger.info('Bridge started', { accountId: account.accountId, active: reg.active, target });
+  console.log(`[wrc-bridge] transport=${transportName} active session: ${reg.active || 'NONE'} → ${target || 'NONE'}`);
+  logger.info('Bridge started', { transport: transportName, active: reg.active, target });
 
   // Bridge restart implies fresh credentials — clear any stale session-expired flag.
   try {
@@ -2053,52 +2107,55 @@ async function main() {
     }
   } catch {}
 
-  // Send proactive welcome if we know the user from a previous session
-  if (targetUserId) {
-    welcomedUsers.add(targetUserId); // suppress duplicate on first incoming message
-    const reg = readSessions();
-    const activeName = reg.active || '(unknown)';
-    sender.sendText(targetUserId, contextToken,
-      buildWelcome({ reconnect: true, activeName, kind: getActiveState().kind })
-    ).catch(err => logger.error('Startup welcome failed', { error: err.message }));
-    logger.info('Sent startup welcome', { userId: targetUserId });
-  }
+  function onEvent(ev) {
+    if (ev.type === 'ready') {
+      logger.info('Transport ready', { transport: transportName, self: ev.selfName });
+      console.log(`[wrc-bridge] transport ready (${transportName}${ev.selfName ? ' @' + ev.selfName : ''})`);
 
-  const monitor = createMonitor(api, {
-    onMessage: async (msg) => { handleWeChatMessage(msg, sender); },
-    onSessionExpired: () => {
-      logger.warn('WeChat session expired');
-      console.error('[wrc-bridge] WeChat session expired — re-login needed');
-      // Mark state so the status line and any operator can see it.
+      // Register the native command menu where supported (Telegram).
+      if (transport.caps.commandMenu && transport.setCommandMenu) {
+        transport.setCommandMenu(MENU_COMMANDS).catch(() => {});
+      }
+
+      // Proactive reconnect welcome if we know the user from a previous session.
+      if (lastTarget) {
+        if (lastUserKey) welcomedUsers.add(lastUserKey); // suppress duplicate on first inbound
+        const activeName = readSessions().active || '(unknown)';
+        transport.sendText(lastTarget, buildWelcome({ reconnect: true, activeName, kind: getActiveState().kind }))
+          .catch(err => logger.error('Startup welcome failed', { error: err.message }));
+        logger.info('Sent startup welcome', { target: lastTarget });
+      }
+      return;
+    }
+    if (ev.type === 'session_expired') {
+      logger.warn('Transport session expired');
+      console.error('[wrc-bridge] session expired — re-login needed');
       try {
-        const state = readState();
-        if (!state.sessionExpired) {
-          state.sessionExpired = true;
-          state.sessionExpiredAt = Date.now();
-          writeJson(STATE_FILE, state);
+        const st = readState();
+        if (!st.sessionExpired) {
+          st.sessionExpired = true;
+          st.sessionExpiredAt = Date.now();
+          writeJson(STATE_FILE, st);
         }
       } catch (e) {
         logger.warn('Failed to mark session expired in state', { error: e.message });
       }
-      // One-shot tmux notice in the attached pane's status bar.
       try {
-        const target = tmuxTarget(getActiveState());
-        if (target) {
+        const t = tmuxTarget(getActiveState());
+        if (t) {
           execFileSync('tmux', [
-            'display-message', '-t', target, '-d', '8000',
-            '⚠️  WeChat session expired — run /wechat-remote-control to re-login',
+            'display-message', '-t', t, '-d', '8000',
+            '⚠️  IM session expired — run /wechat-remote-control to re-login',
           ], { stdio: 'ignore' });
         }
       } catch {}
-    },
-  });
-
-  console.log('[wrc-bridge] starting WeChat poll loop...');
+    }
+  }
 
   function shutdown() {
     logger.info('Shutting down');
-    if (wechatApi && targetUserId) stopTypingIndicator(wechatApi, targetUserId);
-    monitor.stop();
+    if (transport && lastTarget) transport.sendTyping(lastTarget, false).catch(() => {});
+    if (transport) transport.stop();
     hookServer.close();
     cancelPending();
     try { unlinkSync(HOOK_SOCKET); } catch {}
@@ -2107,7 +2164,8 @@ async function main() {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await monitor.run();
+  console.log('[wrc-bridge] starting poll loop...');
+  await transport.start(onInboundMessage, onEvent);
 }
 
 main().catch(err => {
