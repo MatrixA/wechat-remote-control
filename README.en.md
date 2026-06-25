@@ -107,6 +107,22 @@ cd ~/.claude/skills/wechat-remote-control
 npm install --production    # also runs `tsc` via postinstall to refresh dist/
 ```
 
+### Option C — Codex CLI
+
+Codex loads skills from `~/.agents/skills/` (not `~/.claude/skills/`), so install there:
+
+```bash
+git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
+cd ~/.agents/skills/wechat-remote-control
+npm install --production
+```
+
+`attach` auto-detects the running agent: for Codex it writes hooks into
+`~/.codex/hooks.json` (events `PreToolUse` / `Stop` / `UserPromptSubmit`); for Claude it
+writes `~/.claude/settings.json` (`PreToolUse` / `Stop` / `Notification`). The registered
+hook command is guarded — if `hook.py` is missing it silently no-ops and never blocks a
+prompt.
+
 ### Then use it
 
 Inside a tmux-hosted Claude Code session:
@@ -154,7 +170,7 @@ wechat-remote-control/
 ├── src/                  # TypeScript: bridge, tmux injection, ilink client, command router
 ├── dist/                 # Pre-built JS — SKILL.md references these paths directly
 ├── detect.py             # /proc + ps cross-platform CC-in-tmux detector
-├── hook.py               # Claude Code hook entry — ships PreToolUse/Stop/Notification events
+├── hook.py               # agent hook entry — Claude: PreToolUse/Stop/Notification; Codex: PreToolUse/Stop/UserPromptSubmit
 ├── format_history.py     # Render history.jsonl into human-readable text
 ├── status.sh             # Quick status check (bridge / account / session)
 └── .gitignore

@@ -265,13 +265,32 @@ replaces the old `tmux display-message` check, which was unreliable: `display-me
 returns the *focused* client window, not the pane CC lives in, and the old `||
 echo NOT_IN_TMUX` guard never fired (echo always returns 0).
 
+The skill may be installed under `~/.claude/skills/` (Claude Code) **or**
+`~/.agents/skills/` (Codex), so resolve the install dir dynamically and prefer the copy
+matching the detected agent — never hardcode `~/.claude/skills`.
+
 ```bash
+echo "=== skill dir ==="
+ALL_DIRS=$(find "$HOME" -maxdepth 7 -type f -name "detect.py" 2>/dev/null \
+  | grep "wechat-remote-control/detect.py" | sed 's|/detect.py||')
+SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | grep "/.claude/skills/" | head -1)
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | grep "/.agents/skills/" | head -1)
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | head -1)
+# detect.py reports the agent kind via process ancestry; re-point at the matching install.
+AGENT=$(python3 "$SKILL_DIR/detect.py" preflight 2>/dev/null | sed -n 's/^agent=//p' | head -1)
+if [ "$AGENT" = "codex" ]; then
+  CODEX_DIR=$(printf '%s\n' "$ALL_DIRS" | grep "/.agents/skills/" | head -1)
+  [ -n "$CODEX_DIR" ] && SKILL_DIR="$CODEX_DIR"
+fi
+export SKILL_DIR
+echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND} (agent=$AGENT)"
+
 echo "=== bridge installed ==="
-test -f $HOME/.claude/skills/wechat-remote-control/src/index.js && echo "OK" || echo "NOT_FOUND"
+test -f "$SKILL_DIR/src/index.js" && echo "OK" || echo "NOT_FOUND"
 echo "=== account ==="
 ls ~/.wechat-remote-control/accounts/*.json 2>/dev/null | head -1 || echo "NOT_FOUND"
 echo "=== detect ==="
-python3 $HOME/.claude/skills/wechat-remote-control/detect.py preflight
+python3 "$SKILL_DIR/detect.py" preflight
 echo "=== existing attach ==="
 cat ~/.wechat-remote-control/state.json 2>/dev/null || echo "{}"
 ```
@@ -338,7 +357,17 @@ files. The transcript path respects `CLAUDE_CONFIG_DIR` / `CODEX_HOME` if set, a
 session entry records `kind` (`claude` or `codex`).
 
 ```bash
-python3 $HOME/.claude/skills/wechat-remote-control/detect.py json > /tmp/wrc_detect.json
+# Re-resolve the agent-matching SKILL_DIR (shell state does not persist across
+# separate bash calls). detect.py emits its own dir as `skill_dir`, so invoking the
+# copy that matches the running agent makes that field agent-correct for Step 4.
+ALL_DIRS=$(find "$HOME" -maxdepth 7 -type f -name "detect.py" 2>/dev/null \
+  | grep "wechat-remote-control/detect.py" | sed 's|/detect.py||')
+SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | head -1)
+AGENT=$(python3 "$SKILL_DIR/detect.py" preflight 2>/dev/null | sed -n 's/^agent=//p' | head -1)
+MATCH_SUB=$([ "$AGENT" = "codex" ] && echo "/.agents/skills/" || echo "/.claude/skills/")
+MATCHED=$(printf '%s\n' "$ALL_DIRS" | grep "$MATCH_SUB" | head -1)
+[ -n "$MATCHED" ] && SKILL_DIR="$MATCHED"
+python3 "$SKILL_DIR/detect.py" json > /tmp/wrc_detect.json
 test "$(python3 -c "import json; print(json.load(open('/tmp/wrc_detect.json'))['status'])")" = "OK" || { echo "DETECT_FAILED"; cat /tmp/wrc_detect.json; exit 1; }
 
 python3 - <<'PY'
@@ -421,16 +450,40 @@ The hook config file and event set depend on the detected agent:
   `PreToolUse` / `Stop` / `UserPromptSubmit` (Codex has no `Notification` event).
 
 Both files use the same nested `hooks` schema. The writer below **merges** — it never
-overwrites other settings or other tools' hook blocks, and it dedupes by our `hook.py`
-command so re-running attach is idempotent. It reads the agent kind from the Step-3 detect
-blob:
+overwrites other settings or other tools' hook blocks. Two properties matter:
+
+- **The command is guarded so it can NEVER block a prompt.** It is written as
+  `[ -f <hook.py> ] && python3 <hook.py> <arg> 2>/dev/null; exit 0`. If `hook.py` is missing
+  or python errors, the command still exits 0. This is critical for Codex: a bare
+  `python3 <missing>.py` exits 2, and Codex treats a `UserPromptSubmit` hook's exit 2 as a
+  **block** (surfacing stderr as the reason), which silently jams every prompt. Only
+  **stderr** is redirected — stdout must still flow, because PreToolUse auto-approve is
+  conveyed via the permission-decision JSON `hook.py` prints to stdout (the exit code is
+  irrelevant to it), so forcing `exit 0` is safe. We never emit a deny/exit-2.
+- **It migrates instead of skipping.** Any pre-existing wrc handler (old hardcoded path,
+  unguarded command, or wrong install dir) is removed and replaced with the fresh guarded
+  command. This makes re-running attach **self-heal** an already-broken `hooks.json` /
+  `settings.json`, and is idempotent (re-runs yield a byte-identical file).
+
+The install dir comes from `detect.py`'s emitted `skill_dir` (its own location, agent-correct
+by construction), with fallbacks. The agent kind is read from the Step-3 detect blob.
+
+> NOTE: This heredoc is the source of truth for the guarded command and per-agent event set.
+> `src/hookcmd.ts` mirrors it for tests — keep the two byte-identical.
 
 ```bash
 python3 - <<'PY'
-import json, os
+import json, os, shlex
 info = json.load(open('/tmp/wrc_detect.json'))
 kind = info.get('agent', 'claude')
-cmd_base = os.path.expanduser('~/.claude/skills/wechat-remote-control/hook.py')
+
+# Authoritative install dir: detect.py's own dir (matches the running agent); fall back
+# to the SKILL_DIR exported by Step 1, then to the agent-aware default location.
+skill_dir = info.get('skill_dir') or os.environ.get('SKILL_DIR')
+if not skill_dir:
+    sub = '.agents/skills' if kind == 'codex' else '.claude/skills'
+    skill_dir = os.path.expanduser(f'~/{sub}/wechat-remote-control')
+cmd_base = os.path.join(skill_dir, 'hook.py')
 
 if kind == 'codex':
     cfg_dir = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
@@ -445,22 +498,23 @@ os.makedirs(cfg_dir, exist_ok=True)
 cfg = json.load(open(path)) if os.path.exists(path) else {}
 hooks = cfg.setdefault('hooks', {})
 
-added = []
+# Guarded command (stderr-only redirect; forced exit 0 so a missing/erroring hook.py
+# never blocks a prompt). shlex.quote handles install paths containing spaces.
+qbase = shlex.quote(cmd_base)
+MARK = 'wechat-remote-control/hook.py'
 for event, arg in events.items():
-    command = f'python3 {cmd_base} {arg}'
+    command = f'[ -f {qbase} ] && python3 {qbase} {arg} 2>/dev/null; exit 0'
     groups = hooks.setdefault(event, [])
-    # Dedup: skip if any existing handler already runs our hook.py.
-    exists = any(
-        'wechat-remote-control/hook.py' in (h.get('command') or '')
-        for g in groups for h in g.get('hooks', [])
-    )
-    if not exists:
-        groups.append({'matcher': '', 'hooks': [{'type': 'command', 'command': command}]})
-        added.append(event)
+    # Migrate, don't skip: strip any prior wrc handler, drop emptied groups, append one
+    # fresh entry. Idempotent and self-healing for already-broken configs.
+    for g in groups:
+        g['hooks'] = [h for h in g.get('hooks', []) if MARK not in (h.get('command') or '')]
+    hooks[event] = [g for g in groups if g.get('hooks')]
+    hooks[event].append({'matcher': '', 'hooks': [{'type': 'command', 'command': command}]})
 
 with open(path, 'w') as f:
     json.dump(cfg, f, indent=2)
-print(f'OK kind={kind} file={path} added={added or "none (already present)"}')
+print(f'OK kind={kind} file={path} skill_dir={skill_dir}')
 PY
 ```
 
@@ -473,14 +527,16 @@ settings:
 
 ```bash
 # Run only when agent=claude.
-python3 -c "
+# Re-resolve the install dir (separate bash call → shell state not preserved); read the
+# authoritative skill_dir Step 3 persisted, with a find fallback.
+SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name status.sh 2>/dev/null | grep "wechat-remote-control/status.sh" | head -1 | sed 's|/status.sh||')
+SKILL_DIR="$SKILL_DIR" python3 -c "
 import json, os
 path = os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude'), 'settings.json')
 settings = json.load(open(path)) if os.path.exists(path) else {}
-desired = {
-    'type': 'command',
-    'command': 'bash \$HOME/.claude/skills/wechat-remote-control/status.sh'
-}
+skill_dir = os.environ.get('SKILL_DIR') or os.path.expanduser('~/.claude/skills/wechat-remote-control')
+desired = {'type': 'command', 'command': 'bash ' + os.path.join(skill_dir, 'status.sh')}
 if settings.get('statusLine') == desired:
     print('ALREADY_SET')
 else:
@@ -526,8 +582,12 @@ echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
 **Only if BRIDGE_RUNNING=0 — start daemon** (separate bash call):
 
 ```bash
-NODE_USE_ENV_PROXY=1 nohup node $HOME/.claude/skills/wechat-remote-control/src/index.js >> /tmp/cc_wechat_bridge.log 2>&1 &
-echo "launched PID=$!"
+# Re-resolve the install dir (separate bash call); read the skill_dir Step 3 persisted,
+# with a find fallback. For Codex the daemon lives under ~/.agents/skills, not ~/.claude.
+SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name index.js 2>/dev/null | grep "wechat-remote-control/src/index.js" | head -1 | sed 's|/src/index.js||')
+NODE_USE_ENV_PROXY=1 nohup node "$SKILL_DIR/src/index.js" >> /tmp/cc_wechat_bridge.log 2>&1 &
+echo "launched PID=$! (SKILL_DIR=$SKILL_DIR)"
 ```
 
 Do NOT write `bridge.pid` here — the daemon writes its own PID once it wins the
@@ -575,7 +635,11 @@ status line, so that indicator is Claude-only.
 ### Step 1: Format and show history
 
 ```bash
-python3 $HOME/.claude/skills/wechat-remote-control/format_history.py 2>/dev/null \
+# Resolve the install dir dynamically (Claude: ~/.claude/skills; Codex: ~/.agents/skills).
+# format_history.py only reads ~/.wechat-remote-control/history.jsonl, so either copy works.
+SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name format_history.py 2>/dev/null \
+  | grep "wechat-remote-control/format_history.py" | head -1 | sed 's|/format_history.py||')
+python3 "$SKILL_DIR/format_history.py" 2>/dev/null \
   || (tail -20 ~/.wechat-remote-control/history.jsonl 2>/dev/null || echo "No WeChat history found.")
 ```
 
