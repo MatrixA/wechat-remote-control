@@ -31,6 +31,16 @@ export function loadAccount(accountId) {
     }
     return data;
 }
+/**
+ * Authorization decision (pure), mirroring telegram/auth.ts `isChatAllowed`.
+ * If no user is bound yet, any sender is allowed (the transport captures+locks
+ * the first one). Once bound, only that user is allowed.
+ */
+export function isWeChatUserAllowed(account, userId) {
+    if (!account.allowedUserId)
+        return true;
+    return account.allowedUserId === userId;
+}
 /** Load the most recently modified account. Returns null if none exist. */
 export function loadLatestAccount() {
     try {

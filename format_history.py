@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Format ~/.wechat-remote-control/history.jsonl for display in Claude Code."""
 import json, sys, os
+from collections import deque
 from datetime import datetime
 
 path = os.path.expanduser('~/.wechat-remote-control/history.jsonl')
@@ -8,13 +9,15 @@ if not os.path.exists(path):
     print('没有找到微信会话记录。')
     sys.exit(0)
 
+# Read only the trailing 60 lines via a bounded deque instead of slurping the
+# whole (potentially large) history.jsonl into memory just to show the tail.
 with open(path) as f:
-    lines = [l for l in f.read().strip().split('\n') if l.strip()]
+    lines = [l for l in (s.strip() for s in deque(f, maxlen=60)) if l]
 
 # Tolerate corrupted/partial lines (e.g. half-written on crash) and entries
 # missing 'ts' — skip them rather than crashing this display-only helper.
 entries = []
-for l in lines[-60:]:  # last 60 entries
+for l in lines:  # last 60 entries
     try:
         e = json.loads(l)
     except ValueError:
