@@ -112,10 +112,16 @@ function sleep(ms, signal) {
             resolve();
             return;
         }
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener('abort', () => {
+        // Remove the abort listener when the timer wins, otherwise each completed
+        // sleep leaves a dead listener on the long-lived AbortSignal forever.
+        const onAbort = () => {
             clearTimeout(timer);
             resolve();
-        }, { once: true });
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
     });
 }

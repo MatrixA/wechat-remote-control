@@ -13,6 +13,14 @@ export interface AccountData {
   baseUrl: string;
   userId: string;
   createdAt: string;
+  /**
+   * Single-user lock. A WeChat bot token grants control of the owner's terminal
+   * (every injected message is auto-approved), so — exactly like the Telegram
+   * transport's chat lock — the bridge binds to ONE sender: the first
+   * from_user_id seen after login is captured here and every other sender is
+   * dropped thereafter. Undefined until the first message is captured.
+   */
+  allowedUserId?: string;
 }
 
 const ACCOUNTS_DIR = join(homedir(), '.wechat-remote-control', 'accounts');
@@ -44,6 +52,16 @@ export function loadAccount(accountId: string): AccountData | null {
     logger.info('Account loaded', { accountId });
   }
   return data;
+}
+
+/**
+ * Authorization decision (pure), mirroring telegram/auth.ts `isChatAllowed`.
+ * If no user is bound yet, any sender is allowed (the transport captures+locks
+ * the first one). Once bound, only that user is allowed.
+ */
+export function isWeChatUserAllowed(account: AccountData, userId: string): boolean {
+  if (!account.allowedUserId) return true;
+  return account.allowedUserId === userId;
 }
 
 /** Load the most recently modified account. Returns null if none exist. */

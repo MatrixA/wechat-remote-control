@@ -14,7 +14,7 @@
  */
 
 import net from 'node:net';
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, readlinkSync, unlinkSync, appendFileSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, readlinkSync, unlinkSync, appendFileSync, chmodSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
@@ -22,7 +22,7 @@ import { join, dirname, basename } from 'node:path';
 // Pluggable IM transport (WeChat / Telegram). The core never references a
 // specific IM — it talks to the Transport interface and an opaque reply target.
 import { createTransport, resolveTransportName } from '../dist/transport/index.js';
-import { logger } from '../dist/logger.js';
+import { logger, redact } from '../dist/logger.js';
 import {
   splitMessage,
   textFromContent,
@@ -52,6 +52,12 @@ const INJECT_DELAY   = 500;    // ms to wait after Stop before injecting
 const SCAN_INTERVAL  = 30_000; // ms between tmux auto-discovery scans
 const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switch
 
+// Auto-approve every tool by default (the bridge exists to drive the agent
+// hands-free). Set WRC_AUTO_APPROVE=0 (or false) to OPT OUT: PreToolUse then
+// emits no decision, so the agent falls back to its own permission flow instead
+// of granting remote, unsandboxed tool execution unconditionally.
+const AUTO_APPROVE = !(process.env.WRC_AUTO_APPROVE === '0' || process.env.WRC_AUTO_APPROVE === 'false');
+
 // Shell names that should NOT be used as session display names
 const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh']);
 
@@ -67,6 +73,7 @@ let lastPushedText         = null;
 // right conversation even if newer messages arrive meanwhile. Replaces the old
 // single `pendingText` slot, which silently dropped a second message that
 // arrived while CC was busy.
+const MAX_PENDING_QUEUE    = 50;     // upper bound; a stalled turn can't grow it without limit
 let pendingQueue           = [];     // Array<{ text, target }>
 // Opaque reply target of the message currently injected and awaiting a response.
 let injectedTarget         = '';
@@ -91,6 +98,7 @@ const HEARTBEAT_MS       = 25_000;
 let heartbeatTimer       = null;
 let heartbeatTarget      = '';       // target the heartbeat sends/edits to
 let heartbeatMsgId       = null;     // message id to edit (edit-capable transports)
+let heartbeatSentOnce    = false;    // non-edit transports send a single notice, then go quiet
 let turnToolCount        = 0;        // tools called during the current turn
 let turnLastTool         = '';       // name of the most recent tool
 
@@ -105,19 +113,25 @@ let turnLastTool         = '';       // name of the most recent tool
 // never leave it running.
 function startHeartbeat() {
   stopHeartbeat();
-  turnToolCount   = 0;
-  turnLastTool    = '';
-  heartbeatTarget = injectedTarget || lastTarget;
-  heartbeatMsgId  = null;
+  turnToolCount    = 0;
+  turnLastTool     = '';
+  heartbeatTarget  = injectedTarget || lastTarget;
+  heartbeatMsgId   = null;
+  heartbeatSentOnce = false;
   heartbeatTimer = setInterval(() => {
     if (!lastInjectedText) { stopHeartbeat(); return; }
     if (pendingQuiz || pendingSelect) return;      // user is being asked something — don't nag
     if (!transport) return;
+    // Non-edit transports (WeChat) can't update a status line in place, so every
+    // tick would post a NEW chat message — ~12 per 5-min turn. Send a single
+    // progress notice on the first tick, then stay quiet until the turn resolves.
+    if (!transport.caps.editMessages && heartbeatSentOnce) return;
     const target = injectedTarget || lastTarget || heartbeatTarget;
     if (!target) return;
     const body = turnToolCount > 0
       ? `🔧 处理中：已调用 ${turnToolCount} 个工具${turnLastTool ? `，最近 ${turnLastTool}` : ''}`
       : '🔧 仍在处理中…';
+    heartbeatSentOnce = true;
     // Edit-capable transports (Telegram) update ONE status message in place
     // instead of sending a new line every tick.
     if (transport.caps.editMessages && heartbeatMsgId) {
@@ -177,16 +191,27 @@ function getActiveState() {
       injectTarget: { session: sessionPart, window: window || '0', pane: pane || '0' },
       transcriptPath: s.transcriptPath,
       kind: sessionKind(s),
-      autoApprove: true,
+      autoApprove: AUTO_APPROVE,
     };
   }
   // Legacy state.json has no kind — default to claude.
   return { ...readState(), kind: 'claude' };
 }
 
+// history.jsonl is append-only and would otherwise grow without bound (logs are
+// rotated, this was not). Rotate past 5 MB, keeping a single .1 backup so disk
+// is capped at ~2x. Only the last ~60 entries are ever read (format_history.py).
+const HISTORY_MAX_BYTES = 5 * 1024 * 1024;
 function appendHistory(entry) {
   mkdirSync(CC_WECHAT, { recursive: true, mode: 0o700 });
-  appendFileSync(HISTORY_FILE, JSON.stringify({ ts: Date.now(), ...entry }) + '\n');
+  try {
+    if (statSync(HISTORY_FILE).size >= HISTORY_MAX_BYTES) {
+      renameSync(HISTORY_FILE, HISTORY_FILE + '.1'); // overwrites prior backup
+    }
+  } catch {} // ENOENT (no file yet) → nothing to rotate
+  // redact() masks Bearer tokens / *_token / secret / password / api_key values so
+  // a secret typed over IM (or printed by the agent) isn't retained in plaintext.
+  appendFileSync(HISTORY_FILE, redact(JSON.stringify({ ts: Date.now(), ...entry })) + '\n');
   if (process.platform !== 'win32') try { chmodSync(HISTORY_FILE, 0o600); } catch {}
 }
 
@@ -360,8 +385,10 @@ function injectQuizAnswer(target, question, input) {
   // ── No match → select "Other" and type custom text ──
   for (let i = 0; i < options.length; i++) sendTmuxKey(target, 'Down');
   sendTmuxKey(target, 'Enter');
-  // Brief wait for the text input field to appear after "Other" is selected
-  execFileSync('bash', ['-c', 'sleep 0.5']);
+  // Brief wait for the text input field to appear after "Other" is selected.
+  // Atomics.wait blocks for 500ms WITHOUT forking a `bash -c sleep` subprocess
+  // (same synchronous timing, no fork/exec cost). This path is sync-only.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
   execFileSync('tmux', ['send-keys', '-l', '-t', target, trimmed]);
   sendTmuxKey(target, 'Enter');
   return `Other: "${trimmed}"`;
@@ -1329,7 +1356,10 @@ async function forwardResponse(target, fullText) {
   const chunks = splitMessage(fullText, transport.caps.maxMessageLen);
   let anyFailed = false;
   for (let i = 0; i < chunks.length; i++) {
-    const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
+    // Put the multi-part marker on its OWN line. Inline (`[i/n] ` + chunk) would
+    // push a continued ``` fence off column 0, so the HTML formatter (Telegram)
+    // no longer recognises it and renders the whole code chunk as escaped text.
+    const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}]\n` : '';
     const ok = await sendChunkWithRetry(target, prefix + chunks[i]);
     if (!ok) anyFailed = true;
   }
@@ -2055,6 +2085,12 @@ function onInboundMessage(inbound) {
 
   // Regular message or skill — enqueue for injection. Capture the reply target NOW
   // so a later message can't steal this turn's response (H2/H3).
+  // Bound the queue: a stalled turn could otherwise let it grow without limit.
+  if (pendingQueue.length >= MAX_PENDING_QUEUE) {
+    pendingQueue.shift(); // drop oldest
+    logger.warn('pendingQueue full, dropping oldest queued message', { max: MAX_PENDING_QUEUE });
+    transport.sendText(replyTarget, '⚠️ 排队消息过多，已丢弃最早的一条').catch(() => {});
+  }
   pendingQueue.push({ text, target: replyTarget });
 
   // Show a typing indicator immediately (fire-and-forget).
