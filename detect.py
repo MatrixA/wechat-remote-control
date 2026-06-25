@@ -8,7 +8,7 @@ only a hint, since Codex does not set it.
 Subcommands:
     detect.py preflight  → key=value report (status / agent / cc_pid / tmux_* / transcript)
                            error codes: REMOTE_SESSION / NO_AGENT_PROCESS / NO_TMUX / AGENT_NOT_IN_TMUX
-    detect.py json       → JSON object with status, agent, cc_pid, agent_pid, tmux_*, cwd, transcript
+    detect.py json       → JSON object with status, agent, cc_pid, agent_pid, tmux_*, cwd, skill_dir, transcript
 
 Cross-platform: prefers /proc on Linux, falls back to ps/lsof on macOS.
 """
@@ -294,6 +294,11 @@ def detect():
         "cc_pid": agent_pid,      # legacy key (status.sh, attach writer)
         "agent_pid": agent_pid,   # neutral alias
         "cwd": get_cwd(agent_pid),
+        # This script's own install dir — authoritative skill dir for the running
+        # agent (Codex: ~/.agents/skills/...; Claude: ~/.claude/skills/...). The
+        # attach flow uses it to register hooks / launch the bridge from the right
+        # location instead of hardcoding ~/.claude/skills.
+        "skill_dir": os.path.dirname(os.path.abspath(__file__)),
         "tmux_session": pane[0],
         "tmux_window": pane[1],
         "tmux_pane": pane[2],

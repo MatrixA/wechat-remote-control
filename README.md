@@ -112,6 +112,21 @@ cd ~/.claude/skills/wechat-remote-control
 npm install --production
 ```
 
+### Codex CLI 用户
+
+Codex 从 `~/.agents/skills/` 读取 skill（不是 `~/.claude/skills/`），所以装到那里：
+
+```bash
+git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
+cd ~/.agents/skills/wechat-remote-control
+npm install --production
+```
+
+`attach` 会自动识别当前 agent：Codex 的 hook 写进 `~/.codex/hooks.json`（事件
+`PreToolUse` / `Stop` / `UserPromptSubmit`），Claude 写进 `~/.claude/settings.json`
+（`PreToolUse` / `Stop` / `Notification`）。注册的 hook 命令带兜底保护，找不到
+`hook.py` 也只会静默跳过、绝不阻塞 prompt。
+
 ### 然后开始用
 
 在 tmux 里启动的 Claude Code session 内：
@@ -161,7 +176,7 @@ wechat-remote-control/
 ├── src/                  # TS 源码：bridge、tmux 注入、ilink client、命令路由
 ├── dist/                 # 预构建产物，SKILL.md 中的运行步骤直接引用 dist/ 路径
 ├── detect.py             # /proc + ps 双栈的 CC-in-tmux 检测器
-├── hook.py               # Claude Code hook 入口，PreToolUse / Stop / Notification 转给 bridge
+├── hook.py               # agent hook 入口：Claude(PreToolUse/Stop/Notification) 与 Codex(PreToolUse/Stop/UserPromptSubmit) 都转给 bridge
 ├── format_history.py     # 把 history.jsonl 渲染成可读文本
 ├── status.sh             # 一行命令查 bridge / account / session 状态
 └── .gitignore
