@@ -11,6 +11,10 @@ description: |
             Bridge daemon starts in background; it watches the session transcript
             and forwards assistant output to the IM.
   - sync:   Show conversation history since last attach, for context.
+  - uninstall: Remove every trace attach left behind — agent hooks, the Claude
+            status line, the bridge daemon, socket and runtime state — so Claude
+            Code / Codex return to their original behaviour. Login credentials are
+            kept so a future attach needs no re-login.
   Use when stepping away from the terminal and handing off to WeChat / Telegram.
 allowed-tools:
   - Bash
@@ -20,7 +24,8 @@ allowed-tools:
 
 # /wechat-remote-control
 
-Determine whether the user wants **login**, **attach**, or **sync**, then follow the steps below.
+Determine whether the user wants **login**, **attach**, **sync**, or **uninstall**, then
+follow the steps below.
 
 If the user just says `/wechat-remote-control` with no args, default to **attach**.
 
@@ -757,3 +762,138 @@ tail -50 ~/.wechat-remote-control/logs/bridge-$(date +%Y-%m-%d).log 2>/dev/null 
 ### Step 2: Summarize
 
 Give a one-line summary of what happened while the user was away.
+
+---
+
+## uninstall — Remove all wrc traces
+
+Reverses everything **attach** installed, so Claude Code / Codex go back to their original
+behaviour. This is a single global cleanup — it does not distinguish between sessions; it
+removes the shared hooks, status line, daemon, socket and runtime state outright.
+
+**Kept on purpose:** login credentials (`accounts/`, `telegram/`), `history.jsonl`, and
+`logs/`. A future **attach** therefore needs no re-login. (To wipe those too, the user can
+`rm -rf ~/.wechat-remote-control` afterwards — mention this at the end.)
+
+> Note on no-op hooks: even before uninstall, the hooks attach registers are harmless when
+> no daemon is running — `hook.py` exits 0 immediately if the socket is absent. uninstall
+> removes them entirely so nothing fires at all.
+
+### Step 1: Remove agent hooks + status line (merge-safe, both agents)
+
+We strip wrc's entries from **both** Claude (`settings.json`) and Codex (`hooks.json`)
+regardless of which agent you're running under, since attach for either could have written
+to either file over time. Only entries whose command contains `wechat-remote-control/hook.py`
+are removed; all other hooks and settings are preserved. The Claude status line is removed
+only when it still points at this skill's `status.sh`.
+
+> NOTE: The hook-stripping logic below is mirrored in `src/hookuninstall.ts` for tests
+> (`stripWrcHooks` / `stripWrcStatusLine`) — keep the two behaviourally identical.
+
+```bash
+python3 - <<'PY'
+import json, os
+
+HOOK_MARK = 'wechat-remote-control/hook.py'
+STATUS_MARK = 'wechat-remote-control/status.sh'
+
+def strip_hooks(cfg):
+    hooks = cfg.get('hooks')
+    if not isinstance(hooks, dict):
+        return cfg
+    for event in list(hooks.keys()):
+        groups = hooks[event] if isinstance(hooks[event], list) else []
+        kept = []
+        for g in groups:
+            inner = g.get('hooks', []) if isinstance(g, dict) else []
+            filtered = [h for h in inner if HOOK_MARK not in (h.get('command') or '')]
+            if filtered:                      # drop groups emptied by filtering
+                g['hooks'] = filtered
+                kept.append(g)
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if not hooks:
+        del cfg['hooks']
+    return cfg
+
+def strip_statusline(cfg):
+    sl = cfg.get('statusLine')
+    cmd = sl.get('command', '') if isinstance(sl, dict) else ''
+    if STATUS_MARK in cmd:                     # only remove a statusLine that is ours
+        del cfg['statusLine']
+    return cfg
+
+# Resolve both agents' config files, honouring CLAUDE_CONFIG_DIR / CODEX_HOME.
+claude_dir = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
+codex_dir  = os.environ.get('CODEX_HOME')        or os.path.expanduser('~/.codex')
+claude_path = os.path.join(claude_dir, 'settings.json')
+codex_path  = os.path.join(codex_dir,  'hooks.json')
+
+for path, is_claude in ((claude_path, True), (codex_path, False)):
+    if not os.path.exists(path):
+        print(f'SKIP (absent): {path}'); continue
+    try:
+        cfg = json.load(open(path))
+    except Exception as e:
+        print(f'SKIP (unreadable {e}): {path}'); continue
+    strip_hooks(cfg)
+    if is_claude:
+        strip_statusline(cfg)
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    print(f'CLEANED: {path}')
+PY
+```
+
+### Step 2: Stop the bridge daemon
+
+**Run this in its own bash call.** Do NOT combine it with any `pgrep -f`/`grep` over the
+bridge path — Claude Code wraps commands in `bash -c "..."`, so such a pattern matches the
+shell itself and would kill the wrong process. The `bridge.pid` file is the safe handle.
+
+```bash
+PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
+if [ -f "$PID_FILE" ]; then
+    PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null && echo "stopped daemon PID=$PID"
+    else
+        echo "daemon not running (stale PID)"
+    fi
+else
+    echo "no bridge.pid — daemon not running"
+fi
+```
+
+### Step 3: Remove socket and runtime state (separate bash call)
+
+Give the daemon a moment to exit, then remove the socket it owned plus the per-session
+runtime files. Credentials, history and logs are intentionally left in place.
+
+```bash
+sleep 1
+D="$HOME/.wechat-remote-control"
+rm -f /tmp/cc_wechat_hook.sock \
+      "$D/bridge.pid" "$D/cc_pid" "$D/bridge.json" \
+      "$D/state.json" "$D/sessions.json"
+echo "runtime state cleared (accounts/ and history.jsonl kept)"
+```
+
+### Step 4: Report
+
+```
+WeChat Remote Control uninstalled
+
+Removed: agent hooks (Claude + Codex), status line, bridge daemon, socket, runtime state.
+Kept:    login credentials, message history, logs.
+
+Claude Code / Codex are back to their original behaviour. Run /wechat-remote-control attach
+to set it up again (no re-login needed).
+
+To remove everything including credentials: rm -rf ~/.wechat-remote-control
+```
+
+Re-running **uninstall** when nothing is installed is safe — every step is a no-op on
+already-clean state.

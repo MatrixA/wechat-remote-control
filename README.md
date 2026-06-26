@@ -151,9 +151,10 @@ npm install --production
 在 tmux 里启动的 Claude Code session 内：
 
 ```
-/wechat-remote-control login    # 第一次用先扫码登录微信
-/wechat-remote-control attach   # 把当前 CC session 注册成微信遥控目标
-/wechat-remote-control sync     # 显示上次 attach 以来的微信对话历史，给新 session 建立上下文
+/wechat-remote-control login      # 第一次用先扫码登录微信
+/wechat-remote-control attach     # 把当前 CC session 注册成微信遥控目标
+/wechat-remote-control sync       # 显示上次 attach 以来的微信对话历史，给新 session 建立上下文
+/wechat-remote-control uninstall  # 一键清除所有痕迹（hook / 状态栏 / daemon），保留登录凭据
 ```
 
 直接 `/wechat-remote-control` 不带参数，默认走 **attach**。
@@ -162,7 +163,7 @@ npm install --production
 
 ---
 
-## 三个子命令
+## 四个子命令
 
 ### `login`
 
@@ -183,13 +184,25 @@ QR 60s 内没扫会自动刷新一张。
 
 把 `history.jsonl` 渲染成可读的对话记录，方便给一个新的 CC session 建立上下文。
 
+### `uninstall`
+
+把 **attach** 装进去的东西全部撤销，让 Claude Code / Codex 回到原始行为：
+
+1. 从 `~/.claude/settings.json` 和 `~/.codex/hooks.json` 里**精确移除** wrc 的 hook（按 `wechat-remote-control/hook.py` 标记匹配，别人的 hook 与其他设置原样保留）
+2. 移除 Claude 状态栏（仅当它指向本 skill 的 `status.sh`）
+3. 停掉 bridge daemon，删除 socket 与运行时状态（`bridge.pid` / `cc_pid` / `bridge.json` / `state.json` / `sessions.json`）
+4. **保留**登录凭据（`accounts/`、`telegram/`）、`history.jsonl` 和 `logs/`，下次直接 `attach` 无需重新登录
+
+> 没开 remote-control 时，attach 注册的 hook 本就会因 socket 不存在而立即 `exit 0` 静默 no-op，对正常使用几乎零影响；`uninstall` 则把它们彻底清掉，连触发都不再发生。
+> 想连凭据一起删，跑完 `uninstall` 后手动 `rm -rf ~/.wechat-remote-control` 即可。
+
 ---
 
 ## 目录结构
 
 ```
 wechat-remote-control/
-├── SKILL.md              # Claude Code skill 入口，含 login / attach / sync 完整 runbook
+├── SKILL.md              # Claude Code skill 入口，含 login / attach / sync / uninstall 完整 runbook
 ├── package.json          # node 依赖 + 构建脚本
 ├── tsconfig.json
 ├── src/                  # TS 源码：bridge、tmux 注入、ilink client、命令路由

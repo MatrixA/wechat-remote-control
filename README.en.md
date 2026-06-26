@@ -128,9 +128,10 @@ prompt.
 Inside a tmux-hosted Claude Code session:
 
 ```
-/wechat-remote-control login    # one-time WeChat QR login
-/wechat-remote-control attach   # register this CC session as the WeChat remote target
-/wechat-remote-control sync     # show WeChat history since last attach (for context)
+/wechat-remote-control login      # one-time WeChat QR login
+/wechat-remote-control attach     # register this CC session as the WeChat remote target
+/wechat-remote-control sync       # show WeChat history since last attach (for context)
+/wechat-remote-control uninstall  # remove all traces (hooks / status line / daemon), keep credentials
 ```
 
 If you just type `/wechat-remote-control` with no arg, it defaults to **attach**.
@@ -139,7 +140,7 @@ If you just type `/wechat-remote-control` with no arg, it defaults to **attach**
 
 ---
 
-## Three sub-commands / 三个子命令
+## Four sub-commands / 四个子命令
 
 ### `login`
 
@@ -158,13 +159,24 @@ Registers the current Claude Code session as the WeChat remote target.
 
 Renders WeChat conversation history since last attach as a readable transcript, so a fresh CC session can pick up where the last one left off.
 
+### `uninstall`
+
+Reverses everything **attach** installed, so Claude Code / Codex return to their original behaviour:
+
+1. Precisely removes wrc's hooks from `~/.claude/settings.json` and `~/.codex/hooks.json` (matched by the `wechat-remote-control/hook.py` marker — other tools' hooks and unrelated settings are preserved).
+2. Removes the Claude status line (only when it still points at this skill's `status.sh`).
+3. Stops the bridge daemon and deletes the socket plus runtime state (`bridge.pid` / `cc_pid` / `bridge.json` / `state.json` / `sessions.json`).
+4. **Keeps** login credentials (`accounts/`, `telegram/`), `history.jsonl` and `logs/`, so a later `attach` needs no re-login.
+
+> When remote-control isn't running, the hooks attach registered already no-op (`hook.py` exits 0 immediately if the socket is absent), so normal usage is barely affected; `uninstall` removes them entirely so nothing fires at all. To delete credentials too, run `rm -rf ~/.wechat-remote-control` afterwards.
+
 ---
 
 ## Repository layout / 目录结构
 
 ```
 wechat-remote-control/
-├── SKILL.md              # Claude Code skill entry — full runbook for login / attach / sync
+├── SKILL.md              # Claude Code skill entry — full runbook for login / attach / sync / uninstall
 ├── package.json          # node deps + build scripts
 ├── tsconfig.json
 ├── src/                  # TypeScript: bridge, tmux injection, ilink client, command router
