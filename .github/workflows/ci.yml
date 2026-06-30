@@ -23,5 +23,17 @@ jobs:
       - name: Build (type-check + compile)
         run: npm run build
 
+      # dist/ is committed AND imported by the runtime daemon (src/index.js runs
+      # against the COMMITTED dist). A fresh build must match what's checked in, or
+      # users run stale code while CI tests a different copy. Fail on drift.
+      - name: Verify committed dist is up to date
+        run: git diff --exit-code dist/ || (echo "::error::dist/ is stale — run 'npm run build' and commit" && exit 1)
+
+      # src/index.js and src/agents.js are plain JS, excluded from tsc — a syntax /
+      # early-reference error in them would otherwise ship green and only fail at the
+      # user's `node src/index.js` launch. node --check parses without running.
+      - name: Syntax-check plain-JS entrypoints
+        run: node --check src/index.js && node --check src/agents.js
+
       - name: Test
         run: npm test

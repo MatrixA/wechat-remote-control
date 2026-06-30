@@ -123,7 +123,11 @@ def find_tmux_pane(cc_pid, panes):
 
 
 def encode_cwd(cwd):
-    return "".join(c if c.isalnum() or c == "-" else "-" for c in cwd)
+    # Match Claude Code's ACTUAL encoding: replace every char that is not an ASCII
+    # letter/digit or '-' with '-'. Claude Code is ASCII-only — a path with non-ASCII
+    # (e.g. CJK) chars maps each one to '-' (verified: ~/Documents/社会实践 →
+    # ...-Documents-----). Keep this byte-identical to src/index.js / src/constants.ts.
+    return "".join(c if (c.isascii() and c.isalnum()) or c == "-" else "-" for c in cwd)
 
 
 def claude_config_dir():

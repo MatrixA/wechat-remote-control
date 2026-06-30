@@ -1,5 +1,5 @@
 import type { AccountData } from './accounts.js';
-import { DEFAULT_BASE_URL, saveAccount } from './accounts.js';
+import { DEFAULT_BASE_URL, saveAccount, loadAccount } from './accounts.js';
 import { logger } from '../logger.js';
 
 const QR_CODE_URL = `${DEFAULT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`;
@@ -95,12 +95,18 @@ export async function waitForQrScan(qrcodeId: string): Promise<AccountData> {
           throw new Error('QR confirmed but missing required fields in response');
         }
 
+        // Preserve the single-user lock (and original createdAt) across a re-login
+        // for the same bot, so a token refresh — the documented response to session
+        // expiry — doesn't silently drop allowedUserId and re-bind to whoever messages
+        // first next.
+        const existing = loadAccount(data.ilink_bot_id);
         const accountData: AccountData = {
           botToken: data.bot_token,
           accountId: data.ilink_bot_id,
           baseUrl: data.baseurl || DEFAULT_BASE_URL,
           userId: data.ilink_user_id,
-          createdAt: new Date().toISOString(),
+          createdAt: existing?.createdAt ?? new Date().toISOString(),
+          ...(existing?.allowedUserId ? { allowedUserId: existing.allowedUserId } : {}),
         };
 
         saveAccount(accountData);

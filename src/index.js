@@ -14,7 +14,7 @@
  */
 
 import net from 'node:net';
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, readlinkSync, unlinkSync, appendFileSync, chmodSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, readlinkSync, unlinkSync, appendFileSync, chmodSync, renameSync, openSync, readSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
@@ -22,6 +22,7 @@ import { join, dirname, basename } from 'node:path';
 // Pluggable IM transport (WeChat / Telegram). The core never references a
 // specific IM — it talks to the Transport interface and an opaque reply target.
 import { createTransport, resolveTransportName } from '../dist/transport/index.js';
+import { encodeCwd, isSameProjectDir } from '../dist/constants.js';
 import { logger, redact } from '../dist/logger.js';
 import {
   splitMessage,
@@ -80,9 +81,11 @@ let injectedTarget         = '';
 let orphanPollText         = null;   // injectedText of the in-flight 5-min orphan poll (dedup, B5)
 let pendingSelect          = null;   // { type, expires } — waiting for user to pick from a menu
 let pendingQuiz            = null;   // { questions, questionIndex, expires } — AskUserQuestion forwarding
-let compactionGraceUntil   = 0;     // ms timestamp — accept any same-project transcript until this time
+let compactionGraceUntil   = 0;     // ms timestamp — accept a post-compaction transcript until this time
+let compactionGraceTranscript = null; // transcript the grace was armed for; gates acceptance to ITS project (prevents accepting a foreign session's Stop)
 let injectTimer      = null;
 let ccBusy           = false;
+let slashCaptureBusy = false;   // one inject+capture at a time (shared tmux pane)
 let lastTarget       = '';     // most recent inbound reply target (opaque)
 let lastUserKey      = '';     // stable user id of the most recent inbound (welcome dedup)
 const welcomedUsers  = new Set(); // users already sent a welcome this process run
@@ -226,6 +229,18 @@ function paneExists(target) {
   catch { return false; }
 }
 
+/** Resolve a tmux target (session:window.pane) to its pane pid, or null. */
+function panePidFor(tmuxStr) {
+  if (!tmuxStr) return null;
+  try {
+    const rows = execFileSync('tmux', [
+      'list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n');
+    const row = rows.map(l => l.split('\t')).find(([t]) => t === tmuxStr);
+    return row ? row[1] : null;
+  } catch { return null; }
+}
+
 function capturePaneContent(target, scrollback = 40) {
   try {
     return execFileSync('tmux', [
@@ -296,8 +311,13 @@ function tryAutoConfirmCompaction(target) {
 
   logger.info('Detected compaction prompt, auto-confirming', { contentSnippet: content.slice(-200) });
   sendTmuxKey(target, 'Enter');
-  // Set grace period so the Stop handler accepts the new post-compaction transcript
+  // Set grace period so the Stop handler accepts the new post-compaction transcript.
+  // Anchor it to the project we're compacting (the injected/active transcript) BEFORE
+  // nulling lastInjectedTranscript below, so the grace can only authorize accepting a
+  // Stop from THE SAME project — never an unrelated Claude session that happens to
+  // compact within the window (which would otherwise forward its reply to our chat).
   compactionGraceUntil = Date.now() + 120_000; // 2 minutes
+  compactionGraceTranscript = lastInjectedTranscript || getActiveState().transcriptPath || null;
   lastInjectedTranscript = null;  // will be re-set from the Stop payload
   return true;
 }
@@ -440,11 +460,44 @@ function advanceQuiz(replyTarget) {
 }
 
 // ── Transcript helpers ───────────────────────────────────────────────
-function parseTranscript(filePath) {
+// CC transcripts are append-only JSONL and grow into MBs over a long session.
+// parseTranscript runs synchronously on the hook event loop (every Stop /
+// Notification) and inside poll timers, so reading the WHOLE file each time stalls
+// the daemon (blocking the IM long-poll, other hooks, timers). Callers on the hot
+// path pass maxBytes to read only the tail — the current turn (injected user msg +
+// its response) is always at the very end. The first, possibly-partial, line of a
+// tailed read is dropped. maxBytes <= 0 (default) reads the whole file, preserving
+// behaviour for cold paths (#sw context replay, etc.).
+const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024; // ample for any single turn
+
+function parseTranscript(filePath, maxBytes = 0) {
   try {
-    const lines = readFileSync(filePath, 'utf8').trim().split('\n');
+    let raw;
+    if (maxBytes > 0) {
+      const size = statSync(filePath).size;
+      if (size > maxBytes) {
+        const fd = openSync(filePath, 'r');
+        try {
+          const buf = Buffer.allocUnsafe(maxBytes);
+          const read = readSync(fd, buf, 0, maxBytes, size - maxBytes);
+          raw = buf.toString('utf8', 0, read);
+        } finally { closeSync(fd); }
+        const nl = raw.indexOf('\n');      // drop the leading partial line
+        raw = nl >= 0 ? raw.slice(nl + 1) : raw;
+      } else {
+        raw = readFileSync(filePath, 'utf8');
+      }
+    } else {
+      raw = readFileSync(filePath, 'utf8');
+    }
+    const lines = raw.trim().split('\n');
     return lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   } catch { return []; }
+}
+
+/** Is `filePath` larger than the hot-path tail cap? (used to decide a full-read fallback) */
+function transcriptExceedsTail(filePath) {
+  try { return statSync(filePath).size > TRANSCRIPT_TAIL_BYTES; } catch { return false; }
 }
 
 // textFromContent / findResponseToInjected / findLastCompleteResponse /
@@ -452,16 +505,11 @@ function parseTranscript(filePath) {
 
 // ── Multi-session: discovery ─────────────────────────────────────────
 
-/** Encode a filesystem path to the format CC uses for project dirs. */
-function encodeCwd(cwd) {
-  return cwd.replace(/[^a-zA-Z0-9-]/g, '-');
-}
+// encodeCwd is imported from ../dist/constants.js (single source of truth, shared
+// with detect.py's encode_cwd via the unit test). Previously index.js carried its
+// own copy that silently diverged from constants.ts/detect.py on non-ASCII paths.
 
-/** Check if two transcript paths are in the same project directory. */
-function isSameProjectDir(pathA, pathB) {
-  if (!pathA || !pathB) return false;
-  return dirname(pathA) === dirname(pathB);
-}
+// isSameProjectDir is imported from ../dist/constants.js (shared + unit-tested).
 
 /** Find the most recently modified .jsonl transcript for a given cwd (fallback). */
 function findLatestTranscript(cwd) {
@@ -915,6 +963,22 @@ const CC_TUI_ONLY = new Set([
  * Does NOT set lastInjectedText — Stop hook ignores these.
  */
 async function injectSlashAndCapture(target, command, send) {
+  // Serialize: two captures racing the SAME pane within the 2.5s window interleave
+  // their pane reads and the bottom-up echo match duplicates/garbles output. Run one
+  // at a time (normal message injection is already serialized via lastInjectedText).
+  if (slashCaptureBusy) {
+    await send('⏳ 上一个命令还在执行，请稍候重试');
+    return;
+  }
+  slashCaptureBusy = true;
+  try {
+    await injectSlashAndCaptureInner(target, command, send);
+  } finally {
+    slashCaptureBusy = false;
+  }
+}
+
+async function injectSlashAndCaptureInner(target, command, send) {
   const beforeContent = capturePaneContent(target);
   const beforeLineCount = beforeContent.trimEnd().split('\n').length;
 
@@ -1019,6 +1083,16 @@ async function performSwitch(targetName, send) {
   injectedTarget         = '';
   orphanPollText         = null;
   pendingQueue           = [];
+  // A compaction grace armed for the OLD session must not authorize accepting a
+  // Stop after we've switched away.
+  compactionGraceUntil       = 0;
+  compactionGraceTranscript  = null;
+  // Any quiz / model-menu was anchored to the OLD session's pane; a typed answer
+  // now would be keyed into the NEW pane. Drop them and tell the user.
+  const hadPending = !!(pendingQuiz || pendingSelect);
+  pendingQuiz            = null;
+  pendingSelect          = null;
+  if (hadPending) await send('↪️ 切换会话已取消上一个待回答的问题/菜单');
   cancelPending();
   saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null });
 
@@ -1480,15 +1554,58 @@ function onStopCodex(payload, readPath) {
  */
 function transcriptHasInjectedUser(tpath, injectedText) {
   if (!tpath || !injectedText) return false;
-  return transcriptHasUserText(parseTranscript(tpath), injectedText);
+  return transcriptHasUserText(parseTranscript(tpath, TRANSCRIPT_TAIL_BYTES), injectedText);
+}
+
+/**
+ * Arm a bounded poll that resolves (or, at the deadline, abandons) an in-flight
+ * injected turn whose Stop we may never receive — e.g. the daemon was down when the
+ * agent finished, or a missed end_turn. Without this, a restored-on-startup
+ * lastInjectedText (see main()) would stay set forever and scheduleInject() would
+ * perpetually no-op, silently swallowing every future message. Claude-only
+ * (findResponseToInjected reads the Claude transcript schema). Deduped on
+ * orphanPollText so only one chain runs per injected message.
+ */
+function armOrphanPoll(savedInjectedText, savedReadPath, graceMs = 5 * 60 * 1000, pollMs = 5_000) {
+  if (!savedInjectedText) return;
+  if (orphanPollText === savedInjectedText) return; // already polling this turn
+  orphanPollText = savedInjectedText;
+  const deadline = Date.now() + graceMs;
+  const poll = () => {
+    if (lastInjectedText !== savedInjectedText) return; // resolved elsewhere
+    if (savedReadPath) {
+      const r = findResponseToInjected(parseTranscript(savedReadPath, TRANSCRIPT_TAIL_BYTES), savedInjectedText);
+      if (r?.text && r.complete) {
+        orphanPollText = null;
+        pushResponse(r.text);
+        logger.info('Pushed response via orphan poll', { chars: r.text.length });
+        scheduleInject();
+        return;
+      }
+    }
+    if (Date.now() >= deadline) {
+      logger.warn('Orphan poll grace expired, cleaning up', { lastInjected: savedInjectedText.slice(0, 60) });
+      orphanPollText = null;
+      if (lastInjectedText === savedInjectedText) {
+        if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
+        lastInjectedText       = null;
+        lastInjectedTranscript = null;
+        injectedTarget         = '';
+        saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
+        scheduleInject();
+      }
+      return;
+    }
+    setTimeout(poll, pollMs);
+  };
+  setTimeout(poll, pollMs);
 }
 
 async function onStop(payload) {
-  ccBusy = false;
   const state = getActiveState();
   const kind = state.kind || 'claude';
   const tpath = payload.transcript_path || state.transcriptPath;
-  if (!tpath) { scheduleInject(); return; }
+  if (!tpath) { ccBusy = false; scheduleInject(); return; }
 
   // Accept Stop from: (1) the session we injected into, OR (2) the current active session.
   // Check both because the session scanner may temporarily reassign transcriptPath between
@@ -1500,8 +1617,13 @@ async function onStop(payload) {
     // The compaction-grace and same-project acceptance branches are Claude-only:
     // Codex rollouts live in date-based dirs, so "same dir" is NOT project identity
     // and would wrongly accept an unrelated session's Stop.
-    if (kind === 'claude' && lastInjectedText && Date.now() < compactionGraceUntil) {
-      logger.info('Accepting post-compaction transcript', { tpath: tpath.slice(-40) });
+    if (kind === 'claude' && lastInjectedText && Date.now() < compactionGraceUntil
+        && isSameProjectDir(tpath, compactionGraceTranscript || state.transcriptPath)) {
+      // Post-compaction transcript, AND it lives in the same project the grace was
+      // armed for. Without the same-project check, a foreign Claude session's Stop
+      // during the 2-min window would be accepted and its reply forwarded to our
+      // chat (wrong-session / data-leak).
+      logger.info('Accepting post-compaction transcript (same project)', { tpath: tpath.slice(-40) });
       lastInjectedTranscript = tpath;  // update to new transcript
     } else if (kind === 'claude' && lastInjectedText
                && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)
@@ -1515,10 +1637,11 @@ async function onStop(payload) {
       lastInjectedTranscript = tpath;
     } else {
       logger.debug('Stop from foreign session, ignoring', { tpath: tpath.slice(-60), injected: lastInjectedTranscript?.slice(-40), active: state.transcriptPath?.slice(-40) });
-      // ccBusy was cleared unconditionally at the top of onStop, so a message
-      // queued for the ACTIVE session while busy must get a chance to drain now —
-      // scheduleInject() is self-guarded (no-op if lastInjectedText set or queue empty).
-      scheduleInject();
+      // Do NOT clear ccBusy here: a foreign Stop must not unblock a terminal-initiated
+      // turn genuinely in flight (where lastInjectedText is null and ccBusy is the only
+      // interlock) — clearing it would let a queued IM message inject mid terminal-turn.
+      // Only drain the queue if nothing is actually busy.
+      if (!ccBusy) scheduleInject();
       return;
     }
   }
@@ -1529,6 +1652,11 @@ async function onStop(payload) {
     lastInjectedTranscript = tpath;
   }
 
+  // This Stop is for our session (matched, or accepted via grace / same-project) — the
+  // turn has ended, so clear the busy flag. Moved here from the top of onStop so a
+  // foreign Stop (handled+returned above) can never clear busy for a live terminal turn.
+  ccBusy = false;
+
   logger.info('Stop hook received', { kind, transcript_path: tpath.slice(-60) });
 
   const readPath = lastInjectedTranscript || tpath;
@@ -1537,13 +1665,24 @@ async function onStop(payload) {
   // the Stop payload — handle it separately and return.
   if (kind === 'codex') { onStopCodex(payload, readPath); return; }
 
-  const entries = parseTranscript(readPath);
+  // Read only the tail on the hot path; if our injected message isn't in the tail
+  // (a single turn larger than the cap), fall back to one full read so we don't
+  // miss the response on an extremely large turn.
+  let entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
   let result = findResponseToInjected(entries, lastInjectedText);
+  if (!result && lastInjectedText && transcriptExceedsTail(readPath)) {
+    entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
+    result = findResponseToInjected(entries, lastInjectedText);
+  }
 
   // Post-compaction fallback: injected text was summarized away in the new
   // transcript, so text-based matching fails. Use the last end_turn entry.
   // Guard: skip if it matches the last pushed response (avoids sending stale/duplicate).
-  if (!result && lastInjectedText && Date.now() < compactionGraceUntil) {
+  // Also require the transcript to be in the project the grace was armed for —
+  // findLastCompleteResponse ignores injectedText, so without this an unrelated
+  // transcript's last answer could be forwarded.
+  if (!result && lastInjectedText && Date.now() < compactionGraceUntil
+      && (!compactionGraceTranscript || isSameProjectDir(readPath, compactionGraceTranscript))) {
     result = findLastCompleteResponse(entries);
     if (result) {
       if (lastPushedText && result.text === lastPushedText) {
@@ -1589,7 +1728,7 @@ async function onStop(payload) {
     const savedReadPath = readPath;
     setTimeout(() => {
       if (lastInjectedText !== savedInjectedText) return; // already resolved
-      const retryEntries = parseTranscript(savedReadPath);
+      const retryEntries = parseTranscript(savedReadPath, TRANSCRIPT_TAIL_BYTES);
       const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
       if (retryResult?.text && retryResult.complete) {
         pushResponse(retryResult.text);
@@ -1608,7 +1747,7 @@ async function onStop(payload) {
     // flushed.  Retry after a short delay to catch late writes.
     if (!result && lastInjectedText) {
       await new Promise(r => setTimeout(r, 500));
-      const retryEntries = parseTranscript(readPath);
+      const retryEntries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
       result = findResponseToInjected(retryEntries, lastInjectedText);
       if (result?.text && result.complete) {
         pushResponse(result.text);
@@ -1622,7 +1761,7 @@ async function onStop(payload) {
     // stop_reason === 'tool_use', meaning more responses will follow.  In that
     // case, keep lastInjectedText so the eventual end_turn Stop can forward it.
     const lastAssistantStop = (() => {
-      const checkEntries = result ? entries : parseTranscript(readPath);
+      const checkEntries = result ? entries : parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
       for (let i = checkEntries.length - 1; i >= 0; i--) {
         if (checkEntries[i].type === 'assistant' && checkEntries[i].message?.stop_reason) {
           return checkEntries[i].message.stop_reason;
@@ -1654,7 +1793,7 @@ async function onStop(payload) {
         const poll = () => {
           // Already resolved by another path → bail out
           if (lastInjectedText !== savedInjectedText) return;
-          const retryEntries = parseTranscript(savedReadPath);
+          const retryEntries = parseTranscript(savedReadPath, TRANSCRIPT_TAIL_BYTES);
           const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
           if (retryResult?.text && retryResult.complete) {
             orphanPollText = null;
@@ -1814,24 +1953,22 @@ async function onNotification(payload) {
       const readPath = lastInjectedTranscript || state.transcriptPath;
       let result = null;
       if (readPath) {
-        const entries = parseTranscript(readPath);
+        const entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
         result = findResponseToInjected(entries, lastInjectedText);
-        // If not found, try the single newest OTHER transcript in the same project
-        // dir, in case the scanner assigned the wrong .jsonl at injection time.
-        // B6: only the newest alt (not 3) — this runs synchronously on the hook
-        // event loop, so reading several large transcripts here stalls the daemon.
+        // If not found, the scanner may have assigned the wrong .jsonl at injection.
+        // Resolve the transcript the active pane's agent ACTUALLY holds open (fd/lsof
+        // scan) rather than guessing "newest by mtime" — the latter could pick a
+        // DIFFERENT same-cwd session's transcript and forward its reply to our chat
+        // (wrong-session). Confirm it contains our injected message before accepting.
         if (!result) {
           try {
-            const projDir = dirname(readPath);
-            const altPath = readdirSync(projDir)
-              .filter(f => f.endsWith('.jsonl') && join(projDir, f) !== readPath)
-              .map(f => ({ path: join(projDir, f), mtime: statSync(join(projDir, f)).mtimeMs }))
-              .sort((a, b) => b.mtime - a.mtime)[0]?.path;
-            if (altPath) {
-              result = findResponseToInjected(parseTranscript(altPath), lastInjectedText);
+            const panePid = panePidFor(target);
+            const fdPath = panePid ? findTranscriptByPid(panePid) : null;
+            if (fdPath && fdPath !== readPath && transcriptHasInjectedUser(fdPath, lastInjectedText)) {
+              result = findResponseToInjected(parseTranscript(fdPath, TRANSCRIPT_TAIL_BYTES), lastInjectedText);
               if (result?.text) {
-                logger.info('Found response in alt transcript during idle cleanup', { altPath: altPath.slice(-40) });
-                lastInjectedTranscript = altPath;
+                logger.info('Found response in fd-open transcript during idle cleanup', { fdPath: fdPath.slice(-40) });
+                lastInjectedTranscript = fdPath;
               }
             }
           } catch {}
@@ -1862,12 +1999,57 @@ async function onNotification(payload) {
   logger.info('Notification: ' + msg);
 }
 
+// ── Single-instance guard ────────────────────────────────────────────
+// The AF_UNIX hook socket is the PRIMARY singleton token (only one process can
+// bind it). This is a belt-and-suspenders guard for the one race the socket can't
+// cover: the socket file was removed by hand (e.g. during troubleshooting) while a
+// previous daemon is still alive and long-polling. Two live pollers make Telegram
+// return 409 "terminated by other getUpdates request" loops. So before binding,
+// refuse to start if bridge.pid names a LIVE wrc daemon.
+// IMPORTANT: never `rm` the hook socket manually — let the daemon manage it.
+function procArgs(pid) {
+  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim(); } catch {}
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'args='], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {}
+  return '';
+}
+
+function anotherDaemonAlive() {
+  let pid;
+  try { pid = parseInt(readFileSync(join(CC_WECHAT, 'bridge.pid'), 'utf8').trim(), 10); } catch { return false; }
+  if (!pid || pid === process.pid) return false;
+  try { process.kill(pid, 0); } catch { return false; } // ESRCH → not alive
+  // Alive — but make sure it's actually a wrc bridge, not a recycled PID.
+  const args = procArgs(pid);
+  return /\bnode\b/.test(args) && args.includes('src/index.js');
+}
+
 // ── Hook server (Unix socket) ────────────────────────────────────────
+// Generous cap on a single hook payload (PreToolUse tool_input can carry a large
+// file write, so don't be stingy) — purely a guard so a stalled/oversized local
+// client can't pin unbounded memory.
+const MAX_HOOK_BYTES = 16 * 1024 * 1024;
+const HOOK_CONN_TIMEOUT_MS = 15_000;
+
 function startHookServer() {
   const server = net.createServer(conn => {
     conn.on('error', () => {});
+    // The response is gated on the 'end' event, so a client that connects and then
+    // idles without half-closing (a hung/buggy local process) would otherwise pin
+    // this connection and its buffered chunks forever. Drop idle connections and
+    // oversized payloads defensively. The sole real client (hook.py) half-closes
+    // immediately, so this never affects normal operation.
+    conn.setTimeout(HOOK_CONN_TIMEOUT_MS, () => conn.destroy());
     const chunks = [];
-    conn.on('data', d => chunks.push(d));
+    let total = 0;
+    conn.on('data', d => {
+      total += d.length;
+      if (total > MAX_HOOK_BYTES) { conn.destroy(); return; }
+      chunks.push(d);
+    });
     conn.on('end', () => {
       let payload;
       try { payload = JSON.parse(Buffer.concat(chunks).toString()); }
@@ -1895,6 +2077,14 @@ function startHookServer() {
   // Singleton gate: the hook socket IS the singleton token. Only one process can
   // bind an AF_UNIX path, so a second daemon — launched from ANY install dir
   // (~/.claude/skills or ~/.agents/skills) — detects the live one and exits.
+  // Secondary guard: if the socket was removed by hand but a daemon is still alive,
+  // refuse to start so we never double-poll (Telegram 409).
+  if (anotherDaemonAlive()) {
+    logger.info('Another wrc daemon is alive (bridge.pid); exiting to avoid double-poll');
+    console.log('[wrc-bridge] another bridge daemon already running (pid file), exiting');
+    process.exit(0);
+  }
+
   return new Promise((resolve) => {
     let retries = 0;
     const MAX_RETRIES = 3;
@@ -2143,6 +2333,33 @@ async function main() {
     }
   } catch {}
 
+  let startupReconciled = false;
+  function reconcileRestoredTurn() {
+    if (startupReconciled) return;       // ready may fire more than once
+    startupReconciled = true;
+    if (!lastInjectedText) return;
+    // injectedTarget is not persisted across restarts — fall back to the last known
+    // reply target so a recovered response still reaches the user.
+    if (!injectedTarget) injectedTarget = lastTarget || '';
+    logger.info('Reconciling in-flight turn restored from previous run', {
+      lastInjected: lastInjectedText.slice(0, 60), transcript: lastInjectedTranscript?.slice(-40),
+    });
+    if (lastInjectedTranscript) {
+      const r = findResponseToInjected(parseTranscript(lastInjectedTranscript, TRANSCRIPT_TAIL_BYTES), lastInjectedText);
+      if (r?.text && r.complete) {
+        pushResponse(r.text);
+        logger.info('Restored turn already complete; pushed on startup', { chars: r.text.length });
+        scheduleInject();
+        return;
+      }
+    }
+    // Not yet complete (or no transcript): arm a bounded poll so the turn either
+    // resolves when the agent finishes or is abandoned at the deadline — never
+    // wedging lastInjectedText forever. (Claude transcript matching; for Codex the
+    // deadline cleanup still un-wedges it.)
+    armOrphanPoll(lastInjectedText, lastInjectedTranscript);
+  }
+
   function onEvent(ev) {
     if (ev.type === 'ready') {
       logger.info('Transport ready', { transport: transportName, self: ev.selfName });
@@ -2161,6 +2378,13 @@ async function main() {
           .catch(err => logger.error('Startup welcome failed', { error: err.message }));
         logger.info('Sent startup welcome', { target: lastTarget });
       }
+
+      // Reconcile any in-flight turn restored from a previous run. Run here (not
+      // earlier) because the transport's sender/api is only initialised by now, so
+      // pushResponse can actually deliver. Without this, a daemon that died mid-turn
+      // would restore lastInjectedText, never receive the (already-fired) Stop, and
+      // wedge — scheduleInject() no-ops forever and every future message is dropped.
+      reconcileRestoredTurn();
       return;
     }
     if (ev.type === 'session_expired') {

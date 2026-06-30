@@ -13,6 +13,12 @@ import { loadTelegramAccount } from './auth.js';
 import { toTelegramHtml, buildInlineKeyboard } from './format.js';
 import { logger } from '../logger.js';
 const TYPING_REFRESH_MS = 4_000; // Telegram chat-action expires after ~5s
+// Startup token verification (getMe) retry. A fresh process's FIRST connection to
+// api.telegram.org is frequently reset on a flaky/GFW-affected link, so a single
+// shot would fatal-exit the daemon on a very common transient failure. Retry with
+// a bounded backoff; only a real auth rejection (HTTP 401) aborts immediately.
+const GETME_MAX_ATTEMPTS = 8;
+const GETME_RETRY_MS = 2_000;
 const CAPS = {
     inlineKeyboards: true,
     editMessages: true,
@@ -56,12 +62,29 @@ export function createTelegramTransport() {
             }
             api = new TelegramApi(account.botToken);
             // Confirm the token and learn the bot's @username for the ready banner.
+            // Retry transient network failures (ECONNRESET / timeout / "fetch failed")
+            // so a flaky first connection doesn't kill the daemon; bail only on a real
+            // 401 auth rejection.
             let selfName = account.botUsername;
-            try {
-                selfName = (await api.getMe()).username ?? selfName;
+            let verified = false;
+            for (let attempt = 1; attempt <= GETME_MAX_ATTEMPTS; attempt++) {
+                try {
+                    selfName = (await api.getMe()).username ?? selfName;
+                    verified = true;
+                    break;
+                }
+                catch (err) {
+                    const m = err instanceof Error ? err.message : String(err);
+                    if (/\b401\b|unauthorized/i.test(m)) {
+                        throw new Error(`Telegram token rejected (auth): ${m}`);
+                    }
+                    logger.warn('getMe failed, retrying', { attempt, max: GETME_MAX_ATTEMPTS, error: m });
+                    if (attempt < GETME_MAX_ATTEMPTS)
+                        await new Promise((r) => setTimeout(r, GETME_RETRY_MS));
+                }
             }
-            catch (err) {
-                throw new Error(`Telegram token rejected: ${err instanceof Error ? err.message : String(err)}`);
+            if (!verified) {
+                throw new Error(`Telegram getMe failed after ${GETME_MAX_ATTEMPTS} attempts (link unstable?)`);
             }
             onEvent({ type: 'ready', selfName });
             monitor = createTelegramMonitor(api, account, onMessage);
