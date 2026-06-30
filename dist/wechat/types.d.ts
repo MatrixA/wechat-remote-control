@@ -14,13 +14,6 @@ export declare enum MessageState {
     GENERATING = 1,
     FINISH = 2
 }
-/** Media type enum for getUploadUrl API. */
-export declare enum UploadMediaType {
-    IMAGE = 1,
-    VIDEO = 2,
-    FILE = 3,
-    VOICE = 4
-}
 export interface CDNMedia {
     aes_key: string;
     encrypt_query_param: string;
@@ -121,38 +114,4 @@ export interface OutboundMessage {
 }
 export interface SendMessageReq {
     msg: OutboundMessage;
-}
-export interface GetUploadUrlReq {
-    filekey: string;
-    media_type: UploadMediaType;
-    to_user_id: string;
-    rawsize: number;
-    rawfilemd5: string;
-    filesize: number;
-    no_need_thumb?: boolean;
-    aeskey: string;
-}
-export interface GetUploadUrlResp {
-    errcode?: number;
-    upload_param?: string;
-    upload_full_url?: string;
-}
-export interface UploadedMedia {
-    filekey: string;
-    downloadEncryptedQueryParam: string;
-    aeskey: string;
-    fileSize: number;
-    fileSizeCiphertext: number;
-}
-export interface DownloadedMedia {
-    type: 'image' | 'audio' | 'video' | 'file';
-    filePath: string;
-    mimeType: string;
-    fileName?: string;
-}
-export interface VoiceResult {
-    /** If WeChat ASR provided text, this is set and filePath is null */
-    text?: string;
-    /** If no ASR text, the audio file path */
-    media?: DownloadedMedia;
 }

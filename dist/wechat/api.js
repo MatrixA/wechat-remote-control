@@ -75,14 +75,6 @@ export class WeChatApi {
     async sendMessage(req) {
         await this.request('ilink/bot/sendmessage', req);
     }
-    /**
-     * Get a presigned upload URL for media files.
-     * Matches the real API: filekey, media_type, to_user_id, rawsize, rawfilemd5,
-     * filesize, no_need_thumb, aeskey.
-     */
-    async getUploadUrl(req) {
-        return this.request('ilink/bot/getuploadurl', req);
-    }
     /** Fetch bot config (includes typing_ticket) for a given user. */
     async getConfig(ilinkUserId, contextToken) {
         return this.request('ilink/bot/getconfig', { ilink_user_id: ilinkUserId, context_token: contextToken }, 10_000);
