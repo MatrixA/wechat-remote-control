@@ -121,14 +121,10 @@ You can list / update / remove later with `npx skills list`, `npx skills update`
 ### Option B — manual clone
 
 ```bash
-git clone https://github.com/MatrixA/wechat-remote-control.git ~/.claude/skills/wechat-remote-control
-cd ~/.claude/skills/wechat-remote-control
+git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
 npm install --production    # also runs `tsc` via postinstall to refresh dist/
 ```
-
-> If `CLAUDE_CONFIG_DIR` is set, install under `$CLAUDE_CONFIG_DIR/skills/` instead —
-> that's where Claude Code loads skills from. Hook writing and transcript lookup honour
-> `CLAUDE_CONFIG_DIR` / `CODEX_HOME` at runtime as well.
 
 ### Option C — Codex CLI
 
