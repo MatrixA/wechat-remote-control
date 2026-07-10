@@ -106,8 +106,6 @@ needed. Notes:
 
 ```bash
 npx skills add MatrixA/wechat-remote-control
-cd ~/.claude/skills/wechat-remote-control
-npm install --production    # builds dist/ via postinstall
 ```
 
 To target a specific agent, pass `-a`:
@@ -122,8 +120,6 @@ You can list / update / remove later with `npx skills list`, `npx skills update`
 
 ```bash
 git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-npm install --production    # also runs `tsc` via postinstall to refresh dist/
 ```
 
 ### Option C — Codex CLI
@@ -132,8 +128,6 @@ Codex loads skills from `~/.agents/skills/` (not `~/.claude/skills/`), so instal
 
 ```bash
 git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
-cd ~/.agents/skills/wechat-remote-control
-npm install --production
 ```
 
 `attach` auto-detects the running agent: for Codex it writes hooks into
@@ -239,3 +233,5 @@ Issues and PRs welcome. If you hit a bug, please include:
 - Your `tmux -V`, `node --version`, and OS
 
 如果你想加新功能（图片 / 语音转发、群聊支持等）欢迎先开 Issue 讨论。
+
+After changing `src/*.ts`, run `npm install && npm run build` and commit the regenerated `dist/` (CI verifies they match).

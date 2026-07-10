@@ -299,7 +299,7 @@ echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
 command -v node >/dev/null && node --version || echo "NO_NODE"
 ```
 
-If `dist/telegram/login.js` is missing, run `npm install --production` in the skill dir first
+If `dist/telegram/login.js` is missing, run `npm install` in the skill dir first
 (its `postinstall` runs `tsc`). If `NO_NODE`, install Node ≥ 18 as in WeChat login Step 2.
 
 ### Step 2: Get a bot token

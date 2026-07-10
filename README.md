@@ -111,8 +111,6 @@ skill 的登录进程与 bridge daemon 已默认带上 `NODE_USE_ENV_PROXY=1`，
 
 ```bash
 npx skills add MatrixA/wechat-remote-control
-cd ~/.claude/skills/wechat-remote-control
-npm install --production    # postinstall 会自动跑 tsc 生成 dist/
 ```
 
 要指定 agent，加 `-a`：
@@ -127,8 +125,6 @@ npx skills add MatrixA/wechat-remote-control -a claude-code
 
 ```bash
 git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-npm install --production
 ```
 
 ### Codex CLI 用户
@@ -137,8 +133,6 @@ Codex 从 `~/.agents/skills/` 读取 skill（不是 `~/.claude/skills/`），所
 
 ```bash
 git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
-cd ~/.agents/skills/wechat-remote-control
-npm install --production
 ```
 
 `attach` 会自动识别当前 agent：Codex 的 hook 写进 `~/.codex/hooks.json`（事件
@@ -248,3 +242,5 @@ Issue 和 PR 都欢迎。如果遇到 bug，请尽量带上：
 - `tmux -V`、`node --version`、操作系统版本
 
 想加新功能（图片 / 语音转发、群聊支持等）也欢迎先开 Issue 讨论。
+
+改动 `src/*.ts` 后跑 `npm install && npm run build` 重新生成 `dist/` 一起提交（CI 会校验两者一致）。
