@@ -1,6 +1,5 @@
 ---
 name: wechat-remote-control
-version: 1.0.0
 description: |
   Remote Control for Claude Code and OpenAI Codex CLI over WeChat OR Telegram.
   The active agent is auto-detected from the tmux pane (claude vs codex); the IM
@@ -11,15 +10,14 @@ description: |
             Bridge daemon starts in background; it watches the session transcript
             and forwards assistant output to the IM.
   - sync:   Show conversation history since last attach, for context.
-  - uninstall: Remove every trace attach left behind — agent hooks, the Claude
-            status line, the bridge daemon, socket and runtime state — so Claude
-            Code / Codex return to their original behaviour. Login credentials are
+  - uninstall: Remove every trace attach left behind (agent hooks, Claude status
+            line, bridge daemon, socket, runtime state); login credentials are
             kept so a future attach needs no re-login.
   Use when stepping away from the terminal and handing off to WeChat / Telegram.
-allowed-tools:
-  - Bash
-  - Read
-  - Edit
+license: MIT
+allowed-tools: Bash Read Edit
+metadata:
+  version: "1.0.0"
 ---
 
 # /wechat-remote-control
