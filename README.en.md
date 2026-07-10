@@ -126,6 +126,10 @@ cd ~/.claude/skills/wechat-remote-control
 npm install --production    # also runs `tsc` via postinstall to refresh dist/
 ```
 
+> If `CLAUDE_CONFIG_DIR` is set, install under `$CLAUDE_CONFIG_DIR/skills/` instead —
+> that's where Claude Code loads skills from. Hook writing and transcript lookup honour
+> `CLAUDE_CONFIG_DIR` / `CODEX_HOME` at runtime as well.
+
 ### Option C — Codex CLI
 
 Codex loads skills from `~/.agents/skills/` (not `~/.claude/skills/`), so install there:
