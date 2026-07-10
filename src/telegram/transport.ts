@@ -64,9 +64,28 @@ export function createTelegramTransport(): Transport {
       api = new TelegramApi(account.botToken);
 
       // Confirm the token and learn the bot's @username for the ready banner.
+      // The first connection to api.telegram.org on a flaky/throttled route
+      // frequently resets or times out; retry a few times before giving up so a
+      // transient startup failure doesn't kill the (otherwise resilient) daemon.
       let selfName = account.botUsername;
-      try { selfName = (await api.getMe()).username ?? selfName; } catch (err) {
-        throw new Error(`Telegram token rejected: ${err instanceof Error ? err.message : String(err)}`);
+      const GETME_RETRIES = 8;
+      let lastErr: unknown = null;
+      for (let attempt = 1; attempt <= GETME_RETRIES; attempt++) {
+        try {
+          selfName = (await api.getMe()).username ?? selfName;
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const m = err instanceof Error ? err.message : String(err);
+          // A genuine auth rejection (401) will never succeed on retry — fail fast.
+          if (m.includes('401') || m.toLowerCase().includes('unauthorized')) break;
+          logger.warn('Telegram getMe failed, retrying', { attempt, retries: GETME_RETRIES, error: m });
+          if (attempt < GETME_RETRIES) await new Promise((r) => setTimeout(r, 2_000));
+        }
+      }
+      if (lastErr) {
+        throw new Error(`Telegram token rejected: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
       }
 
       onEvent({ type: 'ready', selfName });

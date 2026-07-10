@@ -19,7 +19,12 @@ const BACKOFF_THRESHOLD = 3;
 const BACKOFF_LONG_MS = 30_000;
 const BACKOFF_SHORT_MS = 3_000;
 const MIN_POLL_INTERVAL_MS = 1_000;
-const LONG_POLL_TIMEOUT_S = 30;
+// Short polling (timeout=0) instead of a 30s long poll. On a flaky/throttled route
+// to api.telegram.org a long poll that gets reset mid-flight leaves a server-side
+// poll alive for the full timeout, so the next request 409s against the orphan and
+// the loop spirals. timeout=0 returns immediately, registers no lingering poll, and
+// a failed request recovers within the backoff instead of conflicting.
+const LONG_POLL_TIMEOUT_S = 0;
 
 function mediaNoteFor(msg: NonNullable<TgUpdate['message']>): string | null {
   if (msg.voice || msg.audio) return '⚠️ 暂不支持语音消息，请发送文字';
