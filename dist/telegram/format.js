@@ -11,7 +11,7 @@ export function escapeHtml(s) {
  */
 function renderInline(raw) {
     // Pull inline code spans out first (on the raw line) so their contents are
-    // never touched by the link/bold passes.
+    // never touched by the link/bold passes. NUL sentinels cannot occur in text.
     const codeSpans = [];
     let s = raw.replace(/`([^`]+)`/g, (_, code) => {
         codeSpans.push(`<code>${escapeHtml(code)}</code>`);

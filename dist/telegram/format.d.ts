@@ -11,10 +11,9 @@ import type { TgInlineKeyboardMarkup } from './types.js';
 /** Escape the three characters that are significant in Telegram HTML text. */
 export declare function escapeHtml(s: string): string;
 /**
- * Convert plain text (possibly containing ``` fenced code blocks) to Telegram
- * HTML. Fenced blocks become <pre><code>…</code></pre>; everything else is
- * HTML-escaped. Assumes balanced fences within the input (splitMessage()
- * guarantees this per chunk).
+ * Convert agent markdown (``` fences, `code`, **bold**, [links](url), #
+ * headers) to Telegram HTML. Fenced blocks become <pre><code>…</code></pre>;
+ * other lines get inline rendering via renderInline().
  */
 export declare function toTelegramHtml(text: string): string;
 /**
