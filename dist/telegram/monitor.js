@@ -4,12 +4,18 @@ const BACKOFF_THRESHOLD = 3;
 const BACKOFF_LONG_MS = 30_000;
 const BACKOFF_SHORT_MS = 3_000;
 const MIN_POLL_INTERVAL_MS = 1_000;
-// Short polling (timeout=0) instead of a 30s long poll. On a flaky/throttled route
-// to api.telegram.org a long poll that gets reset mid-flight leaves a server-side
-// poll alive for the full timeout, so the next request 409s against the orphan and
-// the loop spirals. timeout=0 returns immediately, registers no lingering poll, and
-// a failed request recovers within the backoff instead of conflicting.
-const LONG_POLL_TIMEOUT_S = 0;
+// Default to SHORT polling (timeout 0). A long poll that is reset mid-flight leaves
+// the SERVER holding the request for up to `timeout` seconds; the next getUpdates then
+// collides with that "ghost" poll — HTTP 409 "terminated by other getUpdates request" —
+// and fail→retry→409 loops until the ghost expires (up to 30s on the old value). Short
+// polling returns immediately and leaves no hanging server-side request, so a flaky
+// (e.g. GFW-affected) link self-recovers in seconds via the existing backoff. The
+// MIN_POLL_INTERVAL_MS floor caps it at ~1 req/s; inbound latency stays ≤ ~1s. Stable
+// links that prefer instant long-poll delivery can opt back in via WCC_TG_POLL_TIMEOUT.
+const LONG_POLL_TIMEOUT_S = (() => {
+    const v = parseInt(process.env.WCC_TG_POLL_TIMEOUT ?? '', 10);
+    return Number.isFinite(v) && v >= 0 ? v : 0;
+})();
 function mediaNoteFor(msg) {
     if (msg.voice || msg.audio)
         return '⚠️ 暂不支持语音消息，请发送文字';

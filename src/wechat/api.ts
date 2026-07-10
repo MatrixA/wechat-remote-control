@@ -2,8 +2,6 @@ import { randomBytes } from 'node:crypto';
 import type {
   GetUpdatesResp,
   SendMessageReq,
-  GetUploadUrlReq,
-  GetUploadUrlResp,
 } from './types.js';
 import { logger } from '../logger.js';
 
@@ -97,15 +95,6 @@ export class WeChatApi {
   /** Send a message to a user. */
   async sendMessage(req: SendMessageReq): Promise<void> {
     await this.request('ilink/bot/sendmessage', req);
-  }
-
-  /**
-   * Get a presigned upload URL for media files.
-   * Matches the real API: filekey, media_type, to_user_id, rawsize, rawfilemd5,
-   * filesize, no_need_thumb, aeskey.
-   */
-  async getUploadUrl(req: GetUploadUrlReq): Promise<GetUploadUrlResp> {
-    return this.request<GetUploadUrlResp>('ilink/bot/getuploadurl', req);
   }
 
   /** Fetch bot config (includes typing_ticket) for a given user. */

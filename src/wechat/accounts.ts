@@ -5,7 +5,6 @@ import { loadJson, saveJson } from '../store.js';
 import { logger } from '../logger.js';
 
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
-export const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
 export interface AccountData {
   botToken: string;
