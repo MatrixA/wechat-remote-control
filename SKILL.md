@@ -616,6 +616,20 @@ print(f'OK kind={kind} file={path} skill_dir={skill_dir}')
 PY
 ```
 
+**Codex hot-reload caveat.** Codex reads `hooks.json` ONCE at process startup — it does
+not hot-reload. If `agent=codex` and the wrc hooks were not already present before this
+attach (check first: `grep -c 'wechat-remote-control/hook.py' "$CODEX_HOME/hooks.json"`
+→ `0` means first install; default `CODEX_HOME` is `~/.codex`), the running codex will
+never fire them: its turns complete but no Stop reaches the bridge, so responses are
+never forwarded (the IM shows endless "typing"). After Step 6, tell the user to restart
+codex inside the same tmux pane — `/quit`, then `codex resume --last` to keep the
+conversation context. No re-attach is needed; the state files already point at the pane.
+
+Related pitfall: the bridge's session auto-discovery (`Auto-discovered … session` in the
+log) only registers sessions in `sessions.json` — it never installs hooks. Attach must be
+run at least once per agent kind (claude / codex) or that agent's responses are silently
+dropped.
+
 ### Step 5: Configure status line (Claude only)
 
 Codex has no status-line hook mechanism, so **skip this step entirely when `agent=codex`.**

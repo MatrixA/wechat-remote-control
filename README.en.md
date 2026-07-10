@@ -46,6 +46,25 @@ When you're away from your terminal but a Claude Code task is still running — 
 
 ---
 
+## Telegram support
+
+The same machinery (tmux injection, hook forwarding, multi-session, auto-approve) also
+works over a **Telegram bot** — the IM layer is abstracted behind a `Transport` interface
+(`src/transport/`), with WeChat and Telegram each implemented as an adapter.
+
+- **Login**: `/wechat-remote-control login --telegram` — create a bot via **@BotFather**,
+  paste the token, then send the bot `/start`. The first chat to message the bot is
+  **locked** as the only authorized chat (the token grants terminal control — keep it secret).
+- **Transport selection** at attach: `WCC_TRANSPORT` env > `--telegram`/`--wechat` > whichever
+  credentials exist on disk.
+- **Native Telegram capabilities**: command menu, inline keyboards for `/sw` & `/model`,
+  quiz option buttons, progress via message editing, typing indicator, markdown-rendered
+  output (code blocks, bold, links, headers), chunked under the 4096 limit.
+- Credentials live in `~/.wechat-remote-control/telegram/account.json`; WeChat files are
+  untouched, fully backwards compatible.
+
+---
+
 ## Requirements / 依赖
 
 - **macOS or Linux** with `tmux` installed
@@ -122,6 +141,12 @@ npm install --production
 writes `~/.claude/settings.json` (`PreToolUse` / `Stop` / `Notification`). The registered
 hook command is guarded — if `hook.py` is missing it silently no-ops and never blocks a
 prompt.
+
+Two notes:
+
+- If you drive both Claude and Codex, run attach **once under each agent** (only attach installs hooks).
+- Codex reads `hooks.json` only at startup: restart it after the first hook install
+  (`codex resume --last` keeps the conversation context).
 
 ### Then use it
 
