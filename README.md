@@ -66,7 +66,7 @@
   - 原生命令菜单（`setMyCommands`）：`/ls` `/sw` `/model`
   - `/model`、`/sw` 用**内联键盘**点选切换；`AskUserQuestion` 问卷渲染成**选项按钮**（多选可勾选后「完成」）
   - 长任务进度用**编辑同一条消息**的方式刷新「🔧 处理中…」，不再刷屏
-  - 打字状态用 `sendChatAction`；输出用 HTML 渲染（代码块转 `<pre><code>`），按 4096 上限分片
+  - 打字状态用 `sendChatAction`；输出按 Markdown 渲染（代码块、粗体、链接、标题），按 4096 上限分片
 - **数据目录**：Telegram 凭据存在 `~/.wechat-remote-control/telegram/account.json`（含锁定的 chat id），
   长轮询游标存 `telegram/offset.json`；微信文件原样不动，完全向后兼容。
 
@@ -146,6 +146,11 @@ npm install --production
 （`PreToolUse` / `Stop` / `Notification`）。注册的 hook 命令带兜底保护，找不到
 `hook.py` 也只会静默跳过、绝不阻塞 prompt。
 
+两个注意点：
+
+- 同时用 Claude 和 Codex 时，**每种 agent 里各跑一次 attach**（hook 只由 attach 安装）
+- Codex 只在启动时读 `hooks.json`：首次装完 hook 后重启 Codex 才生效（`codex resume --last` 可保留上下文）
+
 ### 然后开始用
 
 在 tmux 里启动的 Claude Code session 内：
@@ -179,6 +184,9 @@ QR 60s 内没扫会自动刷新一张。
 2. 写 `state.json` / `bridge.json` / `sessions.json`，告诉 daemon 要把消息注入哪个 pane
 3. 后台拉起 bridge daemon（单实例 —— 在另一个 session 里 attach 会切走目标）
 4. 给绑定的微信用户发一条欢迎消息，确认通道已建立
+
+attach 后 Claude 状态栏显示 `💬 已连微信 (遥控中)`（当前目标）或
+`💬 已连微信 (#sw 可切入)`（其他已注册 session）；Telegram 下标签为「TG」。
 
 ### `sync`
 
