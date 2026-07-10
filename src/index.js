@@ -1945,6 +1945,17 @@ async function onNotification(payload) {
       return;
     }
     if (lastInjectedText) {
+      // Notification fires per-session and only for Claude. If it comes from a
+      // DIFFERENT session than the one we injected into (e.g. an idle claude
+      // session while a codex turn is still running), it says nothing about our
+      // in-flight turn — reaping here would orphan the eventual Stop. Skip.
+      const ntpath = payload.transcript_path || '';
+      if (lastInjectedTranscript && ntpath && ntpath !== lastInjectedTranscript) {
+        logger.info('Notification from other session while turn in flight, ignoring', {
+          notif: ntpath.slice(-40), injected: lastInjectedTranscript.slice(-40),
+        });
+        return;
+      }
       // Last-chance: the end_turn Stop hook may have been missed (e.g. CC
       // fired Stop for tool_use, then the end_turn Stop wasn't delivered).
       // Try reading the transcript one more time to find the response.
@@ -2310,6 +2321,28 @@ async function main() {
   lastUserKey            = session.userKey || '';
   lastInjectedText       = session.lastInjectedText || null;
   lastInjectedTranscript = session.lastInjectedTranscript || null;
+
+  // A restored in-flight turn may never resolve: if its Stop fired while the
+  // bridge was down (or hooks were missing), no future Stop will clear
+  // lastInjectedText, and scheduleInject() deadlocks the queue forever. Give
+  // the turn a grace window to resolve normally, then reap the stale state.
+  if (lastInjectedText) {
+    const restored = lastInjectedText;
+    logger.warn('Startup: restored in-flight turn, arming stale-state reaper', { text: restored.slice(0, 40) });
+    setTimeout(() => {
+      if (lastInjectedText !== restored) return; // resolved by a real Stop
+      logger.warn('Startup: in-flight turn unresolved after grace, clearing stale state');
+      lastInjectedText       = null;
+      lastInjectedTranscript = null;
+      injectedTarget         = '';
+      saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
+      if (transport && lastTarget) {
+        if (transport.caps.typingIndicator) transport.sendTyping(lastTarget, false).catch(() => {});
+        transport.sendText(lastTarget, '⚠️ 上一条消息的回复在桥接重启期间丢失，请回终端查看，或重发一次').catch(() => {});
+      }
+      scheduleInject();
+    }, 10 * 60_000);
+  }
 
   const hookServer = await startHookServer();
 
