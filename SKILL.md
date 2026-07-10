@@ -84,10 +84,16 @@ so the pattern matches the shell itself, causing self-termination. Always use th
   (no local tmux), so the skill refuses early with a clear message.
 - `CLAUDE_CONFIG_DIR` — relocates `~/.claude/` (undocumented but supported by Claude
   Code; see anthropics/claude-code#3833). Both `detect.py` and the bridge daemon honour
-  it when looking up `<config>/projects/<encoded-cwd>/*.jsonl` transcript files.
+  it when looking up `<config>/projects/<encoded-cwd>/*.jsonl` transcript files, and the
+  hooks/statusLine writers target `<config>/settings.json`. When set, Claude Code also
+  loads skills from `<config>/skills/`, so that's where this skill should be installed.
 - `CODEX_HOME` — relocates `~/.codex/` (documented by Codex). Both `detect.py` and the
   bridge daemon honour it when looking up `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`
   rollout transcripts and when merging hooks into `<home>/hooks.json`.
+
+Every skill-dir lookup in this runbook (`find "$HOME" …`) also searches
+`$CLAUDE_CONFIG_DIR` and `$CODEX_HOME` when set, so installs under a config dir located
+outside `$HOME` are still found.
 - `CLAUDECODE=1` — set by Claude Code only. Treated as a hint, NOT a requirement: agent
   kind is determined by process ancestry, since Codex does not set it.
 
@@ -121,7 +127,7 @@ echo "=== node/npm prereq ==="
 command -v node >/dev/null && node --version || echo "NO_NODE"
 command -v npm  >/dev/null && npm  --version || echo "NO_NPM"
 echo "=== skill dir ==="
-SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name "login.js" 2>/dev/null \
+SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name "login.js" 2>/dev/null \
   | grep "wechat-remote-control/dist/wechat/login.js" | head -1 \
   | sed 's|/dist/wechat/login.js||')
 echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
@@ -286,7 +292,7 @@ the first chat to message the bot is captured and **locked** as the only authori
 ### Step 1: Resolve the skill dir and ensure Node (same as WeChat login Step 2)
 
 ```bash
-SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name "login.js" 2>/dev/null \
+SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name "login.js" 2>/dev/null \
   | grep "wechat-remote-control/dist/telegram/login.js" | head -1 \
   | sed 's|/dist/telegram/login.js||')
 echo "SKILL_DIR=${SKILL_DIR:-NOT_FOUND}"
@@ -364,7 +370,7 @@ matching the detected agent — never hardcode `~/.claude/skills`.
 
 ```bash
 echo "=== skill dir ==="
-ALL_DIRS=$(find "$HOME" -maxdepth 7 -type f -name "detect.py" 2>/dev/null \
+ALL_DIRS=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name "detect.py" 2>/dev/null \
   | grep "wechat-remote-control/detect.py" | sed 's|/detect.py||')
 SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | grep "/.claude/skills/" | head -1)
 [ -z "$SKILL_DIR" ] && SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | grep "/.agents/skills/" | head -1)
@@ -458,7 +464,7 @@ session entry records `kind` (`claude` or `codex`).
 # Re-resolve the agent-matching SKILL_DIR (shell state does not persist across
 # separate bash calls). detect.py emits its own dir as `skill_dir`, so invoking the
 # copy that matches the running agent makes that field agent-correct for Step 4.
-ALL_DIRS=$(find "$HOME" -maxdepth 7 -type f -name "detect.py" 2>/dev/null \
+ALL_DIRS=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name "detect.py" 2>/dev/null \
   | grep "wechat-remote-control/detect.py" | sed 's|/detect.py||')
 SKILL_DIR=$(printf '%s\n' "$ALL_DIRS" | head -1)
 AGENT=$(python3 "$SKILL_DIR/detect.py" preflight 2>/dev/null | sed -n 's/^agent=//p' | head -1)
@@ -642,7 +648,7 @@ settings:
 # Re-resolve the install dir (separate bash call → shell state not preserved); read the
 # authoritative skill_dir Step 3 persisted, with a find fallback.
 SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
-[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name status.sh 2>/dev/null | grep "wechat-remote-control/status.sh" | head -1 | sed 's|/status.sh||')
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name status.sh 2>/dev/null | grep "wechat-remote-control/status.sh" | head -1 | sed 's|/status.sh||')
 SKILL_DIR="$SKILL_DIR" python3 -c "
 import json, os
 path = os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude'), 'settings.json')
@@ -697,7 +703,7 @@ echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
 # Re-resolve the install dir (separate bash call); read the skill_dir Step 3 persisted,
 # with a find fallback. For Codex the daemon lives under ~/.agents/skills, not ~/.claude.
 SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
-[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name index.js 2>/dev/null | grep "wechat-remote-control/src/index.js" | head -1 | sed 's|/src/index.js||')
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name index.js 2>/dev/null | grep "wechat-remote-control/src/index.js" | head -1 | sed 's|/src/index.js||')
 # Transport: explicit WCC_TRANSPORT env wins; else auto-detect (Telegram only when a
 # Telegram account exists AND no WeChat account does). An empty value is a safe no-op —
 # the daemon applies the same heuristic internally.
@@ -761,7 +767,7 @@ status line, so that indicator is Claude-only.
 ```bash
 # Resolve the install dir dynamically (Claude: ~/.claude/skills; Codex: ~/.agents/skills).
 # format_history.py only reads ~/.wechat-remote-control/history.jsonl, so either copy works.
-SKILL_DIR=$(find "$HOME" -maxdepth 7 -type f -name format_history.py 2>/dev/null \
+SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name format_history.py 2>/dev/null \
   | grep "wechat-remote-control/format_history.py" | head -1 | sed 's|/format_history.py||')
 python3 "$SKILL_DIR/format_history.py" 2>/dev/null \
   || (tail -20 ~/.wechat-remote-control/history.jsonl 2>/dev/null || echo "No WeChat history found.")

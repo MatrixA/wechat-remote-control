@@ -131,6 +131,9 @@ cd ~/.claude/skills/wechat-remote-control
 npm install --production
 ```
 
+> 设置了 `CLAUDE_CONFIG_DIR` 的话，装到 `$CLAUDE_CONFIG_DIR/skills/` 下（Claude Code 从那里加载 skill）。
+> 运行时的 hook 写入、transcript 查找同样遵循 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`。
+
 ### Codex CLI 用户
 
 Codex 从 `~/.agents/skills/` 读取 skill（不是 `~/.claude/skills/`），所以装到那里：
