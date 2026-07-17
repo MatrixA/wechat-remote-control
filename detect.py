@@ -94,7 +94,7 @@ def list_tmux_panes():
     try:
         out = subprocess.check_output(
             ["tmux", "list-panes", "-a", "-F",
-             "#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_index}"],
+             "#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}"],
             stderr=subprocess.DEVNULL,
         ).decode()
     except Exception:
@@ -102,9 +102,9 @@ def list_tmux_panes():
     panes = {}
     for line in out.strip().split("\n"):
         parts = line.split("\t")
-        if len(parts) == 4:
+        if len(parts) == 5:
             try:
-                panes[int(parts[0])] = (parts[1], parts[2], parts[3])
+                panes[int(parts[0])] = (parts[1], parts[2], parts[3], parts[4])
             except ValueError:
                 pass
     return panes
@@ -307,6 +307,8 @@ def detect():
         "tmux_window": pane[1],
         "tmux_pane": pane[2],
         "tmux_target": f"{pane[0]}:{pane[1]}.{pane[2]}",
+        # Stable pane id ("%5") — the bridge's authoritative session routing key.
+        "tmux_pane_id": pane[3] if len(pane) > 3 else "",
         "transcript": find_transcript(agent_pid, kind),
     }
 

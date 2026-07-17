@@ -7,10 +7,18 @@
  * interface (src/transport/), so the core deals only in an opaque reply target.
  * Hook events arrive over a Unix socket from hook.py.
  *
- * Multi-session support:
- *   #ls            — list all discovered CC sessions
- *   #sw <n|name>   — switch active session (resets injection state, replays context)
- *   #rename <name> — rename the active session (tmux window + registry, pinned)
+ * Multi-session model: every discovered tmux session (claude/codex pane) owns an
+ * independent SessionState — its own message queue, in-flight turn, quiz, status
+ * message and orphan polls — so sessions work CONCURRENTLY. Hook events route by
+ * the pane id hook.py self-reports (TMUX_PANE); inbound IM messages route by
+ * forum topic (Telegram topics mode) or to the active session (private chat /
+ * WeChat fallback).
+ *
+ * Commands (also mapped from /-aliases and the Telegram command menu):
+ *   #ls            — list all discovered sessions
+ *   #sw <n|name>   — move the default-route pointer (other sessions keep running)
+ *   #rename <name> — rename a session (tmux window + registry + topic, pinned)
+ *   #model         — model menu; #esc — interrupt; #bind — bind a topics group
  */
 
 import net from 'node:net';
@@ -35,6 +43,11 @@ import {
   getAgent, sessionKind, resolveModelFor,
   CODEX_SESSIONS, findCodexTranscriptByPid, findLatestCodexRollout,
 } from './agents.js';
+import {
+  sessionKeyFor, newSessionState,
+  resolveSessionForHook, resolveSessionForInbound,
+  persistableState, migrateLegacyIlink, planTopicSync,
+} from '../dist/sessions.js';
 
 // ── Paths ────────────────────────────────────────────────────────────
 const HOOK_SOCKET    = '/tmp/cc_wechat_hook.sock';
@@ -43,6 +56,7 @@ const STATE_FILE     = join(CC_WECHAT, 'state.json');       // legacy single-ses
 const SESSIONS_FILE  = join(CC_WECHAT, 'sessions.json');    // multi-session registry
 const HISTORY_FILE   = join(CC_WECHAT, 'history.jsonl');
 const SESSION_FILE   = join(CC_WECHAT, 'ilink_session.json');
+const SESS_STATE_FILE = join(CC_WECHAT, 'sessions_state.json'); // per-session crash-recovery turns
 // Honour CLAUDE_CONFIG_DIR (undocumented but supported by Claude Code) so users
 // who relocate ~/.claude/ via that env var still have their transcripts found.
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
@@ -66,93 +80,181 @@ const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh',
 // resolveModelFor). The #model menu is intercepted at bridge level for both agents.
 
 // ── Mutable state ────────────────────────────────────────────────────
-let lastInjectedText       = null;
-let lastInjectedTranscript = null;  // transcript path of the session we injected into
-let lastPushedText         = null;
-// FIFO queue of messages awaiting injection. Each item carries its opaque reply
-// target captured at receive time, so the eventual response is forwarded to the
-// right conversation even if newer messages arrive meanwhile. Replaces the old
-// single `pendingText` slot, which silently dropped a second message that
-// arrived while CC was busy.
-const MAX_PENDING_QUEUE    = 50;     // upper bound; a stalled turn can't grow it without limit
-let pendingQueue           = [];     // Array<{ text, target }>
-// Opaque reply target of the message currently injected and awaiting a response.
-let injectedTarget         = '';
-let orphanPollText         = null;   // injectedText of the in-flight 5-min orphan poll (dedup, B5)
-let pendingSelect          = null;   // { type, expires } — waiting for user to pick from a menu
-let pendingQuiz            = null;   // { questions, questionIndex, expires } — AskUserQuestion forwarding
-let compactionGraceUntil   = 0;     // ms timestamp — accept a post-compaction transcript until this time
-let compactionGraceTranscript = null; // transcript the grace was armed for; gates acceptance to ITS project (prevents accepting a foreign session's Stop)
-let injectTimer      = null;
-let ccBusy           = false;
-let slashCaptureBusy = false;   // one inject+capture at a time (shared tmux pane)
+// Every per-turn variable that used to live here as a module global is now a
+// field of a per-session SessionState (see src/sessions.ts): each discovered
+// tmux session runs its own queue / in-flight turn / quiz / status message,
+// fully concurrently. Only genuinely cross-session state stays global.
+const MAX_PENDING_QUEUE = 50;         // per-session queue bound
+const sessionStates = new Map();      // sessionKey (paneId) → SessionState
+const sidToState    = new Map();      // short runtime id → SessionState (callback routing)
 let lastTarget       = '';     // most recent inbound reply target (opaque)
 let lastUserKey      = '';     // stable user id of the most recent inbound (welcome dedup)
+let persistedTarget  = '';     // last (target,userKey) written to ilink_session.json
 const welcomedUsers  = new Set(); // users already sent a welcome this process run
 
 // ── Transport (WeChat / Telegram), set in main() ─────────────────────
 let transport            = null;
 
-// ── Progress heartbeat state ─────────────────────────────────────────
+/** Get (or lazily create) the SessionState for a registry entry. */
+function getStateFor(name, entry) {
+  const key = sessionKeyFor(entry);
+  let sess = sessionStates.get(key);
+  if (!sess && entry.paneId) {
+    // Key churn: a state created before the entry's paneId was known lives
+    // under the tmux-coordinates fallback key. Migrate it — with its in-flight
+    // turn and queue intact — instead of creating an amnesiac duplicate.
+    const legacy = sessionStates.get(`tmux:${entry.tmux}`);
+    if (legacy) {
+      sessionStates.delete(legacy.key);
+      legacy.key = key;
+      sessionStates.set(key, legacy);
+      persistStates();
+      sess = legacy;
+      logger.info('Migrated session state to pane key', { name, key });
+    }
+  }
+  if (!sess) {
+    sess = newSessionState(key, name);
+    sessionStates.set(key, sess);
+    sidToState.set(sess.sid, sess);
+  }
+  if (sess.name !== name) sess.name = name;
+  return sess;
+}
+
+/** Iterate live states (view for the pure resolvers). */
+function statesView() { return sessionStates.values(); }
+
+/** Persist every in-flight turn for daemon-restart recovery. */
+function persistStates() {
+  const out = {};
+  for (const [key, s] of sessionStates) {
+    if (s.lastInjectedText) out[key] = persistableState(s);
+  }
+  writeJson(SESS_STATE_FILE, out);
+}
+
+/** Tear down a session's runtime state (timers, in-flight notice). */
+function destroyState(key, reason) {
+  const sess = sessionStates.get(key);
+  if (!sess) return;
+  stopTurnStatus(sess);
+  cancelPending(sess);
+  if (sess.lastInjectedText) {
+    const target = sess.injectedTarget || lastTarget;
+    if (transport && target) {
+      transport.sendTyping(target, false).catch(() => {});
+      transport.sendText(target, `⚠️ 会话 ${sess.name} 已消失（${reason}），该条消息的回复不再跟踪`).catch(() => {});
+    }
+  }
+  // Null the turn so any orphan-poll closure still holding this state sees it
+  // resolved and dies silently, instead of double-signalling the user later.
+  sess.lastInjectedText = null;
+  sess.orphanPollText = null;
+  sess.pendingQueue = [];
+  sessionStates.delete(key);
+  sidToState.delete(sess.sid);
+  persistStates();
+}
+
+/** React to a user's message (👀 injected / 👍 delivered / 💔 abandoned) where supported. */
+function reactTo(target, messageId, emoji) {
+  if (!transport?.caps.reactions || !transport.react || !target || !messageId) return;
+  transport.react(target, messageId, emoji).catch(() => {});
+}
+
+// ── Per-turn live status ─────────────────────────────────────────────
 // The typing indicator dies client-side after ~15s, so on multi-minute tool
 // loops the user is left staring at silence wondering if the bridge crashed.
-// A periodic "still working (N tools)" message keeps them informed (C1/H7).
+// Edit-capable transports (Telegram) get ONE status message per turn, edited in
+// place: elapsed time + tool activity + a ⏹ interrupt button. Non-edit
+// transports (WeChat) keep the old single "still working" notice. Self-stops
+// once the turn resolves (sess.lastInjectedText cleared) so a forgotten call
+// site can never leave it running.
 const HEARTBEAT_MS       = 25_000;
-let heartbeatTimer       = null;
-let heartbeatTarget      = '';       // target the heartbeat sends/edits to
-let heartbeatMsgId       = null;     // message id to edit (edit-capable transports)
-let heartbeatSentOnce    = false;    // non-edit transports send a single notice, then go quiet
-let turnToolCount        = 0;        // tools called during the current turn
-let turnLastTool         = '';       // name of the most recent tool
+const STATUS_DEBOUNCE_MS = 3_000;   // min gap between tool-triggered edits (TG rate limits)
 
-// The typing indicator is now owned by each transport adapter (WeChat's
+// The typing indicator is owned by each transport adapter (WeChat's
 // getConfig→ticket dance, Telegram's sendChatAction). The core just calls
 // transport.sendTyping(target, on).
 
-// ── Progress heartbeat ───────────────────────────────────────────────
-// Started when a WeChat-initiated message is injected; ticks every HEARTBEAT_MS
-// while the turn is still in flight, pushing a short progress line. Self-stops
-// once the turn resolves (lastInjectedText cleared) so a forgotten call site can
-// never leave it running.
-function startHeartbeat() {
-  stopHeartbeat();
-  turnToolCount    = 0;
-  turnLastTool     = '';
-  heartbeatTarget  = injectedTarget || lastTarget;
-  heartbeatMsgId   = null;
-  heartbeatSentOnce = false;
-  heartbeatTimer = setInterval(() => {
-    if (!lastInjectedText) { stopHeartbeat(); return; }
-    if (pendingQuiz || pendingSelect) return;      // user is being asked something — don't nag
+function fmtDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60 ? `${s % 60}s` : ''}`;
+}
+
+function statusBody(sess) {
+  const elapsed = fmtDur(Date.now() - sess.turnStartedAt);
+  return sess.turnToolCount > 0
+    ? `⏳ ${elapsed} · 已调用 ${sess.turnToolCount} 个工具${sess.turnLastTool ? ` · 最近 ${sess.turnLastTool}` : ''}`
+    : `🚀 处理中… ${elapsed}`;
+}
+
+function statusButtons(sess) {
+  return [[{ label: '⏹ 中断', data: `intr:${sess.sid}` }]];
+}
+
+function editStatus(sess) {
+  const target = sess.injectedTarget || lastTarget;
+  if (!transport || !target || !sess.lastInjectedText) return;
+  if (sess.pendingQuiz || sess.pendingSelect) return;  // user is being asked something — don't nag
+  if (!sess.statusMsgId) return;
+  transport.editText(target, sess.statusMsgId, statusBody(sess), statusButtons(sess)).catch(() => {});
+}
+
+function startTurnStatus(sess) {
+  stopTurnStatus(sess);
+  sess.turnStartedAt     = Date.now();
+  sess.turnToolCount     = 0;
+  sess.turnLastTool      = '';
+  sess.statusMsgId       = null;
+  sess.heartbeatSentOnce = false;
+  if (transport?.caps.editMessages && transport.caps.inlineKeyboards) {
+    transport.sendButtons(sess.injectedTarget || lastTarget, statusBody(sess), statusButtons(sess))
+      .then(s => { sess.statusMsgId = s?.messageId ?? null; })
+      .catch(() => {});
+  }
+  sess.heartbeatTimer = setInterval(() => {
+    if (!sess.lastInjectedText) { stopTurnStatus(sess); return; }
+    if (sess.pendingQuiz || sess.pendingSelect) return;
     if (!transport) return;
+    if (transport.caps.editMessages) { editStatus(sess); return; }
     // Non-edit transports (WeChat) can't update a status line in place, so every
     // tick would post a NEW chat message — ~12 per 5-min turn. Send a single
     // progress notice on the first tick, then stay quiet until the turn resolves.
-    if (!transport.caps.editMessages && heartbeatSentOnce) return;
-    const target = injectedTarget || lastTarget || heartbeatTarget;
+    if (sess.heartbeatSentOnce) return;
+    const target = sess.injectedTarget || lastTarget;
     if (!target) return;
-    const body = turnToolCount > 0
-      ? `🔧 处理中：已调用 ${turnToolCount} 个工具${turnLastTool ? `，最近 ${turnLastTool}` : ''}`
-      : '🔧 仍在处理中…';
-    heartbeatSentOnce = true;
-    // Edit-capable transports (Telegram) update ONE status message in place
-    // instead of sending a new line every tick.
-    if (transport.caps.editMessages && heartbeatMsgId) {
-      transport.editText(target, heartbeatMsgId, body).catch(async () => {
-        const s = await transport.sendText(target, body).catch(() => null);
-        heartbeatMsgId = s?.messageId ?? null;
-      });
-    } else {
-      transport.sendText(target, body).then(s => {
-        if (transport.caps.editMessages) heartbeatMsgId = s?.messageId ?? null;
-      }).catch(() => {});
-    }
+    sess.heartbeatSentOnce = true;
+    transport.sendText(target, sess.turnToolCount > 0
+      ? `🔧 处理中：已调用 ${sess.turnToolCount} 个工具${sess.turnLastTool ? `，最近 ${sess.turnLastTool}` : ''}`
+      : '🔧 仍在处理中…').catch(() => {});
   }, HEARTBEAT_MS);
 }
 
-function stopHeartbeat() {
-  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-  heartbeatMsgId = null;
+/** Tool-event nudge: debounce edits so a rapid tool loop can't hit TG rate limits. */
+function bumpTurnStatus(sess) {
+  if (!transport?.caps.editMessages || !sess.statusMsgId) return;
+  if (sess.statusEditTimer) return;
+  sess.statusEditTimer = setTimeout(() => {
+    sess.statusEditTimer = null;
+    editStatus(sess);
+  }, STATUS_DEBOUNCE_MS);
+}
+
+/** Finalize the status message (✅/⚠️ summary, button removed) and stop timers. */
+function finishTurnStatus(sess, summary) {
+  if (sess.statusEditTimer) { clearTimeout(sess.statusEditTimer); sess.statusEditTimer = null; }
+  if (sess.heartbeatTimer) { clearInterval(sess.heartbeatTimer); sess.heartbeatTimer = null; }
+  const target = sess.injectedTarget || lastTarget;
+  if (summary && transport?.caps.editMessages && sess.statusMsgId && target) {
+    transport.editText(target, sess.statusMsgId, summary).catch(() => {});
+  }
+  sess.statusMsgId = null;
+}
+
+function stopTurnStatus(sess) {
+  finishTurnStatus(sess, null);
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────
@@ -225,8 +327,12 @@ function tmuxTarget(state) {
 }
 
 function paneExists(target) {
-  try { execFileSync('tmux', ['has-session', '-t', target.split('.')[0]], { stdio: 'ignore' }); return true; }
-  catch { return false; }
+  // display-message resolves both coordinate ("s:w.p") and pane-id ("%5") targets.
+  try {
+    execFileSync('tmux', ['display-message', '-p', '-t', target, '#{pane_id}'],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    return true;
+  } catch { return false; }
 }
 
 /** Resolve a tmux target (session:window.pane) to its pane pid, or null. */
@@ -257,7 +363,7 @@ function stripAnsi(str) {
  * Extract CC's visible response from tmux pane after an injected message.
  * Fallback for when the transcript has no entry (CLI errors, unknown skills, etc.).
  */
-function sendKeys(target, text) {
+function sendKeys(target, text, bufKey = '') {
   // Strip control chars but KEEP newlines (\x0a) — a multi-line WeChat message
   // must reach the agent as one prompt, not be fragmented per line.
   const safe = text.replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '');
@@ -268,8 +374,11 @@ function sendKeys(target, text) {
     // inserts the newlines verbatim, then a single Enter submits the whole message.
     // (-p only brackets when the pane's app enabled bracketed-paste mode, which
     // both agents do; -d deletes the temp buffer after pasting.)
-    execFileSync('tmux', ['set-buffer', '-b', 'wrc-inject', safe]);
-    execFileSync('tmux', ['paste-buffer', '-d', '-p', '-b', 'wrc-inject', '-t', target]);
+    // The buffer name is namespaced per session — two sessions injecting
+    // multi-line messages concurrently must not race one shared buffer.
+    const buf = `wrc-inject-${(bufKey || 'default').replace(/[^%\w.-]/g, '_')}`;
+    execFileSync('tmux', ['set-buffer', '-b', buf, safe]);
+    execFileSync('tmux', ['paste-buffer', '-d', '-p', '-b', buf, '-t', target]);
     execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
     return;
   }
@@ -291,7 +400,7 @@ function sendTmuxKey(target, key) {
  * prompt and auto-confirm it by sending Enter.
  * Returns true if auto-confirmed, false otherwise.
  */
-function tryAutoConfirmCompaction(target) {
+function tryAutoConfirmCompaction(sess, target) {
   const raw = capturePaneContent(target, 30);
   if (!raw) return false;
   const content = stripAnsi(raw);
@@ -312,28 +421,29 @@ function tryAutoConfirmCompaction(target) {
   logger.info('Detected compaction prompt, auto-confirming', { contentSnippet: content.slice(-200) });
   sendTmuxKey(target, 'Enter');
   // Set grace period so the Stop handler accepts the new post-compaction transcript.
-  // Anchor it to the project we're compacting (the injected/active transcript) BEFORE
+  // Anchor it to the project we're compacting (the injected transcript) BEFORE
   // nulling lastInjectedTranscript below, so the grace can only authorize accepting a
   // Stop from THE SAME project — never an unrelated Claude session that happens to
   // compact within the window (which would otherwise forward its reply to our chat).
-  compactionGraceUntil = Date.now() + 120_000; // 2 minutes
-  compactionGraceTranscript = lastInjectedTranscript || getActiveState().transcriptPath || null;
-  lastInjectedTranscript = null;  // will be re-set from the Stop payload
+  sess.compactionGraceUntil = Date.now() + 120_000; // 2 minutes
+  sess.compactionGraceTranscript = sess.lastInjectedTranscript
+    || readSessions().sessions[sess.name]?.transcriptPath || null;
+  sess.lastInjectedTranscript = null;  // will be re-set from the Stop payload
   return true;
 }
 
 /**
  * Forward an AskUserQuestion question to the IM. On transports with inline
  * keyboards (Telegram) each option is a tap-able button (callback_data
- * `quiz:<qIdx>:<optIdx>`, plus a "完成" button for multi-select); otherwise a
- * numbered text menu (WeChat). In both cases a typed custom answer also works.
+ * `quiz:<sid>:<qIdx>:<optIdx>`, plus a "完成" button for multi-select);
+ * otherwise a numbered text menu (WeChat). A typed custom answer also works.
  */
-function sendQuiz(question, replyTarget, qIdx) {
+function sendQuiz(sess, question, replyTarget, qIdx) {
   if (transport.caps.inlineKeyboards) {
-    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${qIdx}:${i}` }]);
+    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${sess.sid}:${qIdx}:${i}` }]);
     let text;
     if (question.multiSelect) {
-      rows.push([{ label: '✅ 完成', data: `quiz:${qIdx}:done` }]);
+      rows.push([{ label: '✅ 完成', data: `quiz:${sess.sid}:${qIdx}:done` }]);
       text = `❓ ${question.question}\n\n（多选：点选切换，选好后按"完成"，或直接输入自定义回答）`;
     } else {
       text = `❓ ${question.question}\n\n（点选项，或直接输入自定义回答）`;
@@ -418,45 +528,80 @@ function injectQuizAnswer(target, question, input) {
  * Handle a typed reply to a pending quiz (button taps go through handleCallback).
  * `replyTarget` is the opaque IM target; `target` below is the tmux pane.
  */
-function handleQuizResponse(text, replyTarget) {
-  const q = pendingQuiz.questions[pendingQuiz.questionIndex];
+function handleQuizResponse(sess, text, replyTarget) {
+  const q = sess.pendingQuiz.questions[sess.pendingQuiz.questionIndex];
   const send = (msg) => transport.sendText(replyTarget, msg)
     .catch(err => logger.error('Quiz reply failed', { error: err.message }));
 
-  const state = getActiveState();
-  const target = tmuxTarget(state);
+  const target = tmuxTargetFor(sess);
   if (!target || !paneExists(target)) {
     send('❌ tmux 不可用');
-    pendingQuiz = null;
+    sess.pendingQuiz = null;
     return;
   }
 
   try {
     const selected = injectQuizAnswer(target, q, text);
     send(`✅ ${selected}`);
-    appendHistory({ type: 'quiz_answer', question: q.question, answer: selected });
+    appendHistory({ type: 'quiz_answer', session: sess.name, question: q.question, answer: selected });
     logger.info('Quiz answer injected', { question: q.question.slice(0, 60), answer: selected });
   } catch (err) {
     send(`❌ 注入失败: ${err.message}`);
     logger.error('Quiz inject failed', { error: err.message });
   }
 
-  advanceQuiz(replyTarget);
+  advanceQuiz(sess, replyTarget);
 }
 
 /** Advance to the next quiz question (or clear state). Shared by text + callback paths. */
-function advanceQuiz(replyTarget) {
-  pendingQuiz.questionIndex++;
-  if (pendingQuiz.questionIndex >= pendingQuiz.questions.length) {
-    pendingQuiz = null;
+function advanceQuiz(sess, replyTarget) {
+  sess.pendingQuiz.questionIndex++;
+  if (sess.pendingQuiz.questionIndex >= sess.pendingQuiz.questions.length) {
+    sess.pendingQuiz = null;
   } else {
     setTimeout(() => {
-      if (pendingQuiz) {
-        pendingQuiz.selected = new Set();
-        sendQuiz(pendingQuiz.questions[pendingQuiz.questionIndex], replyTarget, pendingQuiz.questionIndex);
+      if (sess.pendingQuiz) {
+        sess.pendingQuiz.selected = new Set();
+        sendQuiz(sess, sess.pendingQuiz.questions[sess.pendingQuiz.questionIndex], replyTarget, sess.pendingQuiz.questionIndex);
       }
     }, 800);
   }
+}
+
+/**
+ * Registry-empty fallback: an attach may exist only in legacy state.json (very
+ * old install, sessions.json wiped by hand, or an agent process the scanner
+ * cannot classify). Synthesize a registry entry from it so messages keep
+ * flowing — parity with the old getActiveState() legacy fallback.
+ */
+function synthesizeLegacySession(reg) {
+  const state = readState();
+  const target = tmuxTarget(state);
+  if (!target || !paneExists(target)) return null;
+  const name = 'attached';
+  reg.sessions[name] = {
+    tmux: target,
+    cwd: '',
+    transcriptPath: state.transcriptPath || null,
+    kind: 'claude',
+    lastSeen: Date.now(),
+  };
+  reg.active = name;
+  writeSessions(reg);
+  logger.info('Synthesized session from legacy state.json', { target });
+  return { name, viaTopic: false };
+}
+
+/**
+ * Resolve a session's tmux pane target from the registry. Prefers the stable
+ * pane id (survives window moves/renames) over coordinates.
+ */
+function tmuxTargetFor(sess) {
+  const reg = readSessions();
+  const entry = reg.sessions[sess.name]
+    ?? Object.values(reg.sessions).find(s => sessionKeyFor(s) === sess.key);
+  if (!entry) return null;
+  return entry.paneId || entry.tmux;
 }
 
 // ── Transcript helpers ───────────────────────────────────────────────
@@ -735,18 +880,28 @@ function scanTmuxForCC() {
   try {
     const output = execFileSync('tmux', [
       'list-panes', '-a',
-      '-F', '#{session_name}:#{window_index}.#{pane_index}|#{window_name}|#{pane_current_path}|#{pane_pid}',
+      '-F', '#{session_name}:#{window_index}.#{pane_index}|#{pane_id}|#{window_name}|#{pane_current_path}|#{pane_pid}',
     ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
 
     const reg = readSessions();
     const now = Date.now();
     const activeTmuxTargets = new Set();
+    const activePaneIds = new Set();
+    // Every pane that EXISTS, before the agent-detection filter. Prune uses
+    // this: an entry whose pane is still alive is kept even when detection
+    // temporarily fails (agent launched via a wrapper, pgrep hiccup, agent
+    // restarting) — killing a live session's registration would drop messages
+    // and abandon its in-flight turn.
+    const existingPaneIds = new Set();
+    const existingTmuxTargets = new Set();
 
     for (const line of output.trim().split('\n')) {
       if (!line.trim()) continue;
       const parts = line.split('|');
-      if (parts.length < 4) continue;
-      const [tmuxStr, windowName, cwd, panePid] = parts;
+      if (parts.length < 5) continue;
+      const [tmuxStr, paneId, windowName, cwd, panePid] = parts;
+      existingPaneIds.add(paneId);
+      existingTmuxTargets.add(tmuxStr);
       if (!cwd) continue;
 
       // Only register panes where a supported agent (claude or codex) is running.
@@ -769,15 +924,21 @@ function scanTmuxForCC() {
       if (!transcriptPath) continue;
 
       activeTmuxTargets.add(tmuxStr);
+      activePaneIds.add(paneId);
 
       // Codex rollouts have no /rename custom-title, so never read one for codex.
       const useCustomTitle = (reliable) => kind === 'claude' && reliable;
 
-      // Already registered — refresh transcript path and lastSeen
-      const existing = Object.entries(reg.sessions).find(([, s]) => s.tmux === tmuxStr);
+      // Already registered — refresh transcript path and lastSeen. Match by the
+      // stable pane id first (survives window moves/renames); fall back to tmux
+      // coordinates for entries the attach writer created before the first scan.
+      const existing = Object.entries(reg.sessions).find(([, s]) => s.paneId === paneId)
+        ?? Object.entries(reg.sessions).find(([, s]) => !s.paneId && s.tmux === tmuxStr);
       if (existing) {
         reg.sessions[existing[0]].lastSeen = now;
         reg.sessions[existing[0]].kind = kind;
+        reg.sessions[existing[0]].paneId = paneId;   // authoritative each pass (heals pane-id reuse)
+        reg.sessions[existing[0]].tmux = tmuxStr;    // coordinates may drift as windows move
         if (fdTranscript) {
           reg.sessions[existing[0]].transcriptPath = fdTranscript;
         } else if (kind === 'claude') {
@@ -811,15 +972,32 @@ function scanTmuxForCC() {
       let suffix = 2;
       while (reg.sessions[name]) name = `${baseName}-${suffix++}`;
 
-      reg.sessions[name] = { tmux: tmuxStr, cwd, transcriptPath, kind, lastSeen: now };
-      logger.info(`Auto-discovered ${kind} session: ${name} [${tmuxStr}]`);
+      reg.sessions[name] = { tmux: tmuxStr, paneId, cwd, transcriptPath, kind, lastSeen: now };
+      logger.info(`Auto-discovered ${kind} session: ${name} [${tmuxStr} ${paneId}]`);
     }
 
-    // Prune sessions not seen in 2 scan intervals
+    // Prune sessions whose PANE is gone (not merely "agent not detected") and
+    // that haven't been seen in 2 scan intervals. A pruned session's topic is
+    // closed (kept in the group with its history) and tombstoned so a
+    // reappearing session under the same name reopens it instead of duplicating.
     for (const [name, s] of Object.entries(reg.sessions)) {
-      if (!activeTmuxTargets.has(s.tmux) && now - (s.lastSeen || 0) > SCAN_INTERVAL * 2) {
+      const seen = s.paneId ? activePaneIds.has(s.paneId) : activeTmuxTargets.has(s.tmux);
+      const paneAlive = s.paneId ? existingPaneIds.has(s.paneId) : existingTmuxTargets.has(s.tmux);
+      if (seen || paneAlive) {
+        if (paneAlive && !seen) s.lastSeen = s.lastSeen || now; // keep, but don't refresh lastSeen
+        continue;
+      }
+      if (!seen && now - (s.lastSeen || 0) > SCAN_INTERVAL * 2) {
         logger.info(`Removing stale session: ${name}`);
         if (reg.active === name) reg.active = null;
+        if (s.imTarget) {
+          reg.closedTopics = reg.closedTopics || {};
+          reg.closedTopics[name] = s.imTarget;
+          if (transport?.topics && transport.caps.topics) {
+            transport.topics.close(s.imTarget).catch(() => {});
+          }
+        }
+        destroyState(sessionKeyFor(s), 'tmux 会话已关闭');
         delete reg.sessions[name];
       }
     }
@@ -854,9 +1032,175 @@ function scanTmuxForCC() {
     }
 
     writeSessions(reg);
+    reconcileStates(reg);
+    syncSessionTopics().catch(err => logger.debug('topic sync error', { error: err.message }));
   } catch (err) {
     logger.debug('tmux scan error', { error: err.message });
   }
+}
+
+/**
+ * Align the runtime SessionState map with the registry after a scan: rename
+ * states whose entry was renamed, migrate states stranded on a pre-paneId
+ * fallback key (the scan just stamped paneId, changing sessionKeyFor), drop
+ * states whose entry genuinely disappeared.
+ */
+function reconcileStates(reg) {
+  const byKey = new Map();      // current key → name
+  const migrations = new Map(); // legacy tmux-coords key → [current key, name]
+  for (const [name, s] of Object.entries(reg.sessions)) {
+    const key = sessionKeyFor(s);
+    byKey.set(key, name);
+    if (s.paneId) migrations.set(`tmux:${s.tmux}`, [key, name]);
+  }
+  for (const [key, sess] of [...sessionStates]) {
+    let name = byKey.get(key);
+    if (!name && migrations.has(key)) {
+      const [newKey, newName] = migrations.get(key);
+      const dupe = sessionStates.get(newKey);
+      if (!dupe) {
+        sessionStates.delete(key);
+        sess.key = newKey;
+        sessionStates.set(newKey, sess);
+        persistStates();
+        name = newName;
+        logger.info('Migrated session state to pane key (scan)', { name, key: newKey });
+      } else if (!dupe.lastInjectedText && sess.lastInjectedText) {
+        // A fresh idle duplicate was created under the new key before this
+        // reconcile ran — the legacy state carries the real in-flight turn, so
+        // it wins; retire the duplicate quietly.
+        stopTurnStatus(dupe);
+        cancelPending(dupe);
+        sidToState.delete(dupe.sid);
+        sessionStates.delete(key);
+        sess.key = newKey;
+        sessionStates.set(newKey, sess);
+        persistStates();
+        name = newName;
+        logger.info('Merged legacy in-flight state over idle duplicate', { name });
+      } else {
+        // Legacy state is idle (or both carry turns — keep the pane-keyed one,
+        // it received the newer events). Retire it without the "gone" notice.
+        stopTurnStatus(sess);
+        cancelPending(sess);
+        sess.lastInjectedText = null;
+        sidToState.delete(sess.sid);
+        sessionStates.delete(key);
+        persistStates();
+        continue;
+      }
+    }
+    if (!name) destroyState(key, '会话已不在注册表');
+    else if (sess.name !== name) sess.name = name;
+  }
+}
+
+// ── Forum topics lifecycle ───────────────────────────────────────────
+// After every scan, make the bound Telegram group's topics mirror the registry:
+// each session gets its own topic (reopening a tombstoned one when a session
+// reappears), renames propagate. Serialised — a slow Telegram call must not
+// overlap the next scan's sync.
+let topicSyncBusy = false;
+let topicRightsWarned = false;
+
+async function syncSessionTopics() {
+  if (!transport?.topics || !transport.caps.topics) return;
+  if (topicSyncBusy) return;
+  topicSyncBusy = true;
+  try {
+    const ops = planTopicSync(readSessions());
+    for (const op of ops) {
+      try {
+        if (op.op === 'create') {
+          const imTarget = await transport.topics.create(op.name);
+          applyTopicResult(op.name, imTarget);
+          const fresh = readSessions().sessions[op.name];
+          if (fresh) {
+            transport.sendText(imTarget,
+              `🆕 已连接会话 ${op.name}（${sessionKind(fresh)}）\n📁 ${fresh.cwd}\n\n在此话题内发消息即发送到该会话，回复也只出现在这里。`,
+            ).catch(() => {});
+          }
+        } else if (op.op === 'reopen') {
+          // Best-effort: reopening an already-open or user-deleted topic fails
+          // harmlessly; a deleted topic is recreated on the next send failure.
+          await transport.topics.reopen(op.imTarget).catch(() => {});
+          applyTopicResult(op.name, op.imTarget);
+        } else if (op.op === 'rename') {
+          await transport.topics.rename(op.imTarget, op.name);
+          applyTopicResult(op.name, op.imTarget);
+        }
+      } catch (err) {
+        const m = err?.message || String(err);
+        logger.warn('Topic sync op failed', { op: op.op, name: op.name, error: m });
+        // Missing "Manage Topics" admin right → tell the user once, in General.
+        if (/not enough rights|CHAT_ADMIN_REQUIRED|administrator/i.test(m) && !topicRightsWarned) {
+          topicRightsWarned = true;
+          const home = transport.homeTarget?.();
+          if (home) {
+            transport.sendText(home,
+              '⚠️ 无法创建话题：请把 bot 设为本群管理员并勾选「管理话题」权限，之后会自动重试。',
+            ).catch(() => {});
+          }
+        }
+      }
+    }
+  } finally {
+    topicSyncBusy = false;
+  }
+}
+
+/** Persist a topic op result, re-reading the registry to avoid clobbering a concurrent scan. */
+function applyTopicResult(name, imTarget) {
+  const reg = readSessions();
+  if (reg.sessions[name]) {
+    reg.sessions[name].imTarget = imTarget;
+    reg.sessions[name].topicName = name;
+    if (reg.closedTopics && reg.closedTopics[name] === imTarget) delete reg.closedTopics[name];
+  } else {
+    // The entry was renamed/pruned while the Telegram call was in flight —
+    // tombstone the topic so a session reappearing under this name reuses it
+    // instead of leaving an orphan; close it in the group meanwhile.
+    reg.closedTopics = reg.closedTopics || {};
+    reg.closedTopics[name] = imTarget;
+    if (transport?.topics) transport.topics.close(imTarget).catch(() => {});
+  }
+  writeSessions(reg);
+}
+
+/**
+ * A send into a session's topic failed. Two distinct causes:
+ *  - TOPIC_CLOSED: the topic still exists but is closed (e.g. a send raced the
+ *    reopen after a session reappeared) → reopen it and let the caller retry.
+ *    Recreating here would leave a duplicate closed topic behind.
+ *  - thread not found / TOPIC_DELETED: the user deleted the topic → clear the
+ *    binding so the next sync recreates it.
+ * Returns true when the error was topic-related (caller stops its retry loop
+ * for the deleted case; the closed case returns false so the retry can land
+ * after the reopen).
+ */
+function handleTopicSendError(target, err) {
+  const m = err?.message || String(err);
+  if (/TOPIC_CLOSED/i.test(m)) {
+    if (transport?.topics) transport.topics.reopen(target).catch(() => {});
+    return false; // let the caller's retry re-send into the reopened topic
+  }
+  if (!/thread not found|TOPIC_DELETED/i.test(m)) return false;
+  const reg = readSessions();
+  let changed = false;
+  for (const [name, s] of Object.entries(reg.sessions)) {
+    if (s.imTarget === target) {
+      delete s.imTarget;
+      delete s.topicName;
+      if (reg.closedTopics) delete reg.closedTopics[name];
+      changed = true;
+      logger.info('Topic gone, will recreate on next sync', { name });
+    }
+  }
+  if (changed) {
+    writeSessions(reg);
+    syncSessionTopics().catch(() => {});
+  }
+  return changed;
 }
 
 // ── Multi-session: WeChat bridge commands ────────────────────────────
@@ -868,13 +1212,16 @@ function formatSessionList(reg) {
   const lines = ['📋 Sessions:'];
   names.forEach((name, i) => {
     const s = reg.sessions[name];
+    const sess = getStateFor(name, s);
+    const busy = (sess.busy || sess.lastInjectedText) ? '🔵' : '⚪';
     const marker = name === reg.active ? '▶' : '○';
     const shortPath = s.cwd.replace(home, '~');
-    lines.push(`${marker} ${i + 1}. ${name} (${sessionKind(s)})  [${s.tmux}]\n   ${shortPath}`);
+    const queued = sess.pendingQueue.length ? ` · 排队 ${sess.pendingQueue.length}` : '';
+    lines.push(`${marker} ${i + 1}. ${busy} ${name} (${sessionKind(s)})${queued}\n   ${shortPath}`);
   });
-  lines.push(`\n当前: ${reg.active || '无'}`);
-  lines.push('切换: /sw <名字> 或 /sw <序号>');
-  lines.push('改名: /rename <新名字>');
+  lines.push(`\n默认路由: ${reg.active || '无'}`);
+  if (transport?.caps.topics) lines.push('每个会话有独立话题，进入话题即可对话');
+  lines.push('切换默认: /sw <名字/序号>；改名: /rename <新名字>');
   return lines.join('\n');
 }
 
@@ -962,28 +1309,28 @@ const CC_TUI_ONLY = new Set([
  * Used for text-output commands like /cost, /compact, /fast, /help, etc.
  * Does NOT set lastInjectedText — Stop hook ignores these.
  */
-async function injectSlashAndCapture(target, command, send) {
-  // Serialize: two captures racing the SAME pane within the 2.5s window interleave
-  // their pane reads and the bottom-up echo match duplicates/garbles output. Run one
-  // at a time (normal message injection is already serialized via lastInjectedText).
-  if (slashCaptureBusy) {
+async function injectSlashAndCapture(sess, target, command, send) {
+  // Serialize per session: two captures racing the SAME pane within the 2.5s
+  // window interleave their pane reads and the bottom-up echo match
+  // duplicates/garbles output. Distinct sessions may capture concurrently.
+  if (sess.slashCaptureBusy) {
     await send('⏳ 上一个命令还在执行，请稍候重试');
     return;
   }
-  slashCaptureBusy = true;
+  sess.slashCaptureBusy = true;
   try {
-    await injectSlashAndCaptureInner(target, command, send);
+    await injectSlashAndCaptureInner(sess, target, command, send);
   } finally {
-    slashCaptureBusy = false;
+    sess.slashCaptureBusy = false;
   }
 }
 
-async function injectSlashAndCaptureInner(target, command, send) {
+async function injectSlashAndCaptureInner(sess, target, command, send) {
   const beforeContent = capturePaneContent(target);
   const beforeLineCount = beforeContent.trimEnd().split('\n').length;
 
   try {
-    sendKeys(target, command);
+    sendKeys(target, command, sess.key);
   } catch (err) {
     await send(`❌ 注入失败: ${err.message}`);
     return;
@@ -1037,28 +1384,40 @@ async function injectSlashAndCaptureInner(target, command, send) {
     await send(`已执行: ${command}`);
   }
 
-  appendHistory({ type: 'slash_command', command, output: output?.slice(0, 200) });
-}
-
-/** Inline-keyboard rows for the session list (one button per session). */
-function sessionButtons(reg) {
-  return Object.keys(reg.sessions).map((name, i) => {
-    const s = reg.sessions[name];
-    const marker = name === reg.active ? '▶ ' : '';
-    return [{ label: `${marker}${i + 1}. ${name} (${sessionKind(s)})`, data: `sw:${i}` }];
-  });
-}
-
-/** Inline-keyboard rows for the model list (one button per model). */
-function modelButtons(models, current) {
-  return models.map((m, i) => [{ label: `${m.id === current ? '✅ ' : ''}${i + 1}. ${m.display}`, data: `model:${i}` }]);
+  appendHistory({ type: 'slash_command', session: sess.name, command, output: output?.slice(0, 200) });
 }
 
 /**
- * Perform a session switch (shared by the #sw command and the sw:<idx> button
- * callback). Resets injection state so any in-flight Stop / orphan poll from the
- * OLD session is dropped rather than mis-routed to the new one (B2/H4), then
- * replays recent context.
+ * Inline-keyboard rows for the session list. Topics mode adds a deep link
+ * straight into each session's topic; the switch button moves the default
+ * route (used by the General topic / private chat).
+ */
+function sessionButtons(reg) {
+  return Object.keys(reg.sessions).map((name, i) => {
+    const s = reg.sessions[name];
+    const sess = getStateFor(name, s);
+    const busy = (sess.busy || sess.lastInjectedText) ? '🔵' : '⚪';
+    const marker = name === reg.active ? '▶ ' : '';
+    const row = [{ label: `${marker}${busy} ${i + 1}. ${name} (${sessionKind(s)})`, data: `sw:${sess.sid}` }];
+    if (transport?.caps.topics && s.imTarget && transport.topics) {
+      const url = transport.topics.link(s.imTarget);
+      if (url) row.push({ label: '↗ 进入话题', url });
+    }
+    return row;
+  });
+}
+
+/** Inline-keyboard rows for the model list (one button per model, bound to a session). */
+function modelButtons(sess, models, current) {
+  return models.map((m, i) => [{ label: `${m.id === current ? '✅ ' : ''}${i + 1}. ${m.display}`, data: `model:${sess.sid}:${i}` }]);
+}
+
+/**
+ * Move the default-route pointer to another session (shared by the #sw command
+ * and the sw:<sid> button callback). Sessions run independent turns now, so a
+ * switch touches NOTHING about any session's in-flight state — the old
+ * session's queue keeps draining and its responses still land in the
+ * conversation that sent them; hook events route by pane id, not by "active".
  */
 async function performSwitch(targetName, send) {
   const reg = readSessions();
@@ -1070,31 +1429,6 @@ async function performSwitch(targetName, send) {
 
   reg.active = targetName;
   writeSessions(reg);
-
-  // Stop the old turn's typing indicator + heartbeat before clearing state (B7).
-  if (injectedTarget || lastTarget) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
-  stopHeartbeat();
-  // ccBusy must reset: an idle just-switched session fires no Stop, so leaving the
-  // OLD session's ccBusy=true would strand the next message forever.
-  ccBusy                 = false;
-  lastInjectedText       = null;
-  lastInjectedTranscript = null;
-  lastPushedText         = null;
-  injectedTarget         = '';
-  orphanPollText         = null;
-  pendingQueue           = [];
-  // A compaction grace armed for the OLD session must not authorize accepting a
-  // Stop after we've switched away.
-  compactionGraceUntil       = 0;
-  compactionGraceTranscript  = null;
-  // Any quiz / model-menu was anchored to the OLD session's pane; a typed answer
-  // now would be keyed into the NEW pane. Drop them and tell the user.
-  const hadPending = !!(pendingQuiz || pendingSelect);
-  pendingQuiz            = null;
-  pendingSelect          = null;
-  if (hadPending) await send('↪️ 切换会话已取消上一个待回答的问题/菜单');
-  cancelPending();
-  saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null });
 
   // Update cc_pid to the agent process in the new session's pane so status.sh
   // reflects the correct active session in each terminal.
@@ -1131,12 +1465,39 @@ async function performSwitch(targetName, send) {
   logger.info(`Switched active session to: ${targetName}`);
 }
 
-async function handleBridgeCommand(text, replyTarget) {
+async function handleBridgeCommand(text, replyTarget, ctxSess) {
   const send = (msg) => transport.sendText(replyTarget, msg)
     .catch(err => logger.error('Bridge command reply failed', { error: err.message }));
 
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
+
+  // #bind — bind the topics supergroup this message came from.
+  if (cmd === '#bind') {
+    if (!transport.topics) { await send('当前通道不支持话题群绑定'); return; }
+    const r = await transport.topics.bind(replyTarget);
+    if (r.ok) {
+      await send('✅ 已绑定本群为话题群。每个 tmux 会话将自动获得一个专属话题（约 30 秒内出现）。');
+      syncSessionTopics().catch(() => {});
+    } else {
+      await send(`❌ 绑定失败：${r.reason || '未知原因'}`);
+    }
+    return;
+  }
+
+  // #esc — interrupt the context session's current turn (tmux Escape).
+  if (cmd === '#esc' || cmd === '#stop') {
+    if (!ctxSess) { await send('当前没有会话'); return; }
+    const target = tmuxTargetFor(ctxSess);
+    if (!target || !paneExists(target)) { await send('❌ tmux 不可用'); return; }
+    try {
+      sendTmuxKey(target, 'Escape');
+      await send(`⏹ 已向 ${ctxSess.name} 发送中断`);
+    } catch (err) {
+      await send(`❌ 中断失败: ${err.message}`);
+    }
+    return;
+  }
 
   // #ls / #sessions — list all sessions (with tap-to-switch buttons where supported)
   if (cmd === '#ls' || cmd === '#sessions') {
@@ -1183,8 +1544,10 @@ async function handleBridgeCommand(text, replyTarget) {
     return;
   }
 
-  // #rename <newname> — rename the active session (tmux window + registry).
-  // The name is pinned so periodic rescans (scanTmuxForCC) won't revert it.
+  // #rename <newname> — rename the context session (topic → that session;
+  // private chat / WeChat → the active session). Renames the tmux window, the
+  // registry entry and (topics mode) the forum topic; pinned so periodic
+  // rescans won't revert it.
   if (cmd === '#rename' || cmd === '#mv') {
     const newName = parts.slice(1).join(' ').trim();
     if (!newName) { await send('用法: /rename <新名字>'); return; }
@@ -1192,7 +1555,7 @@ async function handleBridgeCommand(text, replyTarget) {
     if (/[:.\n\t]/.test(newName)) { await send('名字不能包含 : . 制表符或换行'); return; }
 
     const reg = readSessions();
-    const oldName = reg.active;
+    const oldName = ctxSess?.name && reg.sessions[ctxSess.name] ? ctxSess.name : reg.active;
     if (!oldName || !reg.sessions[oldName]) { await send('当前没有活动 session'); return; }
     if (newName === oldName) { await send(`已经叫 ${newName} 了`); return; }
     if (reg.sessions[newName]) { await send(`已存在同名 session: ${newName}`); return; }
@@ -1218,10 +1581,14 @@ async function handleBridgeCommand(text, replyTarget) {
     return;
   }
 
-  // #model [selection] — text-based model switcher (bypasses TUI)
+  // #model [selection] — text-based model switcher for the context session
+  // (bypasses the TUI).
   if (cmd === '#model') {
+    if (!ctxSess) { await send('当前没有会话'); return; }
     const arg = parts.slice(1).join(' ').trim();
-    const kind = getActiveState().kind || 'claude';
+    const reg = readSessions();
+    const entry = reg.sessions[ctxSess.name];
+    const kind = entry ? sessionKind(entry) : 'claude';
     const models = getAgent(kind).models;
 
     if (!arg) {
@@ -1232,10 +1599,10 @@ async function handleBridgeCommand(text, replyTarget) {
         const settings = readJson(join(CLAUDE_CONFIG_DIR, 'settings.json'), {});
         current = settings.model || 'claude-sonnet-4-6';
       }
-      pendingSelect = { type: 'model', expires: Date.now() + 5 * 60 * 1000 };
+      ctxSess.pendingSelect = { type: 'model', expires: Date.now() + 5 * 60 * 1000 };
       // Tap-able buttons (Telegram) or a numbered text menu (WeChat).
       if (transport.caps.inlineKeyboards) {
-        await transport.sendButtons(replyTarget, '🤖 选择模型（5 分钟内有效）:', modelButtons(models, current))
+        await transport.sendButtons(replyTarget, `🤖 为 ${ctxSess.name} 选择模型（5 分钟内有效）:`, modelButtons(ctxSess, models, current))
           .catch(err => logger.error('Model menu push failed', { error: err.message }));
         return;
       }
@@ -1259,19 +1626,18 @@ async function handleBridgeCommand(text, replyTarget) {
       return;
     }
 
-    pendingSelect = null;
-    const state = getActiveState();
-    const target = tmuxTarget(state);
+    ctxSess.pendingSelect = null;
+    const target = tmuxTargetFor(ctxSess);
     if (!target || !paneExists(target)) {
       await send('❌ tmux 不可用');
       return;
     }
     // Both Claude and Codex accept `/model <id>` as a direct argument.
-    await injectSlashAndCapture(target, `/model ${resolved.id}`, send);
+    await injectSlashAndCapture(ctxSess, target, `/model ${resolved.id}`, send);
     return;
   }
 
-  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换\n  /rename <新名字> — 重命名\n  /model — 切换模型`);
+  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换默认路由\n  /rename <新名字> — 重命名\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
 }
 
 /**
@@ -1286,63 +1652,91 @@ async function handleCallback(inbound) {
   const ack = (msg) => transport.answerCallback(inbound.replyToken, msg).catch(() => {});
   const send = (m) => transport.sendText(replyTarget, m).catch(() => {});
 
-  // ── model:<idx> ──
-  if (data.startsWith('model:')) {
-    if (!pendingSelect || pendingSelect.type !== 'model' || Date.now() > pendingSelect.expires) {
-      pendingSelect = null; ack('菜单已过期'); return;
+  // All callback payloads are sid-scoped (`<verb>:<sid>:...`): the sid pins the
+  // tap to the SESSION that produced the buttons, so concurrent sessions can
+  // show menus/quizzes at the same time without cross-talk. A sid from before a
+  // daemon restart resolves to nothing → graceful "expired" ack.
+  const segs = data.split(':');
+  const verb = segs[0];
+  const sess = sidToState.get(parseInt(segs[1], 10)) ?? null;
+
+  // ── intr:<sid> — interrupt button on the live status message ──
+  if (verb === 'intr') {
+    if (!sess) { ack('该会话已不存在'); return; }
+    const tmux = tmuxTargetFor(sess);
+    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); return; }
+    try {
+      sendTmuxKey(tmux, 'Escape');
+      ack(`已向 ${sess.name} 发送中断`);
+      logger.info('Interrupt sent via status button', { session: sess.name });
+    } catch (err) {
+      ack('中断失败');
+      logger.error('Interrupt failed', { error: err.message });
     }
-    const idx = parseInt(data.slice(6), 10);
-    const kind = getActiveState().kind || 'claude';
+    return;
+  }
+
+  // ── model:<sid>:<idx> ──
+  if (verb === 'model') {
+    if (!sess || !sess.pendingSelect || sess.pendingSelect.type !== 'model' || Date.now() > sess.pendingSelect.expires) {
+      if (sess) sess.pendingSelect = null;
+      ack('菜单已过期'); return;
+    }
+    const idx = parseInt(segs[2], 10);
+    const reg = readSessions();
+    const entry = reg.sessions[sess.name];
+    const kind = entry ? sessionKind(entry) : 'claude';
     const models = getAgent(kind).models;
     if (isNaN(idx) || idx < 0 || idx >= models.length) { ack('无效选项'); return; }
     const resolved = models[idx];
-    pendingSelect = null;
+    sess.pendingSelect = null;
     ack(`切换到 ${resolved.display}`);
-    const tmux = tmuxTarget(getActiveState());
-    if (tmux && paneExists(tmux)) await injectSlashAndCapture(tmux, `/model ${resolved.id}`, send);
+    const tmux = tmuxTargetFor(sess);
+    if (tmux && paneExists(tmux)) await injectSlashAndCapture(sess, tmux, `/model ${resolved.id}`, send);
     else send('❌ tmux 不可用');
     return;
   }
 
-  // ── sw:<idx> ──
-  if (data.startsWith('sw:')) {
-    const idx = parseInt(data.slice(3), 10);
-    const names = Object.keys(readSessions().sessions);
-    if (isNaN(idx) || idx < 0 || idx >= names.length) { ack('该 session 已不存在'); return; }
-    ack(`切换到 ${names[idx]}`);
-    await performSwitch(names[idx], send);
+  // ── sw:<sid> ──
+  if (verb === 'sw') {
+    if (!sess || !readSessions().sessions[sess.name]) { ack('该 session 已不存在'); return; }
+    ack(`切换到 ${sess.name}`);
+    await performSwitch(sess.name, send);
     return;
   }
 
-  // ── quiz:<qIdx>:<optIdx|done> ──
-  if (data.startsWith('quiz:')) {
-    if (!pendingQuiz || Date.now() > pendingQuiz.expires) { pendingQuiz = null; ack('问卷已过期'); return; }
-    const segs = data.split(':');
-    const qIdx = parseInt(segs[1], 10);
-    const rest = segs[2];
-    if (qIdx !== pendingQuiz.questionIndex) { ack('该问题已过期'); return; }
-    const q = pendingQuiz.questions[pendingQuiz.questionIndex];
-    const tmux = tmuxTarget(getActiveState());
+  // ── quiz:<sid>:<qIdx>:<optIdx|done> ──
+  if (verb === 'quiz') {
+    if (!sess || !sess.pendingQuiz || Date.now() > sess.pendingQuiz.expires) {
+      if (sess) sess.pendingQuiz = null;
+      ack('问卷已过期'); return;
+    }
+    const quiz = sess.pendingQuiz;
+    const qIdx = parseInt(segs[2], 10);
+    const rest = segs[3];
+    if (qIdx !== quiz.questionIndex) { ack('该问题已过期'); return; }
+    const q = quiz.questions[quiz.questionIndex];
+    const tmux = tmuxTargetFor(sess);
 
     if (q.multiSelect) {
       if (rest === 'done') {
-        const sel = [...(pendingQuiz.selected || new Set())].sort((a, b) => a - b);
+        const sel = [...(quiz.selected || new Set())].sort((a, b) => a - b);
         if (sel.length === 0) { ack('请至少选择一项'); return; }
-        if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); pendingQuiz = null; return; }
+        if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); sess.pendingQuiz = null; return; }
         try {
           const selected = injectQuizAnswer(tmux, q, sel.map(n => n + 1).join(','));
           ack('已提交'); send(`✅ ${selected}`);
-          appendHistory({ type: 'quiz_answer', question: q.question, answer: selected });
+          appendHistory({ type: 'quiz_answer', session: sess.name, question: q.question, answer: selected });
         } catch (err) { ack('注入失败'); send(`❌ 注入失败: ${err.message}`); }
-        advanceQuiz(replyTarget);
+        advanceQuiz(sess, replyTarget);
         return;
       }
       const optIdx = parseInt(rest, 10);
       if (isNaN(optIdx) || optIdx < 0 || optIdx >= q.options.length) { ack('无效选项'); return; }
-      if (!pendingQuiz.selected) pendingQuiz.selected = new Set();
-      if (pendingQuiz.selected.has(optIdx)) pendingQuiz.selected.delete(optIdx);
-      else pendingQuiz.selected.add(optIdx);
-      const chosen = [...pendingQuiz.selected].sort((a, b) => a - b).map(i => q.options[i].label).join(', ');
+      if (!quiz.selected) quiz.selected = new Set();
+      if (quiz.selected.has(optIdx)) quiz.selected.delete(optIdx);
+      else quiz.selected.add(optIdx);
+      const chosen = [...quiz.selected].sort((a, b) => a - b).map(i => q.options[i].label).join(', ');
       ack(chosen ? `已选: ${chosen}` : '已清空');
       return;
     }
@@ -1350,53 +1744,58 @@ async function handleCallback(inbound) {
     // single-select
     const optIdx = parseInt(rest, 10);
     if (isNaN(optIdx) || optIdx < 0 || optIdx >= q.options.length) { ack('无效选项'); return; }
-    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); pendingQuiz = null; return; }
+    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); sess.pendingQuiz = null; return; }
     try {
       const selected = injectQuizAnswer(tmux, q, String(optIdx + 1));
       ack(selected); send(`✅ ${selected}`);
-      appendHistory({ type: 'quiz_answer', question: q.question, answer: selected });
+      appendHistory({ type: 'quiz_answer', session: sess.name, question: q.question, answer: selected });
     } catch (err) { ack('注入失败'); send(`❌ 注入失败: ${err.message}`); }
-    advanceQuiz(replyTarget);
+    advanceQuiz(sess, replyTarget);
     return;
   }
 
   ack(); // unknown callback — just clear the client spinner
 }
 
-// ── Injection state machine ──────────────────────────────────────────
-function cancelPending() {
-  if (injectTimer) { clearTimeout(injectTimer); injectTimer = null; }
+// ── Injection state machine (per session) ────────────────────────────
+function cancelPending(sess) {
+  if (sess.injectTimer) { clearTimeout(sess.injectTimer); sess.injectTimer = null; }
 }
 
-function scheduleInject() {
-  cancelPending();
-  // One turn at a time: never inject while a previous message is still awaiting
-  // its response (lastInjectedText set). The Stop handler clears it and re-calls
-  // scheduleInject() to drain the next queued message in order.
-  if (lastInjectedText) return;
-  if (pendingQueue.length === 0) return;
-  injectTimer = setTimeout(() => {
-    if (lastInjectedText || pendingQueue.length === 0) return;
-    const state = getActiveState();
-    const target = tmuxTarget(state);
+function scheduleInject(sess) {
+  cancelPending(sess);
+  // One turn at a time PER SESSION: never inject while this session's previous
+  // message is still awaiting its response (lastInjectedText set). The Stop
+  // handler clears it and re-calls scheduleInject(sess) to drain the queue in
+  // order. Other sessions inject in parallel — each pane is independent.
+  if (sess.lastInjectedText) return;
+  if (sess.pendingQueue.length === 0) return;
+  sess.injectTimer = setTimeout(() => {
+    sess.injectTimer = null;
+    if (sess.lastInjectedText || sess.pendingQueue.length === 0) return;
+    const reg = readSessions();
+    const entry = reg.sessions[sess.name];
+    const target = entry ? (entry.paneId || entry.tmux) : null;
     if (!target || !paneExists(target)) {
-      logger.warn('Cannot inject: tmux target unavailable', { target });
+      logger.warn('Cannot inject: tmux target unavailable', { session: sess.name, target });
       return;
     }
-    const item = pendingQueue.shift();
+    const item = sess.pendingQueue.shift();
     try {
-      sendKeys(target, item.text);
-      lastInjectedText       = item.text;
-      lastInjectedTranscript = state.transcriptPath || null;
-      injectedTarget         = item.target;
-      saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText, lastInjectedTranscript });
-      appendHistory({ type: 'user_wechat', text: item.text });
-      startHeartbeat();  // progress pings until this turn resolves (C1/H7)
-      logger.info('Injected message', { chars: item.text.length, queued: pendingQueue.length, transcript: lastInjectedTranscript?.slice(-40) });
+      sendKeys(target, item.text, sess.key);
+      sess.lastInjectedText       = item.text;
+      sess.lastInjectedTranscript = entry.transcriptPath || null;
+      sess.injectedTarget         = item.target;
+      sess.injectedMessageId      = item.messageId || '';
+      persistStates();
+      appendHistory({ type: 'user_wechat', session: sess.name, text: item.text });
+      reactTo(item.target, item.messageId, '👀');
+      startTurnStatus(sess);  // live status / progress pings until this turn resolves
+      logger.info('Injected message', { session: sess.name, chars: item.text.length, queued: sess.pendingQueue.length, transcript: sess.lastInjectedTranscript?.slice(-40) });
     } catch (err) {
       // Re-queue at the head so the message is not lost on a transient tmux error.
-      pendingQueue.unshift(item);
-      logger.error('tmux inject failed', { error: err.message });
+      sess.pendingQueue.unshift(item);
+      logger.error('tmux inject failed', { session: sess.name, error: err.message });
     }
   }, INJECT_DELAY);
 }
@@ -1414,6 +1813,8 @@ async function sendChunkWithRetry(target, text, attempts = 3) {
       return true;
     } catch (err) {
       logger.warn('sendText failed', { attempt: i, error: err.message });
+      // The user deleted this session's topic — rebind and stop retrying here.
+      if (handleTopicSendError(target, err)) return false;
       if (i < attempts) { await new Promise(r => setTimeout(r, delay)); delay *= 2; }
     }
   }
@@ -1421,12 +1822,30 @@ async function sendChunkWithRetry(target, text, attempts = 3) {
   return false;
 }
 
+// Responses beyond this many characters arrive as a Markdown FILE (one tap to
+// open, no 10-chunk wallpaper) on transports that support documents.
+const DOC_THRESHOLD = 8_000;
+
 /**
- * Forward a full assistant response to a captured reply target: split into
- * chunks (prefixed [i/n] when more than one), each sent with retry. On any
- * permanent chunk failure, send one best-effort notice.
+ * Forward a full assistant response to a captured reply target. Very long
+ * responses go as a .md document (with the head as caption); everything else
+ * is split into chunks (prefixed [i/n] when more than one), each sent with
+ * retry. On any permanent chunk failure, send one best-effort notice.
  */
-async function forwardResponse(target, fullText) {
+async function forwardResponse(target, fullText, opts = {}) {
+  if (fullText.length > DOC_THRESHOLD && transport.caps.documents && transport.sendDocument) {
+    const caption = `📄 回复较长（${fullText.length} 字符），已作为文件发送\n\n${fullText.slice(0, 200)}…`;
+    try {
+      await transport.sendDocument(target, {
+        filename: opts.filename || `response-${Date.now()}.md`,
+        content: fullText,
+        caption: caption.slice(0, 900), // TG caption hard limit is 1024
+      });
+      return;
+    } catch (err) {
+      logger.warn('sendDocument failed, falling back to chunks', { error: err.message });
+    }
+  }
   const chunks = splitMessage(fullText, transport.caps.maxMessageLen);
   let anyFailed = false;
   for (let i = 0; i < chunks.length; i++) {
@@ -1450,20 +1869,60 @@ async function forwardResponse(target, fullText) {
  * live "latest" target — so a newer incoming message can't redirect this reply
  * to the wrong conversation. Shared by every Claude/Codex forward path.
  */
-function pushResponse(responseText) {
-  const target = injectedTarget || lastTarget;
-  stopHeartbeat();
+function pushResponse(sess, responseText) {
+  const target = sess.injectedTarget || lastTarget;
+  const messageId = sess.injectedMessageId;
+  // Final status-message edit: turn summary replaces the live progress line.
+  finishTurnStatus(sess, `✅ 完成 · ${sess.turnToolCount} 个工具 · ${fmtDur(Date.now() - sess.turnStartedAt)}`);
   if (transport && target) transport.sendTyping(target, false).catch(() => {});
-  lastPushedText         = responseText;
-  lastInjectedText       = null;
-  lastInjectedTranscript = null;
-  injectedTarget         = '';
-  saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
-  appendHistory({ type: 'assistant', text: responseText.slice(0, 500) });
+  reactTo(target, messageId, '👍');
+  sess.lastPushedText         = responseText;
+  sess.lastInjectedText       = null;
+  sess.lastInjectedTranscript = null;
+  sess.injectedTarget         = '';
+  sess.injectedMessageId      = '';
+  persistStates();
+  appendHistory({ type: 'assistant', session: sess.name, text: responseText.slice(0, 500) });
   // target is always set in the normal flow (every queued message carries one),
   // but guard defensively so we never call forwardResponse with an empty target.
-  if (target) forwardResponse(target, responseText);
-  else logger.error('pushResponse: no reply target, dropping forward', { chars: responseText.length });
+  if (!target) {
+    logger.error('pushResponse: no reply target, dropping forward', { chars: responseText.length });
+    return;
+  }
+  // Private-chat / WeChat fallback: several sessions share one conversation, so
+  // tag the response with its origin. Topic-routed replies need no tag.
+  let out = responseText;
+  const reg = readSessions();
+  const entry = reg.sessions[sess.name];
+  const viaTopic = !!(entry?.imTarget && entry.imTarget === target);
+  if (!viaTopic && Object.keys(reg.sessions).length > 1) {
+    out = `【${sess.name}】\n${responseText}`;
+  }
+  forwardResponse(target, out, { filename: docFilename(sess.name) });
+}
+
+/** Safe .md filename for a session's long response. */
+function docFilename(name) {
+  const safe = (name || 'session').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'session';
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  return `${safe}-${ts}.md`;
+}
+
+/**
+ * Give up on a session's in-flight turn (orphan-poll deadline / idle cleanup):
+ * clear the turn state, mark the user's message 💔, and drain the queue.
+ */
+function abandonTurn(sess, reason) {
+  const target = sess.injectedTarget || lastTarget;
+  finishTurnStatus(sess, `⚠️ ${reason || '未捕获到回复'}`);
+  if (transport && target) transport.sendTyping(target, false).catch(() => {});
+  reactTo(target, sess.injectedMessageId, '💔');
+  sess.lastInjectedText       = null;
+  sess.lastInjectedTranscript = null;
+  sess.injectedTarget         = '';
+  sess.injectedMessageId      = '';
+  persistStates();
+  scheduleInject(sess);
 }
 
 /**
@@ -1472,26 +1931,27 @@ function pushResponse(responseText) {
  * turns: gate on the rollout's latest user_message matching what we injected,
  * since Codex also fires Stop for turns the user types at the terminal.
  */
-function onStopCodex(payload, readPath) {
-  if (!lastInjectedText) {
+function onStopCodex(sess, payload, readPath) {
+  if (!sess.lastInjectedText) {
     logger.info('Codex Stop with no injected message, ignoring');
-    scheduleInject();
+    scheduleInject(sess);
     return;
   }
   const agent = getAgent('codex');
   const entries = agent.parseRollout(readPath);
   const latestUser = agent.latestUserMessage(entries);
+  const injected = sess.lastInjectedText;
 
   // Gate against terminal-initiated turns. If the rollout's most recent user
   // message exists and isn't ours, this Stop belongs to a terminal turn — leave
   // lastInjectedText set; our own turn's Stop will arrive later.
-  if (latestUser !== null && latestUser !== lastInjectedText) {
+  if (latestUser !== null && latestUser !== injected) {
     logger.debug('Codex Stop for terminal-initiated turn, ignoring', { latestUser: latestUser.slice(0, 60) });
     return;
   }
 
   const pickText = (eList) => {
-    const r = agent.responseToInjected(eList, lastInjectedText);
+    const r = agent.responseToInjected(eList, injected);
     if (r?.text) return r.text;
     if (typeof payload.last_assistant_message === 'string' && payload.last_assistant_message.trim()) {
       return payload.last_assistant_message.trim();
@@ -1501,49 +1961,16 @@ function onStopCodex(payload, readPath) {
 
   const text = pickText(entries);
   if (text) {
-    pushResponse(text);
+    pushResponse(sess, text);
     logger.info('Pushed codex response', { chars: text.length });
-    scheduleInject();
+    scheduleInject(sess);
     return;
   }
 
   // No response text yet — rollout may not be flushed. Defer with a bounded poll
   // (Codex has no Notification event to act as a later safety net).
-  const savedInjected = lastInjectedText;
-  const ORPHAN_GRACE_MS = 60_000;
-  const POLL_MS = 5_000;
-  const deadline = Date.now() + ORPHAN_GRACE_MS;
-  const poll = () => {
-    if (lastInjectedText !== savedInjected) return; // resolved elsewhere
-    const t2 = pickText(agent.parseRollout(readPath));
-    if (t2) {
-      orphanPollText = null;
-      pushResponse(t2);
-      logger.info('Pushed codex response via deferred poll', { chars: t2.length });
-      scheduleInject();
-      return;
-    }
-    if (Date.now() >= deadline) {
-      logger.warn('Codex: no response within grace window, cleaning up');
-      orphanPollText = null;
-      if (lastInjectedText === savedInjected) {
-        if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
-        lastInjectedText       = null;
-        lastInjectedTranscript = null;
-        injectedTarget         = '';
-        saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
-        scheduleInject();
-      }
-      return;
-    }
-    setTimeout(poll, POLL_MS);
-  };
-  // B5: dedup — one poll chain per injected message.
-  if (orphanPollText !== savedInjected) {
-    orphanPollText = savedInjected;
-    setTimeout(poll, POLL_MS);
-  }
-  scheduleInject();
+  armOrphanPoll(sess, injected, () => pickText(agent.parseRollout(readPath)), 60_000, 5_000);
+  scheduleInject(sess);
 }
 
 /**
@@ -1558,42 +1985,35 @@ function transcriptHasInjectedUser(tpath, injectedText) {
 }
 
 /**
- * Arm a bounded poll that resolves (or, at the deadline, abandons) an in-flight
- * injected turn whose Stop we may never receive — e.g. the daemon was down when the
- * agent finished, or a missed end_turn. Without this, a restored-on-startup
- * lastInjectedText (see main()) would stay set forever and scheduleInject() would
- * perpetually no-op, silently swallowing every future message. Claude-only
- * (findResponseToInjected reads the Claude transcript schema). Deduped on
- * orphanPollText so only one chain runs per injected message.
+ * Arm a bounded poll that resolves (or, at the deadline, abandons) a session's
+ * in-flight injected turn whose Stop we may never receive — e.g. the daemon was
+ * down when the agent finished, or a missed end_turn. Without this, a
+ * restored-on-startup lastInjectedText (see main()) would stay set forever and
+ * scheduleInject() would perpetually no-op, silently swallowing every future
+ * message for that session. The ONE orphan-poll implementation for both agents:
+ * `probe` returns the response text (or null) — the Claude default reads the
+ * transcript via findResponseToInjected; Codex passes a rollout probe. Deduped
+ * per session on orphanPollText so only one chain runs per injected message.
  */
-function armOrphanPoll(savedInjectedText, savedReadPath, graceMs = 5 * 60 * 1000, pollMs = 5_000) {
+function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, pollMs = 5_000) {
   if (!savedInjectedText) return;
-  if (orphanPollText === savedInjectedText) return; // already polling this turn
-  orphanPollText = savedInjectedText;
+  if (sess.orphanPollText === savedInjectedText) return; // already polling this turn
+  sess.orphanPollText = savedInjectedText;
   const deadline = Date.now() + graceMs;
   const poll = () => {
-    if (lastInjectedText !== savedInjectedText) return; // resolved elsewhere
-    if (savedReadPath) {
-      const r = findResponseToInjected(parseTranscript(savedReadPath, TRANSCRIPT_TAIL_BYTES), savedInjectedText);
-      if (r?.text && r.complete) {
-        orphanPollText = null;
-        pushResponse(r.text);
-        logger.info('Pushed response via orphan poll', { chars: r.text.length });
-        scheduleInject();
-        return;
-      }
+    if (sess.lastInjectedText !== savedInjectedText) { sess.orphanPollText = null; return; } // resolved elsewhere
+    const text = probe();
+    if (text) {
+      sess.orphanPollText = null;
+      pushResponse(sess, text);
+      logger.info('Pushed response via orphan poll', { session: sess.name, chars: text.length });
+      scheduleInject(sess);
+      return;
     }
     if (Date.now() >= deadline) {
-      logger.warn('Orphan poll grace expired, cleaning up', { lastInjected: savedInjectedText.slice(0, 60) });
-      orphanPollText = null;
-      if (lastInjectedText === savedInjectedText) {
-        if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
-        lastInjectedText       = null;
-        lastInjectedTranscript = null;
-        injectedTarget         = '';
-        saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
-        scheduleInject();
-      }
+      logger.warn('Orphan poll grace expired, cleaning up', { session: sess.name, lastInjected: savedInjectedText.slice(0, 60) });
+      sess.orphanPollText = null;
+      if (sess.lastInjectedText === savedInjectedText) abandonTurn(sess, '未在时限内捕获到回复，请回终端查看');
       return;
     }
     setTimeout(poll, pollMs);
@@ -1601,78 +2021,106 @@ function armOrphanPoll(savedInjectedText, savedReadPath, graceMs = 5 * 60 * 1000
   setTimeout(poll, pollMs);
 }
 
-async function onStop(payload) {
-  const state = getActiveState();
-  const kind = state.kind || 'claude';
-  const tpath = payload.transcript_path || state.transcriptPath;
-  if (!tpath) { ccBusy = false; scheduleInject(); return; }
+/** Standard Claude transcript probe for armOrphanPoll. */
+function claudeProbe(readPath, injectedText) {
+  return () => {
+    if (!readPath) return null;
+    const r = findResponseToInjected(parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES), injectedText);
+    return (r?.text && r.complete) ? r.text : null;
+  };
+}
 
-  // Accept Stop from: (1) the session we injected into, OR (2) the current active session.
-  // Check both because the session scanner may temporarily reassign transcriptPath between
-  // injection and Stop (flip-flop bug), causing lastInjectedTranscript to be stale.
-  const matchesInjected = lastInjectedTranscript && tpath === lastInjectedTranscript;
-  const matchesActive   = state.transcriptPath && tpath === state.transcriptPath;
-  const hasExpected     = !!(lastInjectedTranscript || state.transcriptPath);
-  if (hasExpected && !matchesInjected && !matchesActive) {
-    // The compaction-grace and same-project acceptance branches are Claude-only:
-    // Codex rollouts live in date-based dirs, so "same dir" is NOT project identity
-    // and would wrongly accept an unrelated session's Stop.
-    if (kind === 'claude' && lastInjectedText && Date.now() < compactionGraceUntil
-        && isSameProjectDir(tpath, compactionGraceTranscript || state.transcriptPath)) {
-      // Post-compaction transcript, AND it lives in the same project the grace was
-      // armed for. Without the same-project check, a foreign Claude session's Stop
-      // during the 2-min window would be accepted and its reply forwarded to our
-      // chat (wrong-session / data-leak).
-      logger.info('Accepting post-compaction transcript (same project)', { tpath: tpath.slice(-40) });
-      lastInjectedTranscript = tpath;  // update to new transcript
-    } else if (kind === 'claude' && lastInjectedText
-               && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)
-               && transcriptHasInjectedUser(tpath, lastInjectedText)) {
-      // Same project dir, different file, AND this transcript actually contains our
-      // injected message → the scanner picked the wrong .jsonl at injection time and
-      // the hook's tpath is authoritative. Accept it. (If it does NOT contain our
-      // message it belongs to a different session sharing the cwd — fall through to
-      // ignore, preventing the H4 mis-route after #sw.)
-      logger.info('Stop from same project, accepting transcript switch', { tpath: tpath.slice(-40), was: (lastInjectedTranscript || state.transcriptPath)?.slice(-40) });
-      lastInjectedTranscript = tpath;
-    } else {
-      logger.debug('Stop from foreign session, ignoring', { tpath: tpath.slice(-60), injected: lastInjectedTranscript?.slice(-40), active: state.transcriptPath?.slice(-40) });
-      // Do NOT clear ccBusy here: a foreign Stop must not unblock a terminal-initiated
-      // turn genuinely in flight (where lastInjectedText is null and ccBusy is the only
-      // interlock) — clearing it would let a queued IM message inject mid terminal-turn.
-      // Only drain the queue if nothing is actually busy.
-      if (!ccBusy) scheduleInject();
-      return;
+async function onStop(payload) {
+  const reg = readSessions();
+  const route = resolveSessionForHook(reg, statesView(), payload);
+  if (!route) {
+    logger.debug('Stop: no session resolved, ignoring', { tpath: (payload.transcript_path || '').slice(-60) });
+    return;
+  }
+  const entry = reg.sessions[route.name];
+  const sess = getStateFor(route.name, entry);
+  backfillPaneId(reg, route.name, payload);
+  const kind = sessionKind(entry);
+  const tpath = payload.transcript_path || entry.transcriptPath;
+  if (!tpath) { sess.busy = false; scheduleInject(sess); return; }
+
+  if (route.via === 'pane') {
+    // Authoritative routing: the agent in this very pane reported its own
+    // transcript, so tpath IS this session's transcript — trust it over the
+    // scanner's guess. This subsumes the old flip-flop / compaction-transcript
+    // heuristics whenever the new hook.py is installed.
+    if (sess.lastInjectedText && sess.lastInjectedTranscript !== tpath) {
+      logger.info('Pane-routed Stop, adopting reported transcript', { session: sess.name, tpath: tpath.slice(-40) });
+      sess.lastInjectedTranscript = tpath;
+    }
+    if (entry.transcriptPath !== tpath) {
+      entry.transcriptPath = tpath;
+      writeSessions(reg);
+    }
+  } else {
+    // Fallback routing (old hook.py without _tmuxPane): keep the conservative
+    // acceptance gating so a same-cwd sibling's Stop can't hijack this session.
+    const matchesInjected = sess.lastInjectedTranscript && tpath === sess.lastInjectedTranscript;
+    const matchesEntry    = entry.transcriptPath && tpath === entry.transcriptPath;
+    const hasExpected     = !!(sess.lastInjectedTranscript || entry.transcriptPath);
+    if (hasExpected && !matchesInjected && !matchesEntry) {
+      // The compaction-grace and same-project acceptance branches are Claude-only:
+      // Codex rollouts live in date-based dirs, so "same dir" is NOT project identity
+      // and would wrongly accept an unrelated session's Stop.
+      if (kind === 'claude' && sess.lastInjectedText && Date.now() < sess.compactionGraceUntil
+          && isSameProjectDir(tpath, sess.compactionGraceTranscript || entry.transcriptPath)) {
+        // Post-compaction transcript, AND it lives in the same project the grace was
+        // armed for. Without the same-project check, a foreign Claude session's Stop
+        // during the 2-min window would be accepted and its reply forwarded to our
+        // chat (wrong-session / data-leak).
+        logger.info('Accepting post-compaction transcript (same project)', { tpath: tpath.slice(-40) });
+        sess.lastInjectedTranscript = tpath;  // update to new transcript
+      } else if (kind === 'claude' && sess.lastInjectedText
+                 && isSameProjectDir(tpath, sess.lastInjectedTranscript || entry.transcriptPath)
+                 && transcriptHasInjectedUser(tpath, sess.lastInjectedText)) {
+        // Same project dir, different file, AND this transcript actually contains our
+        // injected message → the scanner picked the wrong .jsonl at injection time and
+        // the hook's tpath is authoritative. Accept it. (If it does NOT contain our
+        // message it belongs to a different session sharing the cwd — fall through to
+        // ignore.)
+        logger.info('Stop from same project, accepting transcript switch', { tpath: tpath.slice(-40), was: (sess.lastInjectedTranscript || entry.transcriptPath)?.slice(-40) });
+        sess.lastInjectedTranscript = tpath;
+      } else {
+        logger.debug('Stop transcript mismatch, ignoring', { session: sess.name, tpath: tpath.slice(-60), injected: sess.lastInjectedTranscript?.slice(-40), entry: entry.transcriptPath?.slice(-40) });
+        // Do NOT clear busy here: a mismatched Stop must not unblock a
+        // terminal-initiated turn genuinely in flight (where lastInjectedText is
+        // null and busy is the only interlock). Only drain if nothing is busy.
+        if (!sess.busy) scheduleInject(sess);
+        return;
+      }
+    }
+    // If tpath matched the entry but not the injected one, update injected
+    // so that subsequent reads use the correct transcript.
+    if (!matchesInjected && matchesEntry && sess.lastInjectedTranscript) {
+      logger.info('Updating lastInjectedTranscript to match session entry', { from: sess.lastInjectedTranscript.slice(-40), to: tpath.slice(-40) });
+      sess.lastInjectedTranscript = tpath;
     }
   }
-  // If tpath matched the active session but not the injected one, update injected
-  // so that subsequent handlers (readPath) use the correct transcript.
-  if (!matchesInjected && matchesActive && lastInjectedTranscript) {
-    logger.info('Updating lastInjectedTranscript to match active session', { from: lastInjectedTranscript.slice(-40), to: tpath.slice(-40) });
-    lastInjectedTranscript = tpath;
-  }
 
-  // This Stop is for our session (matched, or accepted via grace / same-project) — the
-  // turn has ended, so clear the busy flag. Moved here from the top of onStop so a
-  // foreign Stop (handled+returned above) can never clear busy for a live terminal turn.
-  ccBusy = false;
+  // This Stop is for this session — the turn has ended, so clear the busy flag.
+  sess.busy = false;
 
-  logger.info('Stop hook received', { kind, transcript_path: tpath.slice(-60) });
+  logger.info('Stop hook received', { session: sess.name, kind, via: route.via, transcript_path: tpath.slice(-60) });
 
-  const readPath = lastInjectedTranscript || tpath;
+  const readPath = sess.lastInjectedTranscript || tpath;
 
   // Codex has a distinct rollout schema and supplies last_assistant_message on
   // the Stop payload — handle it separately and return.
-  if (kind === 'codex') { onStopCodex(payload, readPath); return; }
+  if (kind === 'codex') { onStopCodex(sess, payload, readPath); return; }
 
   // Read only the tail on the hot path; if our injected message isn't in the tail
   // (a single turn larger than the cap), fall back to one full read so we don't
   // miss the response on an extremely large turn.
   let entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
-  let result = findResponseToInjected(entries, lastInjectedText);
-  if (!result && lastInjectedText && transcriptExceedsTail(readPath)) {
-    entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
-    result = findResponseToInjected(entries, lastInjectedText);
+  let result = findResponseToInjected(entries, sess.lastInjectedText);
+  if (!result && sess.lastInjectedText && transcriptExceedsTail(readPath)) {
+    entries = parseTranscript(readPath);
+    result = findResponseToInjected(entries, sess.lastInjectedText);
   }
 
   // Post-compaction fallback: injected text was summarized away in the new
@@ -1681,11 +2129,11 @@ async function onStop(payload) {
   // Also require the transcript to be in the project the grace was armed for —
   // findLastCompleteResponse ignores injectedText, so without this an unrelated
   // transcript's last answer could be forwarded.
-  if (!result && lastInjectedText && Date.now() < compactionGraceUntil
-      && (!compactionGraceTranscript || isSameProjectDir(readPath, compactionGraceTranscript))) {
+  if (!result && sess.lastInjectedText && Date.now() < sess.compactionGraceUntil
+      && (!sess.compactionGraceTranscript || isSameProjectDir(readPath, sess.compactionGraceTranscript))) {
     result = findLastCompleteResponse(entries);
     if (result) {
-      if (lastPushedText && result.text === lastPushedText) {
+      if (sess.lastPushedText && result.text === sess.lastPushedText) {
         logger.info('Post-compaction fallback returned same as lastPushedText, skipping');
         result = null;
       } else {
@@ -1698,16 +2146,17 @@ async function onStop(payload) {
   const responseComplete = result?.complete ?? false;
 
   logger.info('Stop', {
+    session: sess.name,
     responseLen: responseText?.length ?? 0,
     complete: responseComplete,
-    lastInjected: lastInjectedText?.slice(0, 60),
+    lastInjected: sess.lastInjectedText?.slice(0, 60),
   });
 
-  // ── Path A: Complete response → forward to WeChat
-  if (responseText && responseComplete && lastInjectedText) {
-    pushResponse(responseText);
+  // ── Path A: Complete response → forward to the IM
+  if (responseText && responseComplete && sess.lastInjectedText) {
+    pushResponse(sess, responseText);
     logger.info('Pushed response', { chars: responseText.length });
-    scheduleInject();
+    scheduleInject(sess);
     return;
   }
 
@@ -1716,43 +2165,43 @@ async function onStop(payload) {
   //    Also schedule a delayed retry: the transcript JSONL may not have been fully
   //    flushed with end_turn yet, or the end_turn Stop may never arrive if the
   //    terminal user interacts before CC becomes idle.
-  if (responseText && !responseComplete && lastInjectedText) {
+  if (responseText && !responseComplete && sess.lastInjectedText) {
     logger.info('Incomplete response (no end_turn), deferring', {
       partialLen: responseText.length, snippet: responseText.slice(0, 80),
     });
-    const target = tmuxTarget(getActiveState());
-    if (target) tryAutoConfirmCompaction(target);
+    const target = tmuxTargetFor(sess);
+    if (target) tryAutoConfirmCompaction(sess, target);
 
     // Delayed retry: re-read transcript after 3s to check for late end_turn flush
-    const savedInjectedText = lastInjectedText;
+    const savedInjectedText = sess.lastInjectedText;
     const savedReadPath = readPath;
     setTimeout(() => {
-      if (lastInjectedText !== savedInjectedText) return; // already resolved
+      if (sess.lastInjectedText !== savedInjectedText) return; // already resolved
       const retryEntries = parseTranscript(savedReadPath, TRANSCRIPT_TAIL_BYTES);
       const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
       if (retryResult?.text && retryResult.complete) {
-        pushResponse(retryResult.text);
+        pushResponse(sess, retryResult.text);
         logger.info('Pushed response via deferred retry', { chars: retryResult.text.length });
-        scheduleInject();
+        scheduleInject(sess);
       }
     }, 3000);
 
-    scheduleInject();
+    scheduleInject(sess);
     return;
   }
 
   // ── Path C: No response found
-  if (!responseText && lastInjectedText) {
+  if (!responseText && sess.lastInjectedText) {
     // Race condition: the Stop hook may arrive before the transcript is fully
     // flushed.  Retry after a short delay to catch late writes.
-    if (!result && lastInjectedText) {
+    if (!result) {
       await new Promise(r => setTimeout(r, 500));
       const retryEntries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
-      result = findResponseToInjected(retryEntries, lastInjectedText);
+      result = findResponseToInjected(retryEntries, sess.lastInjectedText);
       if (result?.text && result.complete) {
-        pushResponse(result.text);
+        pushResponse(sess, result.text);
         logger.info('Pushed response via retry', { chars: result.text.length });
-        scheduleInject();
+        scheduleInject(sess);
         return;
       }
     }
@@ -1773,91 +2222,56 @@ async function onStop(payload) {
     if (lastAssistantStop === 'tool_use') {
       logger.info('No text yet but CC still in tool_use loop, keeping lastInjectedText');
     } else {
-      const target = tmuxTarget(getActiveState());
-      if (target && tryAutoConfirmCompaction(target)) {
+      const target = tmuxTargetFor(sess);
+      if (target && tryAutoConfirmCompaction(sess, target)) {
         logger.info('Auto-confirmed compaction, keeping lastInjectedText');
       } else {
         // Don't clean up immediately. Stop can fire prematurely (e.g. CC is
         // still generating, an interrupt fired, or transcript flush lagged).
         // Give the real response a long window to arrive — only abandon the
         // injected message if nothing matches after the deadline.
-        const savedInjectedText = lastInjectedText;
-        const savedReadPath = readPath;
-        const ORPHAN_GRACE_MS = 5 * 60 * 1000;  // 5 min — well beyond any normal CC turn
-        const POLL_INTERVAL_MS = 5_000;
-        const deadline = Date.now() + ORPHAN_GRACE_MS;
         logger.info('Stop arrived with no response yet, deferring cleanup', {
-          graceMs: ORPHAN_GRACE_MS, lastInjected: savedInjectedText.slice(0, 60),
+          session: sess.name, lastInjected: sess.lastInjectedText.slice(0, 60),
         });
-
-        const poll = () => {
-          // Already resolved by another path → bail out
-          if (lastInjectedText !== savedInjectedText) return;
-          const retryEntries = parseTranscript(savedReadPath, TRANSCRIPT_TAIL_BYTES);
-          const retryResult = findResponseToInjected(retryEntries, savedInjectedText);
-          if (retryResult?.text && retryResult.complete) {
-            orphanPollText = null;
-            pushResponse(retryResult.text);
-            logger.info('Pushed response via deferred orphan poll', {
-              chars: retryResult.text.length,
-            });
-            scheduleInject();
-            return;
-          }
-          if (Date.now() >= deadline) {
-            logger.warn('No response found within grace window, cleaning up', {
-              lastInjected: savedInjectedText.slice(0, 60), graceMs: ORPHAN_GRACE_MS,
-            });
-            orphanPollText = null;
-            if (lastInjectedText === savedInjectedText) {
-              if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
-              lastInjectedText       = null;
-              lastInjectedTranscript = null;
-              injectedTarget         = '';
-              saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
-              scheduleInject();
-            }
-            return;
-          }
-          setTimeout(poll, POLL_INTERVAL_MS);
-        };
-        // B5: dedup — only one orphan poll chain per injected message, so repeated
-        // Stops for the same unresolved turn don't accumulate timer closures.
-        if (orphanPollText !== savedInjectedText) {
-          orphanPollText = savedInjectedText;
-          setTimeout(poll, POLL_INTERVAL_MS);
-        }
+        armOrphanPoll(sess, sess.lastInjectedText, claudeProbe(readPath, sess.lastInjectedText));
       }
     }
   }
 
-  scheduleInject();
+  scheduleInject(sess);
+}
+
+/**
+ * A hook payload carrying _tmuxPane can stamp paneId onto a just-attached
+ * registry entry before the next scan pass gets to it (routing then upgrades
+ * from transcript-fallback to authoritative pane matching immediately).
+ */
+function backfillPaneId(reg, name, payload) {
+  const pane = (payload._tmuxPane || '').trim();
+  const entry = reg.sessions[name];
+  if (!pane || !entry || entry.paneId) return;
+  entry.paneId = pane;
+  writeSessions(reg);
+  logger.info('Backfilled paneId from hook payload', { session: name, paneId: pane });
 }
 
 function onPreToolUse(payload) {
-  // Only mark CC busy if this is from our tracked session (or no session filter).
-  // Foreign CC sessions fire PreToolUse too; if we set ccBusy=true for them but
-  // their Stop is filtered out, ccBusy gets stuck forever.
-  const tpath = payload.transcript_path;
-  const state = getActiveState();
-  const kind = state.kind || 'claude';
-  const matchesInjected = lastInjectedTranscript && tpath === lastInjectedTranscript;
-  const matchesActive   = state.transcriptPath && tpath === state.transcriptPath;
-  const hasExpected     = !!(lastInjectedTranscript || state.transcriptPath);
-  if (tpath && hasExpected && !matchesInjected && !matchesActive) {
-    // Same-project acceptance is Claude-only (Codex date-dirs aren't projects).
-    if (kind === 'claude' && isSameProjectDir(tpath, lastInjectedTranscript || state.transcriptPath)) {
-      // Same project, different transcript — accept (scanner misassignment)
-    } else {
-      // Truly foreign session — don't touch ccBusy
-      return undefined;
-    }
-  }
+  // Route to the owning session; a PreToolUse from an untracked agent (e.g. a
+  // Claude outside any registered pane) resolves to nothing → return no
+  // decision, so it falls back to the agent's own permission flow. Marking a
+  // foreign session busy would strand that state forever (its Stop never routes).
+  const reg = readSessions();
+  const route = resolveSessionForHook(reg, statesView(), payload);
+  if (!route) return undefined;
+  const entry = reg.sessions[route.name];
+  const sess = getStateFor(route.name, entry);
+  backfillPaneId(reg, route.name, payload);
+  const kind = sessionKind(entry);
 
-  ccBusy = true;
-  cancelPending();
+  sess.busy = true;
+  cancelPending(sess);
 
-  if (!state.autoApprove) return undefined;
+  if (!AUTO_APPROVE) return undefined;
 
   const toolName  = payload.tool_name || '?';
   const toolInput = payload.tool_input || {};
@@ -1865,31 +2279,35 @@ function onPreToolUse(payload) {
   if (toolName === 'Bash' && toolInput.command) desc = `bash: \`${toolInput.command.slice(0, 120)}\``;
   else if (toolInput.file_path) desc = `${toolName}(${toolInput.file_path})`;
 
-  // Track tool activity for the progress heartbeat (only our in-flight turn).
-  if (lastInjectedText) { turnToolCount++; turnLastTool = toolName; }
+  // Track tool activity for the live status message (only our in-flight turn).
+  if (sess.lastInjectedText) {
+    sess.turnToolCount++;
+    sess.turnLastTool = toolName;
+    bumpTurnStatus(sess);
+  }
 
   // ── Quiz support: forward AskUserQuestion to the IM ──
   // Only intercept quizzes triggered by an IM-injected message (lastInjectedText is set).
   // Terminal-initiated quizzes are left to the terminal user.
   // AskUserQuestion is a Claude Code TUI; Codex uses a different approval UX, so
   // quiz interception is Claude-only.
-  if (kind === 'claude' && toolName === 'AskUserQuestion' && lastInjectedText) {
+  if (kind === 'claude' && toolName === 'AskUserQuestion' && sess.lastInjectedText) {
     const questions = toolInput.questions || [];
     if (questions.length > 0) {
-      const quizTarget = injectedTarget || lastTarget;
-      pendingQuiz = {
+      const quizTarget = sess.injectedTarget || lastTarget;
+      sess.pendingQuiz = {
         questions,
         questionIndex: 0,
         expires: Date.now() + 5 * 60 * 1000, // 5 min timeout
         target: quizTarget,
         selected: new Set(),
       };
-      sendQuiz(questions[0], quizTarget, 0);
-      logger.info('Quiz forwarded', { numQuestions: questions.length, q: questions[0].question.slice(0, 80) });
+      sendQuiz(sess, questions[0], quizTarget, 0);
+      logger.info('Quiz forwarded', { session: sess.name, numQuestions: questions.length, q: questions[0].question.slice(0, 80) });
     }
   }
 
-  appendHistory({ type: 'auto_approve', tool: toolName, desc });
+  appendHistory({ type: 'auto_approve', session: sess.name, tool: toolName, desc });
 
   // Emit both the modern (hookSpecificOutput.permissionDecision) and the
   // legacy (decision: 'approve') shapes. Some Claude Code releases honor only
@@ -1915,44 +2333,47 @@ function onPreToolUse(payload) {
  * belongs to our tracked session.
  */
 function onUserPromptSubmit(payload) {
-  const tpath = payload.transcript_path;
-  const state = getActiveState();
-  const matchesInjected = lastInjectedTranscript && tpath === lastInjectedTranscript;
-  const matchesActive   = state.transcriptPath && tpath === state.transcriptPath;
-  const hasExpected     = !!(lastInjectedTranscript || state.transcriptPath);
-  if (tpath && hasExpected && !matchesInjected && !matchesActive) return; // foreign session
-  ccBusy = true;
-  cancelPending();
+  const reg = readSessions();
+  const route = resolveSessionForHook(reg, statesView(), payload);
+  if (!route) return; // untracked session
+  const sess = getStateFor(route.name, reg.sessions[route.name]);
+  backfillPaneId(reg, route.name, payload);
+  sess.busy = true;
+  cancelPending(sess);
 }
 
 async function onNotification(payload) {
   const msg = payload.message || '';
+  const reg = readSessions();
+  const route = resolveSessionForHook(reg, statesView(), payload);
 
   if (msg.includes('waiting for your input')) {
-    // CC is idle. Two cases:
+    if (!route) { logger.debug('Notification from untracked session, ignoring'); return; }
+    const entry = reg.sessions[route.name];
+    const sess = getStateFor(route.name, entry);
+    backfillPaneId(reg, route.name, payload);
+    // The session is idle. Three cases:
     // 1. Quiz pending → already forwarded to the IM, just wait for user reply
     // 2. Compaction prompt → auto-confirm so CC can continue
     // 3. lastInjectedText still set → CC stopped without triggering Stop
     //    (shouldn't happen, but clean up to avoid stuck state)
-    if (pendingQuiz) {
-      logger.info('Notification: CC waiting for quiz input');
+    if (sess.pendingQuiz) {
+      logger.info('Notification: CC waiting for quiz input', { session: sess.name });
       return;
     }
-    const state = getActiveState();
-    const target = tmuxTarget(state);
-    if (target && tryAutoConfirmCompaction(target)) {
-      logger.info('Auto-confirmed compaction via Notification');
+    const target = tmuxTargetFor(sess);
+    if (target && tryAutoConfirmCompaction(sess, target)) {
+      logger.info('Auto-confirmed compaction via Notification', { session: sess.name });
       return;
     }
-    if (lastInjectedText) {
-      // Notification fires per-session and only for Claude. If it comes from a
-      // DIFFERENT session than the one we injected into (e.g. an idle claude
-      // session while a codex turn is still running), it says nothing about our
-      // in-flight turn — reaping here would orphan the eventual Stop. Skip.
+    if (sess.lastInjectedText) {
+      // Fallback-routed Notification from a DIFFERENT transcript than the one we
+      // injected into says nothing about our in-flight turn — reaping here would
+      // orphan the eventual Stop. Skip. (Pane-routed events are authoritative.)
       const ntpath = payload.transcript_path || '';
-      if (lastInjectedTranscript && ntpath && ntpath !== lastInjectedTranscript) {
-        logger.info('Notification from other session while turn in flight, ignoring', {
-          notif: ntpath.slice(-40), injected: lastInjectedTranscript.slice(-40),
+      if (route.via !== 'pane' && sess.lastInjectedTranscript && ntpath && ntpath !== sess.lastInjectedTranscript) {
+        logger.info('Notification transcript mismatch while turn in flight, ignoring', {
+          notif: ntpath.slice(-40), injected: sess.lastInjectedTranscript.slice(-40),
         });
         return;
       }
@@ -1961,52 +2382,47 @@ async function onNotification(payload) {
       // Try reading the transcript one more time to find the response.
       // Also try other transcripts in the same project dir in case the scanner
       // assigned the wrong one at injection time.
-      const readPath = lastInjectedTranscript || state.transcriptPath;
+      const readPath = sess.lastInjectedTranscript || entry.transcriptPath;
       let result = null;
       if (readPath) {
         const entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
-        result = findResponseToInjected(entries, lastInjectedText);
+        result = findResponseToInjected(entries, sess.lastInjectedText);
         // If not found, the scanner may have assigned the wrong .jsonl at injection.
-        // Resolve the transcript the active pane's agent ACTUALLY holds open (fd/lsof
+        // Resolve the transcript the pane's agent ACTUALLY holds open (fd/lsof
         // scan) rather than guessing "newest by mtime" — the latter could pick a
         // DIFFERENT same-cwd session's transcript and forward its reply to our chat
         // (wrong-session). Confirm it contains our injected message before accepting.
         if (!result) {
           try {
-            const panePid = panePidFor(target);
+            const panePid = panePidFor(entry.tmux);
             const fdPath = panePid ? findTranscriptByPid(panePid) : null;
-            if (fdPath && fdPath !== readPath && transcriptHasInjectedUser(fdPath, lastInjectedText)) {
-              result = findResponseToInjected(parseTranscript(fdPath, TRANSCRIPT_TAIL_BYTES), lastInjectedText);
+            if (fdPath && fdPath !== readPath && transcriptHasInjectedUser(fdPath, sess.lastInjectedText)) {
+              result = findResponseToInjected(parseTranscript(fdPath, TRANSCRIPT_TAIL_BYTES), sess.lastInjectedText);
               if (result?.text) {
                 logger.info('Found response in fd-open transcript during idle cleanup', { fdPath: fdPath.slice(-40) });
-                lastInjectedTranscript = fdPath;
+                sess.lastInjectedTranscript = fdPath;
               }
             }
           } catch {}
         }
       }
       if (result?.text) {
-          pushResponse(result.text);
+          pushResponse(sess, result.text);
           logger.info('Pushed response via idle cleanup', { chars: result.text.length, complete: result.complete });
-          scheduleInject();
+          scheduleInject(sess);
           return;
       }
       logger.warn('CC idle but lastInjectedText still set, cleaning up', {
-        lastInjected: lastInjectedText.slice(0, 60),
+        session: sess.name, lastInjected: sess.lastInjectedText.slice(0, 60),
       });
-      orphanPollText = null;
-      if (transport && (injectedTarget || lastTarget)) transport.sendTyping(injectedTarget || lastTarget, false).catch(() => {});
-      lastInjectedText       = null;
-      lastInjectedTranscript = null;
-      injectedTarget         = '';
-      saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
-      scheduleInject();
+      sess.orphanPollText = null;
+      abandonTurn(sess, '会话已空闲但未捕获到回复，请回终端查看');
     } else {
       logger.info('Notification (logged, not pushed): ' + msg);
     }
     return;
   }
-  appendHistory({ type: 'notification', text: msg });
+  appendHistory({ type: 'notification', session: route?.name, text: msg });
   logger.info('Notification: ' + msg);
 }
 
@@ -2159,17 +2575,23 @@ function agentLabel(kind) {
 }
 
 function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
-  const label = kind ? agentLabel(kind) : '微信远程';
+  const label = kind ? agentLabel(kind) : '远程控制';
   const header = reconnect
-    ? `👋 ${label} 已重连！\n\n当前 session: ${activeName || '(unknown)'}\n\n`
+    ? `👋 ${label} 已重连！\n\n默认 session: ${activeName || '(unknown)'}\n\n`
     : `👋 ${label} 已连接！\n\n`;
-  return header +
+  const topicsHint = transport?.caps.topics
+    ? '🧵 话题模式已开启：每个 tmux 会话有自己的话题，进话题即可并行对话。\n\n'
+    : (transport?.topics
+      ? '💡 提示：建一个开启「话题」的超级群，把 bot 加为管理员后发 /bind，每个会话就有独立频道，可同时开工。\n\n'
+      : '');
+  return header + topicsHint +
     '可用指令：\n' +
-    '  /ls — 列出所有 session（Claude Code / Codex）\n' +
-    '  /sw <名字/序号> — 切换 session\n' +
-    '  /rename <新名字> — 重命名当前 session\n' +
-    '  /model — 切换模型（文字菜单，无需终端交互）\n\n' +
-    '直接发消息即注入当前 session，回复将自动转发。';
+    '  /ls — 列出所有 session（Claude Code / Codex，含忙碌状态）\n' +
+    '  /sw <名字/序号> — 切换默认路由\n' +
+    '  /rename <新名字> — 重命名会话\n' +
+    '  /model — 切换模型（文字菜单，无需终端交互）\n' +
+    '  /esc — 中断当前回合\n\n' +
+    '直接发消息即注入对应 session，回复将自动转发；各会话互不阻塞。';
 }
 
 // ── Inbound message handler (transport-agnostic) ─────────────────────
@@ -2178,6 +2600,13 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
 function onInboundMessage(inbound) {
   lastTarget  = inbound.target;
   lastUserKey = inbound.userKey;
+  // Persist the reply destination so a restarted daemon can send its reconnect
+  // welcome / recovered responses somewhere sensible (per-turn state lives in
+  // sessions_state.json; this file only carries the last-known conversation).
+  if (inbound.target !== persistedTarget) {
+    persistedTarget = inbound.target;
+    try { saveSession({ target: lastTarget, userKey: lastUserKey }); } catch {}
+  }
   const replyTarget = inbound.target;
 
   // Button taps (Telegram) → callback dispatcher.
@@ -2200,44 +2629,56 @@ function onInboundMessage(inbound) {
 
   logger.info('Inbound message', { from: inbound.userKey, text: text.slice(0, 80) });
 
+  // Resolve the context session: a topic target routes to its bound session;
+  // private chat / General topic / WeChat route to the active session. When
+  // the registry is empty, fall back to a session synthesized from legacy
+  // state.json (parity with the old getActiveState() fallback — covers panes
+  // the scanner cannot classify and hand-wiped registries).
+  const reg = readSessions();
+  let routed = resolveSessionForInbound(reg, replyTarget);
+  if (!routed && Object.keys(reg.sessions).length === 0) routed = synthesizeLegacySession(reg);
+  const sess = routed ? getStateFor(routed.name, reg.sessions[routed.name]) : null;
+
   // Welcome first-time users (once per bridge process run).
   if (!welcomedUsers.has(inbound.userKey)) {
     welcomedUsers.add(inbound.userKey);
-    transport.sendText(replyTarget, buildWelcome({ reconnect: false, kind: getActiveState().kind }))
+    const kind = routed ? sessionKind(reg.sessions[routed.name]) : '';
+    transport.sendText(replyTarget, buildWelcome({ reconnect: false, kind }))
       .catch(err => logger.error('Welcome message failed', { error: err.message }));
   }
 
   // Consume a pending /model text selection (button taps go through handleCallback).
-  if (pendingSelect) {
-    if (Date.now() > pendingSelect.expires) {
+  if (sess?.pendingSelect) {
+    if (Date.now() > sess.pendingSelect.expires) {
       logger.info('pendingSelect expired, clearing');
-      pendingSelect = null;
+      sess.pendingSelect = null;
       transport.sendText(replyTarget, '⏰ 模型菜单已超时取消，本条按普通消息处理').catch(() => {});
-    } else if (pendingSelect.type === 'model') {
-      const resolved = resolveModelFor(getActiveState().kind || 'claude', text.trim());
+    } else if (sess.pendingSelect.type === 'model') {
+      const entry = reg.sessions[sess.name];
+      const resolved = resolveModelFor(entry ? sessionKind(entry) : 'claude', text.trim());
       if (resolved) {
-        pendingSelect = null;
+        sess.pendingSelect = null;
         const reply = (m) => transport.sendText(replyTarget, m)
           .catch(err => logger.error('Model select reply failed', { error: err.message }));
-        const tmux = tmuxTarget(getActiveState());
-        if (tmux && paneExists(tmux)) injectSlashAndCapture(tmux, `/model ${resolved.id}`, reply);
+        const tmux = tmuxTargetFor(sess);
+        if (tmux && paneExists(tmux)) injectSlashAndCapture(sess, tmux, `/model ${resolved.id}`, reply);
         else reply('❌ tmux 不可用');
         return;
       }
       // Unrecognised input — cancel selection, fall through to normal injection.
-      pendingSelect = null;
+      sess.pendingSelect = null;
       logger.info('pendingSelect: unrecognised input, cancelled');
     }
   }
 
-  // Consume a pending quiz (typed answer).
-  if (pendingQuiz) {
-    if (Date.now() > pendingQuiz.expires) {
+  // Consume a pending quiz (typed answer) for the context session.
+  if (sess?.pendingQuiz) {
+    if (Date.now() > sess.pendingQuiz.expires) {
       logger.info('pendingQuiz expired, clearing');
-      pendingQuiz = null;
+      sess.pendingQuiz = null;
       transport.sendText(replyTarget, '⏰ 问卷已超时取消，本条按普通消息处理').catch(() => {});
     } else {
-      handleQuizResponse(text, replyTarget);
+      handleQuizResponse(sess, text, replyTarget);
       return;
     }
   }
@@ -2252,62 +2693,83 @@ function onInboundMessage(inbound) {
   else if (/^\/rename(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(7);
   else if (/^\/mv(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(3);
   else if (/^\/model(\s|$)/i.test(cmdText)) cmdText = '#model' + cmdText.slice(6);
-
-  if (cmdText.startsWith('#')) {
-    handleBridgeCommand(cmdText, replyTarget);
+  else if (/^\/bind\b/i.test(cmdText)) cmdText = '#bind';
+  else if (/^\/esc\b/i.test(cmdText)) cmdText = '#esc';
+  else if (/^\/start\b/i.test(cmdText)) {
+    // Telegram /start (BotFather flow) → welcome/usage text. /help stays a
+    // remotable CC builtin (inject + capture), as before.
+    const kind = routed ? sessionKind(reg.sessions[routed.name]) : '';
+    transport.sendText(replyTarget, buildWelcome({ reconnect: false, kind })).catch(() => {});
     return;
   }
+
+  if (cmdText.startsWith('#')) {
+    handleBridgeCommand(cmdText, replyTarget, sess);
+    return;
+  }
+
+  // Everything past this point needs a session to talk to.
+  if (!sess) {
+    transport.sendText(replyTarget, '暂无已发现的会话（等待自动扫描，约 30 秒；或在终端里运行 attach）').catch(() => {});
+    return;
+  }
+  const ctxEntry = reg.sessions[sess.name];
 
   const slashMatch = cmdText.match(/^\/([a-z][\w-]*)/i);
   if (slashMatch) {
     const slashName = slashMatch[1].toLowerCase();
-    const activeKind = getActiveState().kind || 'claude';
-    const builtin = activeKind === 'codex' ? getAgent('codex').builtinSlash : CC_BUILTIN_SLASH;
-    const tuiOnly = activeKind === 'codex' ? getAgent('codex').tuiOnly : CC_TUI_ONLY;
+    const ctxKind = ctxEntry ? sessionKind(ctxEntry) : 'claude';
+    const builtin = ctxKind === 'codex' ? getAgent('codex').builtinSlash : CC_BUILTIN_SLASH;
+    const tuiOnly = ctxKind === 'codex' ? getAgent('codex').tuiOnly : CC_TUI_ONLY;
 
     if (builtin.has(slashName)) {
       const sendReply = (m) => transport.sendText(replyTarget, m)
         .catch(err => logger.error('Slash reply failed', { error: err.message }));
-      const tmux = tmuxTarget(getActiveState());
+      const tmux = tmuxTargetFor(sess);
       if (!tmux || !paneExists(tmux)) { sendReply('❌ tmux 不可用'); return; }
 
       if (tuiOnly.has(slashName)) {
-        const remotable = activeKind === 'codex'
+        const remotable = ctxKind === 'codex'
           ? '/status /diff /mcp /ps /compact /clear /new /model /review'
           : '/cost /usage /compact /clear /fast /effort /help /doctor /status /model';
         sendReply(`⚠️ /${slashName} 需要终端交互（方向键选择），无法远程操作。\n\n可远程使用的命令:\n  ${remotable}`);
         return;
       }
-      injectSlashAndCapture(tmux, cmdText, sendReply);
+      injectSlashAndCapture(sess, tmux, cmdText, sendReply);
       return;
     }
     // Not a known built-in → probably a skill → inject normally (produces transcript)
   }
 
-  // Regular message or skill — enqueue for injection. Capture the reply target NOW
-  // so a later message can't steal this turn's response (H2/H3).
-  // Bound the queue: a stalled turn could otherwise let it grow without limit.
-  if (pendingQueue.length >= MAX_PENDING_QUEUE) {
-    pendingQueue.shift(); // drop oldest
-    logger.warn('pendingQueue full, dropping oldest queued message', { max: MAX_PENDING_QUEUE });
+  // Regular message or skill — enqueue for injection into the CONTEXT session.
+  // Capture the reply target NOW so a later message can't steal this turn's
+  // response (H2/H3). Bound the queue: a stalled turn could otherwise let it
+  // grow without limit.
+  if (sess.pendingQueue.length >= MAX_PENDING_QUEUE) {
+    sess.pendingQueue.shift(); // drop oldest
+    logger.warn('pendingQueue full, dropping oldest queued message', { session: sess.name, max: MAX_PENDING_QUEUE });
     transport.sendText(replyTarget, '⚠️ 排队消息过多，已丢弃最早的一条').catch(() => {});
   }
-  pendingQueue.push({ text, target: replyTarget });
+  sess.pendingQueue.push({ text, target: replyTarget, messageId: inbound.messageId });
 
   // Show a typing indicator immediately (fire-and-forget).
   if (transport.caps.typingIndicator) transport.sendTyping(replyTarget, true).catch(() => {});
 
-  if (!ccBusy) scheduleInject();
-  else logger.info('CC busy, message queued for injection after Stop', { queued: pendingQueue.length });
+  if (!sess.busy) scheduleInject(sess);
+  else logger.info('Session busy, message queued for injection after Stop', { session: sess.name, queued: sess.pendingQueue.length });
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
 // Native command menu (Telegram setMyCommands). Each entry, when tapped, sends
 // the "/<command>" text which the slash-alias router maps to a bridge command.
 const MENU_COMMANDS = [
-  { command: 'ls',    description: '列出所有 session' },
-  { command: 'sw',    description: '切换 session' },
-  { command: 'model', description: '切换模型' },
+  { command: 'ls',     description: '列出所有会话（含忙碌状态）' },
+  { command: 'sw',     description: '切换默认路由会话' },
+  { command: 'model',  description: '切换模型' },
+  { command: 'rename', description: '重命名当前会话' },
+  { command: 'esc',    description: '中断当前回合' },
+  { command: 'bind',   description: '在话题群里绑定（每会话一个话题）' },
+  { command: 'start',  description: '使用说明' },
 ];
 
 async function main() {
@@ -2317,31 +2779,28 @@ async function main() {
   transport = await createTransport(transportName);
 
   const session = loadSession();
-  lastTarget             = session.target || '';
-  lastUserKey            = session.userKey || '';
-  lastInjectedText       = session.lastInjectedText || null;
-  lastInjectedTranscript = session.lastInjectedTranscript || null;
+  lastTarget  = session.target || '';
+  lastUserKey = session.userKey || '';
+  persistedTarget = lastTarget;
 
-  // A restored in-flight turn may never resolve: if its Stop fired while the
-  // bridge was down (or hooks were missing), no future Stop will clear
-  // lastInjectedText, and scheduleInject() deadlocks the queue forever. Give
-  // the turn a grace window to resolve normally, then reap the stale state.
-  if (lastInjectedText) {
-    const restored = lastInjectedText;
-    logger.warn('Startup: restored in-flight turn, arming stale-state reaper', { text: restored.slice(0, 40) });
-    setTimeout(() => {
-      if (lastInjectedText !== restored) return; // resolved by a real Stop
-      logger.warn('Startup: in-flight turn unresolved after grace, clearing stale state');
-      lastInjectedText       = null;
-      lastInjectedTranscript = null;
-      injectedTarget         = '';
-      saveSession({ target: lastTarget, userKey: lastUserKey, lastInjectedText: null, lastInjectedTranscript: null });
-      if (transport && lastTarget) {
-        if (transport.caps.typingIndicator) transport.sendTyping(lastTarget, false).catch(() => {});
-        transport.sendText(lastTarget, '⚠️ 上一条消息的回复在桥接重启期间丢失，请回终端查看，或重发一次').catch(() => {});
-      }
-      scheduleInject();
-    }, 10 * 60_000);
+  // Restore per-session in-flight turns for crash recovery. A legacy
+  // ilink_session.json that still carries turn fields is migrated once onto the
+  // active session's key; afterwards ilink_session.json holds only target/userKey.
+  const persisted = readJson(SESS_STATE_FILE, {});
+  const legacy = migrateLegacyIlink(session, readSessions());
+  for (const [key, turn] of Object.entries({ ...legacy, ...persisted })) {
+    if (!turn?.lastInjectedText) continue;
+    const sess = newSessionState(key, turn.name || key);
+    sess.lastInjectedText       = turn.lastInjectedText;
+    sess.lastInjectedTranscript = turn.lastInjectedTranscript || null;
+    sess.injectedTarget         = turn.injectedTarget || '';
+    sess.injectedMessageId      = turn.injectedMessageId || '';
+    sessionStates.set(key, sess);
+    sidToState.set(sess.sid, sess);
+    logger.warn('Startup: restored in-flight turn', { session: sess.name, text: turn.lastInjectedText.slice(0, 40) });
+  }
+  if (session.lastInjectedText) {
+    saveSession({ target: lastTarget, userKey: lastUserKey }); // strip migrated legacy fields
   }
 
   const hookServer = await startHookServer();
@@ -2370,27 +2829,29 @@ async function main() {
   function reconcileRestoredTurn() {
     if (startupReconciled) return;       // ready may fire more than once
     startupReconciled = true;
-    if (!lastInjectedText) return;
-    // injectedTarget is not persisted across restarts — fall back to the last known
-    // reply target so a recovered response still reaches the user.
-    if (!injectedTarget) injectedTarget = lastTarget || '';
-    logger.info('Reconciling in-flight turn restored from previous run', {
-      lastInjected: lastInjectedText.slice(0, 60), transcript: lastInjectedTranscript?.slice(-40),
-    });
-    if (lastInjectedTranscript) {
-      const r = findResponseToInjected(parseTranscript(lastInjectedTranscript, TRANSCRIPT_TAIL_BYTES), lastInjectedText);
-      if (r?.text && r.complete) {
-        pushResponse(r.text);
-        logger.info('Restored turn already complete; pushed on startup', { chars: r.text.length });
-        scheduleInject();
-        return;
+    for (const sess of sessionStates.values()) {
+      if (!sess.lastInjectedText) continue;
+      // injectedTarget may be missing on legacy restores — fall back to the last
+      // known reply target so a recovered response still reaches the user.
+      if (!sess.injectedTarget) sess.injectedTarget = lastTarget || '';
+      logger.info('Reconciling in-flight turn restored from previous run', {
+        session: sess.name, lastInjected: sess.lastInjectedText.slice(0, 60), transcript: sess.lastInjectedTranscript?.slice(-40),
+      });
+      if (sess.lastInjectedTranscript) {
+        const r = findResponseToInjected(parseTranscript(sess.lastInjectedTranscript, TRANSCRIPT_TAIL_BYTES), sess.lastInjectedText);
+        if (r?.text && r.complete) {
+          pushResponse(sess, r.text);
+          logger.info('Restored turn already complete; pushed on startup', { chars: r.text.length });
+          scheduleInject(sess);
+          continue;
+        }
       }
+      // Not yet complete (or no transcript): arm a bounded poll so the turn either
+      // resolves when the agent finishes or is abandoned at the deadline — never
+      // wedging lastInjectedText forever. (Claude transcript matching; for Codex the
+      // deadline cleanup still un-wedges it.)
+      armOrphanPoll(sess, sess.lastInjectedText, claudeProbe(sess.lastInjectedTranscript, sess.lastInjectedText));
     }
-    // Not yet complete (or no transcript): arm a bounded poll so the turn either
-    // resolves when the agent finishes or is abandoned at the deadline — never
-    // wedging lastInjectedText forever. (Claude transcript matching; for Codex the
-    // deadline cleanup still un-wedges it.)
-    armOrphanPoll(lastInjectedText, lastInjectedTranscript);
   }
 
   function onEvent(ev) {
@@ -2403,13 +2864,22 @@ async function main() {
         transport.setCommandMenu(MENU_COMMANDS).catch(() => {});
       }
 
+      // Topics become available only once the transport has loaded its account
+      // (caps.topics computed in start()) — sync immediately rather than waiting
+      // for the next 30s scan tick.
+      syncSessionTopics().catch(() => {});
+
       // Proactive reconnect welcome if we know the user from a previous session.
-      if (lastTarget) {
+      // Prefer the transport's "home" destination (bound group's General topic /
+      // locked private chat) over the raw last inbound target, which may be a
+      // topic that no longer maps to a session.
+      const welcomeTarget = transport.homeTarget?.() || lastTarget;
+      if (welcomeTarget) {
         if (lastUserKey) welcomedUsers.add(lastUserKey); // suppress duplicate on first inbound
         const activeName = readSessions().active || '(unknown)';
-        transport.sendText(lastTarget, buildWelcome({ reconnect: true, activeName, kind: getActiveState().kind }))
+        transport.sendText(welcomeTarget, buildWelcome({ reconnect: true, activeName, kind: getActiveState().kind }))
           .catch(err => logger.error('Startup welcome failed', { error: err.message }));
-        logger.info('Sent startup welcome', { target: lastTarget });
+        logger.info('Sent startup welcome', { target: welcomeTarget });
       }
 
       // Reconcile any in-flight turn restored from a previous run. Run here (not
@@ -2450,7 +2920,11 @@ async function main() {
     if (transport && lastTarget) transport.sendTyping(lastTarget, false).catch(() => {});
     if (transport) transport.stop();
     hookServer.close();
-    cancelPending();
+    for (const sess of sessionStates.values()) {
+      cancelPending(sess);
+      if (sess.statusEditTimer) clearTimeout(sess.statusEditTimer);
+      if (sess.heartbeatTimer) clearInterval(sess.heartbeatTimer);
+    }
     try { unlinkSync(HOOK_SOCKET); } catch {}
     process.exit(0);
   }

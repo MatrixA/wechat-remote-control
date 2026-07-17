@@ -25,15 +25,22 @@ function mediaNoteFor(msg) {
         return '⚠️ 暂不支持该类型消息，请发送文字';
     return null;
 }
+/** Encode a message's reply destination: plain chat, or "<chatId>:<threadId>" inside a topic. */
+function targetOf(msg) {
+    if (msg.is_topic_message && msg.message_thread_id) {
+        return `${msg.chat.id}:${msg.message_thread_id}`;
+    }
+    return String(msg.chat.id);
+}
 /** Normalise a Telegram Update into the shared inbound shape (pure). */
 export function normalizeUpdate(update) {
     const cq = update.callback_query;
     if (cq) {
-        const chat = cq.message?.chat;
-        if (!chat)
+        const msg = cq.message;
+        if (!msg)
             return null; // can't route a reply without a chat
         return {
-            target: String(chat.id),
+            target: targetOf(msg),
             replyToken: cq.id,
             text: '',
             kind: 'callback',
@@ -44,16 +51,22 @@ export function normalizeUpdate(update) {
     const msg = update.message;
     if (!msg)
         return null;
-    const target = String(msg.chat.id);
+    const target = targetOf(msg);
     const userKey = String(msg.from?.id ?? msg.chat.id);
+    const messageId = String(msg.message_id);
     if (typeof msg.text === 'string' && msg.text.length > 0) {
-        return { target, replyToken: '', text: msg.text, kind: 'text', userKey };
+        return { target, replyToken: '', text: msg.text, kind: 'text', userKey, messageId };
     }
     const note = mediaNoteFor(msg);
     if (note) {
-        return { target, replyToken: '', text: '', kind: 'unsupported_media', mediaNote: note, userKey };
+        return { target, replyToken: '', text: '', kind: 'unsupported_media', mediaNote: note, userKey, messageId };
     }
     return null; // service message / unhandled
+}
+/** The plain chat id an update came from (authorization is chat-level, not thread-level). */
+function chatIdOf(update) {
+    const chat = update.message?.chat ?? update.callback_query?.message?.chat;
+    return chat ? String(chat.id) : null;
 }
 /** Username best-effort, for capturing the locked chat. */
 function usernameOf(update) {
@@ -85,16 +98,23 @@ export function createTelegramMonitor(api, account, onMessage) {
                     const inbound = normalizeUpdate(u);
                     if (!inbound)
                         continue;
-                    // ── Single-chat authorization lock ──
-                    if (!isChatAllowed(account, inbound.target)) {
-                        logger.warn('Dropping message from unauthorized chat', { chatId: inbound.target });
+                    // ── Chat authorization lock ──
+                    const chatId = chatIdOf(u) ?? inbound.target;
+                    if (!isChatAllowed(account, chatId, inbound.userKey)) {
+                        logger.warn('Dropping message from unauthorized chat', { chatId });
                         continue;
                     }
-                    if (!account.allowedChatId) {
-                        account.allowedChatId = inbound.target;
+                    // Capture-lock only a PRIVATE chat: locking a group id would block the
+                    // owner's own DM forever (the owner exception compares fromUserId to
+                    // allowedChatId, which equals the user id only for private chats).
+                    // A group that messages an unbound bot passes through un-captured, so
+                    // the /bind-before-first-DM order still works.
+                    const chatType = (u.message?.chat ?? u.callback_query?.message?.chat)?.type;
+                    if (!account.allowedChatId && chatType === 'private') {
+                        account.allowedChatId = chatId;
                         account.allowedUsername = usernameOf(u);
-                        saveAllowedChat(inbound.target, account.allowedUsername);
-                        logger.info('Telegram locked to chat', { chatId: inbound.target, username: account.allowedUsername });
+                        saveAllowedChat(chatId, account.allowedUsername);
+                        logger.info('Telegram locked to chat', { chatId, username: account.allowedUsername });
                     }
                     try {
                         onMessage(inbound);

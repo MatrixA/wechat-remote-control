@@ -9,6 +9,9 @@ test('createTransport returns the wechat adapter with text-only caps', async () 
   assert.strictEqual(t.caps.inlineKeyboards, false);
   assert.strictEqual(t.caps.editMessages, false);
   assert.strictEqual(t.caps.commandMenu, false);
+  assert.strictEqual(t.caps.topics, false);
+  assert.strictEqual(t.caps.reactions, false);
+  assert.strictEqual(t.caps.documents, false);
   assert.strictEqual(t.caps.maxMessageLen, 2048);
 });
 
@@ -18,6 +21,10 @@ test('createTransport returns the telegram adapter with rich caps', async () => 
   assert.strictEqual(t.caps.inlineKeyboards, true);
   assert.strictEqual(t.caps.editMessages, true);
   assert.strictEqual(t.caps.commandMenu, true);
+  assert.strictEqual(t.caps.reactions, true);
+  assert.strictEqual(t.caps.documents, true);
+  // topics stays false until a group is bound at start()
+  assert.strictEqual(t.caps.topics, false);
   assert.ok(t.caps.maxMessageLen >= 2048);
 });
 

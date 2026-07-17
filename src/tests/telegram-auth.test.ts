@@ -17,3 +17,17 @@ test('isChatAllowed locks to the bound chat once set', () => {
   assert.strictEqual(isChatAllowed(bound, '99'), false);
   assert.strictEqual(isChatAllowed(bound, ''), false);
 });
+
+test('isChatAllowed also admits the bound topics group', () => {
+  const bound: TelegramAccount = { ...base, allowedChatId: '42', groupChatId: '-100777' };
+  assert.strictEqual(isChatAllowed(bound, '-100777'), true);
+  assert.strictEqual(isChatAllowed(bound, '-100778'), false);
+});
+
+test('isChatAllowed admits the owner from any chat (enables /bind in a new group)', () => {
+  const bound: TelegramAccount = { ...base, allowedChatId: '42' };
+  // owner (user id 42 == locked private chat id) speaking inside an unbound group
+  assert.strictEqual(isChatAllowed(bound, '-100999', '42'), true);
+  // a stranger in that group is still dropped
+  assert.strictEqual(isChatAllowed(bound, '-100999', '7'), false);
+});

@@ -7,7 +7,7 @@
  * (& < >) with no positional special-casing.
  */
 import type { Button } from '../transport/types.js';
-import type { TgInlineKeyboardMarkup } from './types.js';
+import type { TgInlineKeyboardMarkup, TgInlineKeyboardButton } from './types.js';
 
 /** Escape the three characters that are significant in Telegram HTML text. */
 export function escapeHtml(s: string): string {
@@ -61,22 +61,57 @@ export function toTelegramHtml(text: string): string {
   return out.join('\n');
 }
 
+/**
+ * Find a safe split point for a long message: the end of the last line that
+ * (a) keeps at least `headChars` characters in the head and (b) does not sit
+ * inside a ``` fence. Returns -1 when no such boundary exists (short text, or
+ * everything past headChars is inside one giant fence).
+ */
+export function findExpandableSplit(text: string, headChars: number): number {
+  if (text.length <= headChars) return -1;
+  const lines = text.split('\n');
+  let inFence = false;
+  let offset = 0;
+  let split = -1;
+  for (const line of lines) {
+    const end = offset + line.length; // index just past this line (before its \n)
+    if (/^```/.test(line)) inFence = !inFence;
+    if (!inFence && end >= headChars && end < text.length) { split = end; break; }
+    offset = end + 1;
+  }
+  return split;
+}
+
+/**
+ * Render a long message so only a head stays visible and the remainder is
+ * wrapped in an expandable blockquote (collapsed by default in the client).
+ * Falls back to plain toTelegramHtml when no safe split point exists.
+ */
+export function toExpandableHtml(text: string, headChars = 600): string {
+  const split = findExpandableSplit(text, headChars);
+  if (split < 0) return toTelegramHtml(text);
+  const head = text.slice(0, split);
+  const tail = text.slice(split + 1); // skip the newline at the boundary
+  if (!tail.trim()) return toTelegramHtml(text);
+  return `${toTelegramHtml(head)}\n<blockquote expandable>${toTelegramHtml(tail)}</blockquote>`;
+}
+
 const MAX_CALLBACK_BYTES = 64;
 
 /**
- * Build a Telegram inline keyboard from generic Button rows. Throws if any
- * callback payload exceeds Telegram's 64-byte limit (callers must index-encode,
- * never embed raw labels/ids).
+ * Build a Telegram inline keyboard from generic Button rows. Callback buttons
+ * throw if the payload exceeds Telegram's 64-byte limit (callers must
+ * index-encode, never embed raw labels/ids); URL buttons pass through.
  */
 export function buildInlineKeyboard(rows: Button[][]): TgInlineKeyboardMarkup {
-  for (const row of rows) {
-    for (const b of row) {
-      if (Buffer.byteLength(b.data, 'utf8') > MAX_CALLBACK_BYTES) {
-        throw new Error(`callback_data exceeds ${MAX_CALLBACK_BYTES} bytes: ${b.data}`);
-      }
+  const mapped: TgInlineKeyboardButton[][] = rows.map((row) => row.map((b) => {
+    if (b.url) return { text: b.label, url: b.url };
+    const data = b.data ?? '';
+    if (!data) throw new Error(`button "${b.label}" has neither data nor url`);
+    if (Buffer.byteLength(data, 'utf8') > MAX_CALLBACK_BYTES) {
+      throw new Error(`callback_data exceeds ${MAX_CALLBACK_BYTES} bytes: ${data}`);
     }
-  }
-  return {
-    inline_keyboard: rows.map((row) => row.map((b) => ({ text: b.label, callback_data: b.data }))),
-  };
+    return { text: b.label, callback_data: data };
+  }));
+  return { inline_keyboard: mapped };
 }

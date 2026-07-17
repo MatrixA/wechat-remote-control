@@ -46,7 +46,18 @@ When you're away from your terminal but a Claude Code task is still running — 
 
 ---
 
-## Telegram support
+## Fully concurrent multi-session
+
+The bridge auto-discovers **every** tmux pane running claude / codex. Each session owns
+an independent message queue, in-flight turn and live status — you can drive session B
+while session A is mid-task, and every reply lands back in the conversation that asked
+for it. Hook events route authoritatively by tmux pane id (`TMUX_PANE`), so same-cwd
+sessions never cross-talk. `/sw` only moves the private-chat *default route* pointer and
+never interrupts any session's in-flight work.
+
+---
+
+## Telegram support (recommended)
 
 The same machinery (tmux injection, hook forwarding, multi-session, auto-approve) also
 works over a **Telegram bot** — the IM layer is abstracted behind a `Transport` interface
@@ -55,13 +66,29 @@ works over a **Telegram bot** — the IM layer is abstracted behind a `Transport
 - **Login**: `/wechat-remote-control login --telegram` — create a bot via **@BotFather**,
   paste the token, then send the bot `/start`. The first chat to message the bot is
   **locked** as the only authorized chat (the token grants terminal control — keep it secret).
+- **Forum Topics mode (best experience)**: create a supergroup with Topics enabled, add
+  the bot as an admin with *Manage Topics*, and send `/bind` in the group — **every tmux
+  session automatically gets its own forum topic**, isolated like a Slack channel:
+  messages typed in a topic go to that session; replies, status updates and quizzes stay
+  there. Renames propagate to the topic; a closed session's topic is archived and reused
+  if the session comes back. The General topic and the private chat remain the "lobby"
+  (the `/ls` dashboard with busy states and topic deep links, global commands, and the
+  default-route destination).
 - **Transport selection** at attach: `WCC_TRANSPORT` env > `--telegram`/`--wechat` > whichever
   credentials exist on disk.
-- **Native Telegram capabilities**: command menu, inline keyboards for `/sw` & `/model`,
-  quiz option buttons, progress via message editing, typing indicator, markdown-rendered
-  output (code blocks, bold, links, headers), chunked under the 4096 limit.
-- Credentials live in `~/.wechat-remote-control/telegram/account.json`; WeChat files are
-  untouched, fully backwards compatible.
+- **Native Telegram capabilities**:
+  - command menu (`/ls` `/sw` `/model` `/rename` `/esc` `/bind` `/help`)
+  - **live turn status**: one message per turn, edited in place with elapsed time, tool
+    count and the current tool, plus a **⏹ interrupt button** (sends Escape to the pane)
+  - **reactions** on your message: 👀 injected, 👍 answered, 💔 abandoned
+  - inline keyboards for `/sw` & `/model`; quiz option buttons (multi-select supported)
+  - **long replies don't wallpaper the chat**: medium ones collapse into an expandable
+    quote; anything over 8k chars arrives as a Markdown **file**
+  - per-topic typing indicator, markdown-rendered output, automatic `retry_after`
+    backoff on rate limits
+- Credentials live in `~/.wechat-remote-control/telegram/account.json` (locked chat id +
+  bound group id); WeChat files are untouched. WeChat stays functional in degraded mode:
+  single active session + numbered text menus, exactly as before.
 
 ---
 

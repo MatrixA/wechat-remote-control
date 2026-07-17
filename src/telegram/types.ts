@@ -21,6 +21,8 @@ export interface TgChat {
   type: string; // 'private' | 'group' | 'supergroup' | 'channel'
   username?: string;
   title?: string;
+  /** True for supergroups with Topics enabled. */
+  is_forum?: boolean;
 }
 
 export interface TgMessage {
@@ -29,6 +31,9 @@ export interface TgMessage {
   chat: TgChat;
   date: number;
   text?: string;
+  /** Forum-topic thread id; only meaningful together with is_topic_message. */
+  message_thread_id?: number;
+  is_topic_message?: boolean;
   photo?: unknown[];
   document?: unknown;
   voice?: unknown;
@@ -53,7 +58,8 @@ export interface TgUpdate {
 
 export interface TgInlineKeyboardButton {
   text: string;
-  callback_data: string;
+  callback_data?: string;
+  url?: string;
 }
 
 export interface TgInlineKeyboardMarkup {
@@ -63,4 +69,11 @@ export interface TgInlineKeyboardMarkup {
 export interface TgBotCommand {
   command: string;
   description: string;
+}
+
+/** Result of createForumTopic. */
+export interface TgForumTopic {
+  message_thread_id: number;
+  name: string;
+  icon_color?: number;
 }
