@@ -31,6 +31,11 @@ export interface TgMessage {
     /** Forum-topic thread id; only meaningful together with is_topic_message. */
     message_thread_id?: number;
     is_topic_message?: boolean;
+    /** Service message: this topic was edited (name and/or icon; absent field = unchanged). */
+    forum_topic_edited?: {
+        name?: string;
+        icon_custom_emoji_id?: string;
+    };
     photo?: unknown[];
     document?: unknown;
     voice?: unknown;

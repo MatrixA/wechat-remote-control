@@ -47,6 +47,7 @@ import {
   sessionKeyFor, newSessionState,
   resolveSessionForHook, resolveSessionForInbound,
   persistableState, migrateLegacyIlink, planTopicSync,
+  tmuxSessionOf, effectiveFocus, orderedSessionNames, sanitizeSessionName,
 } from '../dist/sessions.js';
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -974,6 +975,19 @@ function scanTmuxForCC() {
 
       reg.sessions[name] = { tmux: tmuxStr, paneId, cwd, transcriptPath, kind, lastSeen: now };
       logger.info(`Auto-discovered ${kind} session: ${name} [${tmuxStr} ${paneId}]`);
+
+      // A pane outside the /fc focus gets no topic — surface it in General so
+      // the user still learns it exists. (Restored entries match by paneId
+      // above and never reach this branch, so restarts don't spam.)
+      const focus = effectiveFocus(reg);
+      if (focus && transport?.caps.topics && tmuxSessionOf(reg.sessions[name]) !== focus) {
+        const home = transport.homeTarget?.();
+        if (home) {
+          transport.sendText(home,
+            `🆕 发现新会话 ${name}（tmux 会话 ${tmuxSessionOf(reg.sessions[name])}，不在聚焦的 ${focus} 内，未创建话题）— /fc 可切换聚焦`,
+          ).catch(() => {});
+        }
+      }
     }
 
     // Prune sessions whose PANE is gone (not merely "agent not detected") and
@@ -1000,6 +1014,14 @@ function scanTmuxForCC() {
         destroyState(sessionKeyFor(s), 'tmux 会话已关闭');
         delete reg.sessions[name];
       }
+    }
+
+    // A focus whose tmux session vanished entirely would filter out every
+    // topic; drop it so the group falls back to showing all sessions.
+    if (reg.focusedTmuxSession
+        && !Object.values(reg.sessions).some(s => tmuxSessionOf(s) === reg.focusedTmuxSession)) {
+      logger.info('Focused tmux session vanished, clearing focus', { focus: reg.focusedTmuxSession });
+      reg.focusedTmuxSession = null;
     }
 
     // Pick a default active session if none set.
@@ -1097,18 +1119,38 @@ function reconcileStates(reg) {
 
 // ── Forum topics lifecycle ───────────────────────────────────────────
 // After every scan, make the bound Telegram group's topics mirror the registry:
-// each session gets its own topic (reopening a tombstoned one when a session
-// reappears), renames propagate. Serialised — a slow Telegram call must not
-// overlap the next scan's sync.
+// each session in focus gets its own topic (reopening a tombstoned one when a
+// session reappears), renames propagate, and sessions outside a /fc focus get
+// their topic deleted. Serialised — a slow Telegram call must not overlap the
+// next scan's sync.
 let topicSyncBusy = false;
 let topicRightsWarned = false;
+// Dead-thread forensics: thread target → session name for topics that were
+// deleted (focus purge or user deletion). handleTopicSendError consults this
+// when the registry binding was already cleared — a late reply from a turn
+// that outlived its topic must still re-route to General instead of dying in
+// retries against the dead thread. In-memory only: after a daemon restart the
+// (rare) purged-mid-turn reply just falls back to plain retries.
+const purgedTopicNames = new Map();
+
+/** Sessions whose topic must not be deleted right now: an in-flight or queued
+ *  turn would aim its reply at the thread this sync just destroyed. */
+function busySessionNames(reg) {
+  const busy = new Set();
+  for (const [name, s] of Object.entries(reg.sessions)) {
+    const st = sessionStates.get(sessionKeyFor(s));
+    if (st && (st.busy || st.lastInjectedText || st.pendingQueue.length > 0)) busy.add(name);
+  }
+  return busy;
+}
 
 async function syncSessionTopics() {
   if (!transport?.topics || !transport.caps.topics) return;
   if (topicSyncBusy) return;
   topicSyncBusy = true;
   try {
-    const ops = planTopicSync(readSessions());
+    const regNow = readSessions();
+    const ops = planTopicSync(regNow, busySessionNames(regNow));
     for (const op of ops) {
       try {
         if (op.op === 'create') {
@@ -1119,6 +1161,14 @@ async function syncSessionTopics() {
             transport.sendText(imTarget,
               `🆕 已连接会话 ${op.name}（${sessionKind(fresh)}）\n📁 ${fresh.cwd}\n\n在此话题内发消息即发送到该会话，回复也只出现在这里。`,
             ).catch(() => {});
+            // Recreated after a purge (/fc switch or user deletion): the old
+            // thread's history is gone, so replay recent rounds into the fresh one.
+            if (op.replay && fresh.transcriptPath) {
+              const replay = contextReplayFor(sessionKind(fresh), fresh.transcriptPath);
+              for (const chunk of splitMessage(replay, transport.caps.maxMessageLen)) {
+                await transport.sendText(imTarget, chunk).catch(() => {});
+              }
+            }
           }
         } else if (op.op === 'reopen') {
           // Best-effort: reopening an already-open or user-deleted topic fails
@@ -1128,6 +1178,17 @@ async function syncSessionTopics() {
         } else if (op.op === 'rename') {
           await transport.topics.rename(op.imTarget, op.name);
           applyTopicResult(op.name, op.imTarget);
+        } else if (op.op === 'remove') {
+          try {
+            await transport.topics.remove(op.imTarget);
+          } catch (err) {
+            const m = err?.message || String(err);
+            // Already gone (the user deleted it first): treat as success so the
+            // binding is cleared — otherwise this op re-fails every 30s forever
+            // and the entry stays bound to a dead thread, blocking recreation.
+            if (!/thread not found|TOPIC_DELETED/i.test(m)) throw err;
+          }
+          applyTopicRemoved(op.name, op.imTarget);
         }
       } catch (err) {
         const m = err?.message || String(err);
@@ -1155,6 +1216,7 @@ function applyTopicResult(name, imTarget) {
   if (reg.sessions[name]) {
     reg.sessions[name].imTarget = imTarget;
     reg.sessions[name].topicName = name;
+    delete reg.sessions[name].topicPurged;
     if (reg.closedTopics && reg.closedTopics[name] === imTarget) delete reg.closedTopics[name];
   } else {
     // The entry was renamed/pruned while the Telegram call was in flight —
@@ -1167,51 +1229,81 @@ function applyTopicResult(name, imTarget) {
   writeSessions(reg);
 }
 
+/** Persist a focus-driven topic deletion: unbind the dead thread and mark the
+ *  entry so a topic created for it later gets a context replay. */
+function applyTopicRemoved(name, imTarget) {
+  purgedTopicNames.set(imTarget, name);
+  const reg = readSessions();
+  const s = reg.sessions[name];
+  if (s && s.imTarget === imTarget) {
+    delete s.imTarget;
+    delete s.topicName;
+    s.topicPurged = true;
+    writeSessions(reg);
+  }
+}
+
 /**
  * A send into a session's topic failed. Two distinct causes:
  *  - TOPIC_CLOSED: the topic still exists but is closed (e.g. a send raced the
  *    reopen after a session reappeared) → reopen it and let the caller retry.
  *    Recreating here would leave a duplicate closed topic behind.
- *  - thread not found / TOPIC_DELETED: the user deleted the topic → clear the
- *    binding so the next sync recreates it.
- * Returns true when the error was topic-related (caller stops its retry loop
- * for the deleted case; the closed case returns false so the retry can land
- * after the reopen).
+ *  - thread not found / TOPIC_DELETED: the topic is gone (user deletion, or an
+ *    /fc focus purge racing an in-flight reply) → clear the binding so the next
+ *    sync recreates it (focused sessions only), and return the session's name
+ *    so the caller can re-route the undeliverable text instead of dropping it.
+ * Returns { name } when the thread is dead, null otherwise (the closed case
+ * returns null so the caller's retry can land after the reopen).
  */
 function handleTopicSendError(target, err) {
   const m = err?.message || String(err);
   if (/TOPIC_CLOSED/i.test(m)) {
     if (transport?.topics) transport.topics.reopen(target).catch(() => {});
-    return false; // let the caller's retry re-send into the reopened topic
+    return null; // let the caller's retry re-send into the reopened topic
   }
-  if (!/thread not found|TOPIC_DELETED/i.test(m)) return false;
+  if (!/thread not found|TOPIC_DELETED/i.test(m)) return null;
   const reg = readSessions();
-  let changed = false;
+  let hit = null;
   for (const [name, s] of Object.entries(reg.sessions)) {
     if (s.imTarget === target) {
       delete s.imTarget;
       delete s.topicName;
+      s.topicPurged = true; // replay context into the recreated thread
       if (reg.closedTopics) delete reg.closedTopics[name];
-      changed = true;
+      hit = name;
       logger.info('Topic gone, will recreate on next sync', { name });
     }
   }
-  if (changed) {
+  if (hit) {
+    purgedTopicNames.set(target, hit);
     writeSessions(reg);
     syncSessionTopics().catch(() => {});
+    return { name: hit };
   }
-  return changed;
+  // Binding already cleared (a focus purge beat this send, or an earlier chunk
+  // of the same reply cleared it) — the dead-thread map still knows the owner.
+  const purged = purgedTopicNames.get(target);
+  return purged ? { name: purged } : null;
 }
 
 // ── Multi-session: WeChat bridge commands ────────────────────────────
 
 function formatSessionList(reg) {
-  const names = Object.keys(reg.sessions);
+  const names = orderedSessionNames(reg);
   if (names.length === 0) return '暂无发现活跃的 CC session\n（等待自动扫描，约30秒）';
   const home = homedir();
+  const focus = effectiveFocus(reg);
+  // Group headers only earn their lines when there is more than one tmux session.
+  const showGroups = new Set(names.map(n => tmuxSessionOf(reg.sessions[n]))).size > 1;
   const lines = ['📋 Sessions:'];
+  let lastGroup = null;
   names.forEach((name, i) => {
     const s = reg.sessions[name];
+    const group = tmuxSessionOf(s);
+    if (showGroups && group !== lastGroup) {
+      lastGroup = group;
+      lines.push(`▼ tmux: ${group}${group === focus ? ' 🎯' : ''}`);
+    }
     const sess = getStateFor(name, s);
     const busy = (sess.busy || sess.lastInjectedText) ? '🔵' : '⚪';
     const marker = name === reg.active ? '▶' : '○';
@@ -1220,8 +1312,9 @@ function formatSessionList(reg) {
     lines.push(`${marker} ${i + 1}. ${busy} ${name} (${sessionKind(s)})${queued}\n   ${shortPath}`);
   });
   lines.push(`\n默认路由: ${reg.active || '无'}`);
+  if (focus) lines.push(`🎯 聚焦: ${focus}（其他 tmux 会话的话题已删除，/fc all 恢复）`);
   if (transport?.caps.topics) lines.push('每个会话有独立话题，进入话题即可对话');
-  lines.push('切换默认: /sw <名字/序号>；改名: /rename <新名字>');
+  lines.push('切换默认: /sw <名字/序号>；改名: /rename <新名字>；聚焦: /fc');
   return lines.join('\n');
 }
 
@@ -1393,7 +1486,7 @@ async function injectSlashAndCaptureInner(sess, target, command, send) {
  * route (used by the General topic / private chat).
  */
 function sessionButtons(reg) {
-  return Object.keys(reg.sessions).map((name, i) => {
+  return orderedSessionNames(reg).map((name, i) => {
     const s = reg.sessions[name];
     const sess = getStateFor(name, s);
     const busy = (sess.busy || sess.lastInjectedText) ? '🔵' : '⚪';
@@ -1465,6 +1558,154 @@ async function performSwitch(targetName, send) {
   logger.info(`Switched active session to: ${targetName}`);
 }
 
+// ── /fc: tmux-session focus ──────────────────────────────────────────
+// One tmux session ≈ one project. /fc collapses the group's topic list to just
+// the focused session's panes by DELETING every other topic (Telegram offers
+// no true per-topic hide: close only greys a topic out, it stays in the list).
+// Deleted topics are recreated with a context replay on refocus. Focus filters
+// topic visibility ONLY — the default route (#sw) and in-flight turns are
+// untouched.
+let fcMenu = null; // { names: string[], expires: number } — snapshot behind fc:<idx> callbacks
+const FC_MENU_TTL = 5 * 60 * 1000;
+
+/** Registry names grouped by tmux session, in orderedSessionNames order. */
+function tmuxGroups(reg) {
+  const groups = new Map();
+  for (const name of orderedSessionNames(reg)) {
+    const g = tmuxSessionOf(reg.sessions[name]);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(name);
+  }
+  return groups;
+}
+
+function formatTmuxList(reg) {
+  const groups = tmuxGroups(reg);
+  if (groups.size === 0) return '暂无发现活跃的会话（等待自动扫描，约30秒）';
+  const focus = effectiveFocus(reg);
+  const lines = ['🗂 tmux 会话（聚焦后，其余会话的话题将被删除，切回时重建）:'];
+  let i = 0;
+  for (const [g, members] of groups) {
+    i++;
+    const busyCount = members.filter(n => {
+      const st = sessionStates.get(sessionKeyFor(reg.sessions[n]));
+      return st && (st.busy || st.lastInjectedText);
+    }).length;
+    const mark = g === focus ? '🎯' : '○';
+    lines.push(`${mark} ${i}. ${g} — ${members.length} 个会话${busyCount ? `（${busyCount} 忙碌）` : ''}`);
+    lines.push(`   ${members.join(', ')}`);
+  }
+  lines.push(focus ? `\n当前聚焦: ${focus}（/fc all 显示全部）` : '\n当前未聚焦：所有会话都有话题');
+  return lines.join('\n');
+}
+
+function tmuxButtons(names, focus) {
+  const rows = names.map((g, i) => [{ label: `${g === focus ? '🎯 ' : ''}${i + 1}. ${g}`, data: `fc:${i}` }]);
+  rows.push([{ label: '📖 全部显示（取消聚焦）', data: 'fc:all' }]);
+  return rows;
+}
+
+/**
+ * Set (or clear, groupName=null) the focused tmux session and kick a topic
+ * sync. Shared by the #fc command and the fc:<idx> button callback. The reply
+ * goes out before the sync — deleting/recreating many topics can take a while
+ * and busy sessions defer their deletion to a later sync anyway.
+ */
+async function performFocus(groupName, send) {
+  const reg = readSessions();
+  reg.focusedTmuxSession = groupName || null;
+  writeSessions(reg);
+  if (!groupName) {
+    await send('📖 已取消聚焦：将为所有会话恢复话题（重建的话题会回放最近上下文）。');
+  } else {
+    const members = new Set(tmuxGroups(reg).get(groupName) || []);
+    // Count only topics that actually exist and will be deleted.
+    const toRemove = Object.entries(reg.sessions)
+      .filter(([n, s]) => !members.has(n) && s.imTarget).length;
+    await send(
+      `🎯 已聚焦 tmux 会话 ${groupName}：${members.size} 个会话保留/新建话题`
+      + (toRemove > 0 ? `，其余 ${toRemove} 个话题将被删除（历史随之删除，切回时重建并回放上下文）` : '')
+      + `。\n默认路由不变: ${reg.active || '无'}\n/fc all 恢复全部`);
+  }
+  syncSessionTopics().catch(() => {});
+  logger.info('Focus switched', { focus: groupName || null });
+}
+
+/**
+ * Rename a session everywhere it has a name: the tmux window, the registry key
+ * (pinned so rescans never revert it) and the live runtime state. Shared by
+ * the #rename command and Telegram-side topic renames; callers validate
+ * newName (non-empty, no [:.\t\n], no collision) first. `topicName` (when
+ * given) records what the topic currently displays, so the next sync only
+ * renames the topic if it actually drifts from the registry name.
+ */
+function renameSession(reg, oldName, newName, { topicName } = {}) {
+  const s = reg.sessions[oldName];
+  if (!s) return false;
+  // Prefer the pane id — tmux resolves it to the containing window for
+  // window-level commands and it survives window moves; coordinates are the
+  // pre-paneId fallback. rename-window also disables automatic-rename for the
+  // window, so the new name sticks.
+  const windowTarget = s.paneId || s.tmux.split('.')[0];
+  try {
+    execFileSync('tmux', ['rename-window', '-t', windowTarget, newName], { stdio: 'ignore' });
+  } catch (err) {
+    logger.error('tmux rename-window failed', { error: err.message, target: windowTarget });
+    // Non-fatal — the registry rename below still makes #ls/#sw use the new name.
+  }
+  reg.sessions[newName] = {
+    ...s, pinnedName: newName, lastSeen: Date.now(),
+    ...(topicName !== undefined ? { topicName } : {}),
+  };
+  delete reg.sessions[oldName];
+  // Follow only when the renamed session IS the default route — renaming a
+  // non-active session (e.g. from inside its topic) must not hijack the pointer.
+  if (reg.active === oldName) reg.active = newName;
+  writeSessions(reg);
+  // Refresh the live state's name now instead of waiting ≤30s for the scanner.
+  const st = sessionStates.get(sessionKeyFor(s));
+  if (st) st.name = newName;
+  return true;
+}
+
+/**
+ * A topic was renamed in the Telegram UI (long-press → Edit): apply it to the
+ * bound session's tmux window + registry. The bridge's own editForumTopic
+ * calls echo the same service message — absorbed by the name-equality guard,
+ * so no rename ping-pong is possible (the bridge only renames a topic when
+ * topicName !== registry name, and every path below ends with them equal).
+ */
+async function handleTopicRename(inbound) {
+  const reg = readSessions();
+  const routed = resolveSessionForInbound(reg, inbound.target);
+  if (!routed?.viaTopic) return; // General / unknown thread — never touch the active fallback
+  const oldName = routed.name;
+  const raw = (inbound.topicName || '').trim();
+  if (!raw || raw === oldName) return; // echo of our own rename, or a no-op
+  const newName = sanitizeSessionName(raw);
+  if (!newName || newName === oldName) {
+    // Nothing usable survives sanitizing (or it sanitizes back to the current
+    // name): record what the topic now shows so the next sync renames it back.
+    const entry = reg.sessions[oldName];
+    if (entry) { entry.topicName = raw; writeSessions(reg); syncSessionTopics().catch(() => {}); }
+    return;
+  }
+  if (reg.sessions[newName]) {
+    // Record what the topic now shows and let the drift sync rename it back —
+    // unlike a one-shot revert call, the sync retries every cycle if it fails.
+    const entry = reg.sessions[oldName];
+    if (entry) { entry.topicName = raw; writeSessions(reg); syncSessionTopics().catch(() => {}); }
+    transport.sendText(inbound.target, `⚠️ 已存在同名会话「${newName}」，话题名已改回「${oldName}」`).catch(() => {});
+    return;
+  }
+  renameSession(reg, oldName, newName, { topicName: raw });
+  logger.info(`Session renamed via topic edit: ${oldName} → ${newName}`);
+  transport.sendText(inbound.target, `✅ 已同步重命名 tmux 窗口: ${oldName} → ${newName}`).catch(() => {});
+  // raw carried chars we sanitized away → topicName(raw) ≠ name(newName), so
+  // kick a sync to converge the topic onto the sanitized form.
+  if (raw !== newName) syncSessionTopics().catch(() => {});
+}
+
 async function handleBridgeCommand(text, replyTarget, ctxSess) {
   const send = (msg) => transport.sendText(replyTarget, msg)
     .catch(err => logger.error('Bridge command reply failed', { error: err.message }));
@@ -1527,7 +1768,9 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     }
 
     const reg = readSessions();
-    const names = Object.keys(reg.sessions);
+    // Same ordering as the /ls display and its buttons, so "/sw 3" always
+    // means the session shown as 3.
+    const names = orderedSessionNames(reg);
     let targetName = null;
     const num = parseInt(arg, 10);
     if (!isNaN(num) && num >= 1 && num <= names.length) {
@@ -1541,6 +1784,40 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
       return;
     }
     await performSwitch(targetName, send);
+    return;
+  }
+
+  // #fc [name|number|all] — focus one tmux session (see the /fc block above).
+  if (cmd === '#fc') {
+    if (!transport.caps.topics) {
+      await send('话题模式未开启（先在开启「话题」的超级群里 /bind），/fc 无效');
+      return;
+    }
+    const arg = parts.slice(1).join(' ').trim();
+    const reg = readSessions();
+    const groupNames = [...tmuxGroups(reg).keys()];
+    if (!arg) {
+      fcMenu = { names: groupNames, expires: Date.now() + FC_MENU_TTL };
+      const list = formatTmuxList(reg);
+      if (transport.caps.inlineKeyboards && groupNames.length > 0) {
+        await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
+          .catch(err => logger.error('Focus menu push failed', { error: err.message }));
+      } else {
+        await send(`${list}\n\n用法: /fc <名字/序号|all>`);
+      }
+      return;
+    }
+    if (/^(all|全部)$/i.test(arg)) { await performFocus(null, send); return; }
+    let groupName = null;
+    const num = parseInt(arg, 10);
+    if (!isNaN(num) && num >= 1 && num <= groupNames.length) {
+      groupName = groupNames[num - 1];
+    } else {
+      groupName = groupNames.find(g => g.toLowerCase() === arg.toLowerCase())
+        ?? groupNames.find(g => g.toLowerCase().includes(arg.toLowerCase()));
+    }
+    if (!groupName) { await send(`找不到 tmux 会话: "${arg}"\n\n${formatTmuxList(reg)}`); return; }
+    await performFocus(groupName, send);
     return;
   }
 
@@ -1560,24 +1837,10 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     if (newName === oldName) { await send(`已经叫 ${newName} 了`); return; }
     if (reg.sessions[newName]) { await send(`已存在同名 session: ${newName}`); return; }
 
-    const s = reg.sessions[oldName];
-    // Rename the actual tmux window (target-window is session:window, drop .pane).
-    // rename-window also disables automatic-rename for that window, so it sticks.
-    const windowTarget = s.tmux.split('.')[0];
-    try {
-      execFileSync('tmux', ['rename-window', '-t', windowTarget, newName], { stdio: 'ignore' });
-    } catch (err) {
-      logger.error('tmux rename-window failed', { error: err.message, target: windowTarget });
-      // Non-fatal — the registry rename below still makes #ls/#sw use the new name.
-    }
-
-    reg.sessions[newName] = { ...s, pinnedName: newName, lastSeen: Date.now() };
-    delete reg.sessions[oldName];
-    reg.active = newName;
-    writeSessions(reg);
-
-    logger.info(`Session renamed via #rename: ${oldName} → ${newName} [${s.tmux}]`);
-    await send(`✅ 已重命名: ${oldName} → ${newName} [${s.tmux}]`);
+    const tmuxCoords = reg.sessions[oldName].tmux;
+    renameSession(reg, oldName, newName);
+    logger.info(`Session renamed via #rename: ${oldName} → ${newName} [${tmuxCoords}]`);
+    await send(`✅ 已重命名: ${oldName} → ${newName} [${tmuxCoords}]`);
     return;
   }
 
@@ -1637,7 +1900,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     return;
   }
 
-  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换默认路由\n  /rename <新名字> — 重命名\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
+  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号|all> — 聚焦 tmux 会话（删除其他话题）\n  /rename <新名字> — 重命名\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
 }
 
 /**
@@ -1702,6 +1965,19 @@ async function handleCallback(inbound) {
     if (!sess || !readSessions().sessions[sess.name]) { ack('该 session 已不存在'); return; }
     ack(`切换到 ${sess.name}`);
     await performSwitch(sess.name, send);
+    return;
+  }
+
+  // ── fc:<idx|all> — focus a tmux session from the /fc menu ──
+  // (Not sid-scoped: the payload indexes the fcMenu snapshot taken when the
+  // menu was sent; a stale/pre-restart tap lands on the expired ack.)
+  if (verb === 'fc') {
+    if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
+    if (segs[1] === 'all') { ack('显示全部'); await performFocus(null, send); return; }
+    const groupName = fcMenu.names[parseInt(segs[1], 10)];
+    if (!groupName) { ack('无效选项'); return; }
+    ack(`聚焦 ${groupName}`);
+    await performFocus(groupName, send);
     return;
   }
 
@@ -1813,8 +2089,22 @@ async function sendChunkWithRetry(target, text, attempts = 3) {
       return true;
     } catch (err) {
       logger.warn('sendText failed', { attempt: i, error: err.message });
-      // The user deleted this session's topic — rebind and stop retrying here.
-      if (handleTopicSendError(target, err)) return false;
+      // The topic is gone (user deletion / /fc focus purge) — stop retrying the
+      // dead thread and deliver to the General topic instead, tagged with the
+      // session of origin, so the reply is not silently lost.
+      const gone = handleTopicSendError(target, err);
+      if (gone) {
+        const home = transport.homeTarget?.();
+        if (home && home !== target) {
+          try {
+            await transport.sendText(home, `【${gone.name}】\n${text}`);
+            return true;
+          } catch (homeErr) {
+            logger.warn('General-topic fallback send failed', { error: homeErr.message });
+          }
+        }
+        return false;
+      }
       if (i < attempts) { await new Promise(r => setTimeout(r, delay)); delay *= 2; }
     }
   }
@@ -2588,7 +2878,8 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
     '可用指令：\n' +
     '  /ls — 列出所有 session（Claude Code / Codex，含忙碌状态）\n' +
     '  /sw <名字/序号> — 切换默认路由\n' +
-    '  /rename <新名字> — 重命名会话\n' +
+    '  /fc <名字/序号|all> — 聚焦一个 tmux 会话，收起其他话题\n' +
+    '  /rename <新名字> — 重命名会话（TG 里直接改话题名也会同步）\n' +
     '  /model — 切换模型（文字菜单，无需终端交互）\n' +
     '  /esc — 中断当前回合\n\n' +
     '直接发消息即注入对应 session，回复将自动转发；各会话互不阻塞。';
@@ -2598,6 +2889,13 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
 // Operates on the normalised InboundMessage from any transport. The reply
 // destination is the opaque `inbound.target`; the core never inspects it.
 function onInboundMessage(inbound) {
+  // Topic renamed in the Telegram UI — a service event, not a conversation:
+  // handle before the lastTarget bookkeeping so it can't become a reply target.
+  if (inbound.kind === 'topic_edited') {
+    handleTopicRename(inbound).catch(err => logger.error('Topic rename handler error', { error: err.message }));
+    return;
+  }
+
   lastTarget  = inbound.target;
   lastUserKey = inbound.userKey;
   // Persist the reply destination so a restarted daemon can send its reconnect
@@ -2690,6 +2988,7 @@ function onInboundMessage(inbound) {
   let cmdText = text.trim();
   if (/^\/ls\b/i.test(cmdText) || /^\/sessions\b/i.test(cmdText)) cmdText = '#ls';
   else if (/^\/sw(\s|$)/i.test(cmdText)) cmdText = '#sw' + cmdText.slice(3);
+  else if (/^\/fc(\s|$)/i.test(cmdText)) cmdText = '#fc' + cmdText.slice(3);
   else if (/^\/rename(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(7);
   else if (/^\/mv(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(3);
   else if (/^\/model(\s|$)/i.test(cmdText)) cmdText = '#model' + cmdText.slice(6);
@@ -2765,6 +3064,7 @@ function onInboundMessage(inbound) {
 const MENU_COMMANDS = [
   { command: 'ls',     description: '列出所有会话（含忙碌状态）' },
   { command: 'sw',     description: '切换默认路由会话' },
+  { command: 'fc',     description: '聚焦一个 tmux 会话（删除其他话题）' },
   { command: 'model',  description: '切换模型' },
   { command: 'rename', description: '重命名当前会话' },
   { command: 'esc',    description: '中断当前回合' },

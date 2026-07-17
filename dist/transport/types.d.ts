@@ -37,7 +37,7 @@ export interface TransportCapabilities {
      */
     maxMessageLen: number;
 }
-export type InboundKind = 'text' | 'callback' | 'unsupported_media';
+export type InboundKind = 'text' | 'callback' | 'unsupported_media' | 'topic_edited';
 /**
  * Normalised inbound message. Both transports map their native payload onto this
  * shape so the core handles one type.
@@ -58,6 +58,8 @@ export interface InboundMessage {
     userKey: string;
     /** IM message id of this inbound message (Telegram; used for reactions). */
     messageId?: string;
+    /** Present when kind === 'topic_edited': the topic's new display name. */
+    topicName?: string;
 }
 /**
  * One inline-keyboard button: either a callback button (`data`, <= 64 UTF-8
@@ -106,6 +108,8 @@ export interface TopicsApi {
     rename(target: string, name: string): Promise<void>;
     close(target: string): Promise<void>;
     reopen(target: string): Promise<void>;
+    /** Delete the topic and its history (Telegram deleteForumTopic) — irreversible. */
+    remove(target: string): Promise<void>;
     /** Deep link (t.me/c/...) to a topic, when derivable. */
     link(target: string): string | null;
 }

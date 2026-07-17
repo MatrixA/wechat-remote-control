@@ -817,8 +817,12 @@ Optional Step 6*.
 each with its own queue, in-flight turn and status message. In the topics group, each
 topic addresses its own session. In the private chat / WeChat, plain messages go to the
 *default-route* session shown by `/ls`; `/sw` moves only that pointer and never cancels
-another session's in-flight work. IM-side commands: `/ls` (dashboard with busy state),
-`/sw`, `/rename`, `/model`, `/esc` (interrupt), `/bind`, plus the `#`-prefixed aliases.
+another session's in-flight work. IM-side commands: `/ls` (dashboard with busy state,
+grouped by tmux session), `/sw`, `/fc` (focus one tmux session — topics of all other
+sessions are DELETED, history included, and recreated with a context replay on refocus),
+`/rename`, `/model`, `/esc` (interrupt), `/bind`, plus the `#`-prefixed aliases.
+Renaming a topic directly in the Telegram UI also syncs back: the pane's tmux window is
+renamed (pinned against rescans) and illegal characters (`: . tab newline`) become `-`.
 
 ---
 
@@ -834,14 +838,23 @@ For validating a code change to the bridge itself (not a user-facing sub-command
    reactions land on each user message, each reply returns to its own topic.
 5. Tap ⏹ on a running turn's status message → the pane receives Escape.
 6. `/rename` inside a topic → tmux window, registry and the topic itself are renamed.
+   Rename a topic in the Telegram UI (long-press → Edit) → the tmux window follows, a ✅
+   notice appears in the topic, and the 30s rescan does NOT revert it (no rename ping-pong
+   in the log). Renaming to an existing session's name snaps the topic back with a ⚠️.
 7. `kill $(cat ~/.wechat-remote-control/bridge.pid)` mid-turn, relaunch the daemon →
    the in-flight turn is recovered from sessions_state.json (reply arrives or the turn
    is abandoned with ⚠️ after the grace window).
 8. Delete a topic in Telegram → next send recreates it automatically.
 9. Close one pane → its topic is closed within ~60s; reopen a session with the same
    name → the old topic is reopened, not duplicated.
-10. WeChat smoke test: single active session, numbered menus, `#sw` still works, and
-    switching no longer clears the other session's queue.
+10. `/fc` in General → grouped tmux-session menu; tap one → other sessions' topics are
+    deleted (`sessions.json` gains `focusedTmuxSession`, hidden entries lose `imTarget`
+    and gain `topicPurged`), busy sessions keep theirs until the turn ends. New panes in
+    a hidden tmux session get a one-line notice in General instead of a topic. `/fc all`
+    (or focusing back) recreates topics with a 📜 context replay. Kill the focused tmux
+    session entirely → focus auto-clears on the next scan.
+11. WeChat smoke test: single active session, numbered menus, `#sw` still works, `/fc`
+    replies "话题模式未开启", and switching no longer clears the other session's queue.
 
 ---
 

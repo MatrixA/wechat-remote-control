@@ -81,3 +81,28 @@ test('normalizeUpdate falls back to chat id for userKey when no sender', () => {
     const u = { update_id: 7, message: { message_id: 14, chat: privateChat, date: 0, text: 'hi' } };
     assert.strictEqual(normalizeUpdate(u)?.userKey, '42');
 });
+test('normalizeUpdate maps a forum_topic_edited service message to topic_edited', () => {
+    const u = {
+        update_id: 12,
+        message: {
+            message_id: 40, chat: forumChat, from: { id: 7, is_bot: false }, date: 0,
+            message_thread_id: 55, forum_topic_edited: { name: 'mywork' },
+        },
+    };
+    assert.deepStrictEqual(normalizeUpdate(u), {
+        target: '-1001234567890:55', replyToken: '', text: '', kind: 'topic_edited',
+        topicName: 'mywork', userKey: '7', messageId: '40',
+    });
+});
+test('normalizeUpdate drops icon-only and threadless topic edits', () => {
+    // Icon change only — no name to sync.
+    assert.strictEqual(normalizeUpdate({
+        update_id: 13,
+        message: { message_id: 41, chat: forumChat, date: 0, message_thread_id: 55, forum_topic_edited: { icon_custom_emoji_id: 'x' } },
+    }), null);
+    // No thread id — can't map to a topic.
+    assert.strictEqual(normalizeUpdate({
+        update_id: 14,
+        message: { message_id: 42, chat: forumChat, date: 0, forum_topic_edited: { name: 'mywork' } },
+    }), null);
+});

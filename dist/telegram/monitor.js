@@ -54,6 +54,19 @@ export function normalizeUpdate(update) {
     const target = targetOf(msg);
     const userKey = String(msg.from?.id ?? msg.chat.id);
     const messageId = String(msg.message_id);
+    // A topic was renamed in the Telegram UI (service message; also echoed for
+    // the bridge's own editForumTopic calls — the core absorbs those by name).
+    // Icon-only edits carry no name and are irrelevant here. Service messages
+    // don't reliably set is_topic_message, so key off message_thread_id directly.
+    if (msg.forum_topic_edited) {
+        const name = (msg.forum_topic_edited.name ?? '').trim();
+        if (!name || !msg.message_thread_id)
+            return null;
+        return {
+            target: `${msg.chat.id}:${msg.message_thread_id}`,
+            replyToken: '', text: '', kind: 'topic_edited', topicName: name, userKey, messageId,
+        };
+    }
     if (typeof msg.text === 'string' && msg.text.length > 0) {
         return { target, replyToken: '', text: msg.text, kind: 'text', userKey, messageId };
     }
