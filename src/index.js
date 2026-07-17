@@ -872,6 +872,10 @@ function getSessionDisplayName(cwd, windowName, transcriptPath, useCustomTitle =
   return basename(cwd) || cwd;
 }
 
+// One-shot guard so the "auto-focused a tmux session" notice is pushed once per
+// transition into focus, not on every 30s rescan.
+let autoFocusNotified = false;
+
 /**
  * Scan all tmux panes for active CC sessions and update the registry.
  * A pane is considered a CC session if its cwd has a corresponding
@@ -1022,6 +1026,7 @@ function scanTmuxForCC() {
         && !Object.values(reg.sessions).some(s => tmuxSessionOf(s) === reg.focusedTmuxSession)) {
       logger.info('Focused tmux session vanished, clearing focus', { focus: reg.focusedTmuxSession });
       reg.focusedTmuxSession = null;
+      autoFocusNotified = false; // announce the next auto-focus transition
     }
 
     // Pick a default active session if none set.
@@ -1051,6 +1056,31 @@ function scanTmuxForCC() {
 
       const chosen = preferred || Object.keys(reg.sessions)[0];
       if (chosen) { reg.active = chosen; logger.info(`Active session defaulted to: ${chosen}`); }
+    }
+
+    // Focus is sticky (there is no "unfocus"): whenever more than one tmux
+    // session is live but none is focused — a fresh start, or right after the
+    // previously focused session vanished (cleared just above) — auto-focus the
+    // default-route session's group so we never spread every session's topics
+    // across the group at once. One tmux session ⇒ nothing to collapse, leave
+    // focus off.
+    if (transport?.caps.topics && !effectiveFocus(reg)) {
+      const groups = new Set(Object.values(reg.sessions).map(s => tmuxSessionOf(s)));
+      if (groups.size > 1) {
+        const activeEntry = reg.active ? reg.sessions[reg.active] : null;
+        const target = activeEntry ? tmuxSessionOf(activeEntry) : [...groups][0];
+        reg.focusedTmuxSession = target;
+        logger.info('Auto-focused tmux session (multi-session, none focused)', { focus: target });
+        if (!autoFocusNotified) {
+          autoFocusNotified = true;
+          const home = transport.homeTarget?.();
+          if (home) {
+            transport.sendText(home,
+              `🎯 检测到多个 tmux 会话，已自动聚焦 ${target}（其余 tmux 会话的话题已隐藏）。用 /fc 切换。`,
+            ).catch(() => {});
+          }
+        }
+      }
     }
 
     writeSessions(reg);
@@ -1293,27 +1323,32 @@ function formatSessionList(reg) {
   if (names.length === 0) return '暂无发现活跃的 CC session\n（等待自动扫描，约30秒）';
   const home = homedir();
   const focus = effectiveFocus(reg);
-  // Group headers only earn their lines when there is more than one tmux session.
-  const showGroups = new Set(names.map(n => tmuxSessionOf(reg.sessions[n]))).size > 1;
+  const topics = !!transport?.caps.topics;
+  // Always render as a tree: tmux session headers with their cc/codex sessions
+  // indented beneath, rather than one flat spread.
   const lines = ['📋 Sessions:'];
   let lastGroup = null;
   names.forEach((name, i) => {
     const s = reg.sessions[name];
     const group = tmuxSessionOf(s);
-    if (showGroups && group !== lastGroup) {
+    if (group !== lastGroup) {
       lastGroup = group;
-      lines.push(`▼ tmux: ${group}${group === focus ? ' 🎯' : ''}`);
+      const mark = group === focus ? ' 🎯' : '';
+      // Only the topics transport hides out-of-focus groups; WeChat has no topics.
+      const hidden = topics && focus && group !== focus ? '（话题已隐藏）' : '';
+      lines.push(`▸ tmux: ${group}${mark}${hidden}`);
     }
     const sess = getStateFor(name, s);
     const busy = (sess.busy || sess.lastInjectedText) ? '🔵' : '⚪';
     const marker = name === reg.active ? '▶' : '○';
     const shortPath = s.cwd.replace(home, '~');
     const queued = sess.pendingQueue.length ? ` · 排队 ${sess.pendingQueue.length}` : '';
-    lines.push(`${marker} ${i + 1}. ${busy} ${name} (${sessionKind(s)})${queued}\n   ${shortPath}`);
+    lines.push(`   ${marker} ${i + 1}. ${busy} ${name} (${sessionKind(s)})${queued}`);
+    lines.push(`      ${shortPath}`);
   });
   lines.push(`\n默认路由: ${reg.active || '无'}`);
-  if (focus) lines.push(`🎯 聚焦: ${focus}（其他 tmux 会话的话题已删除，/fc all 恢复）`);
-  if (transport?.caps.topics) lines.push('每个会话有独立话题，进入话题即可对话');
+  if (focus) lines.push(`🎯 聚焦: ${focus}（其他 tmux 会话的话题已隐藏，用 /fc 切换）`);
+  if (topics) lines.push('每个会话有独立话题，进入话题即可对话');
   lines.push('切换默认: /sw <名字/序号>；改名: /rename <新名字>；聚焦: /fc');
   return lines.join('\n');
 }
@@ -1565,6 +1600,10 @@ async function performSwitch(targetName, send) {
 // Deleted topics are recreated with a context replay on refocus. Focus filters
 // topic visibility ONLY — the default route (#sw) and in-flight turns are
 // untouched.
+// Focus is STICKY: /fc only switches which session is focused, there is no
+// "unfocus"/"show all" (spreading every session's topics at once is the bad UX
+// this feature exists to avoid). The scanner auto-focuses the default-route
+// session's group whenever >1 session is live and none is focused.
 let fcMenu = null; // { names: string[], expires: number } — snapshot behind fc:<idx> callbacks
 const FC_MENU_TTL = 5 * 60 * 1000;
 
@@ -1595,40 +1634,70 @@ function formatTmuxList(reg) {
     lines.push(`${mark} ${i}. ${g} — ${members.length} 个会话${busyCount ? `（${busyCount} 忙碌）` : ''}`);
     lines.push(`   ${members.join(', ')}`);
   }
-  lines.push(focus ? `\n当前聚焦: ${focus}（/fc all 显示全部）` : '\n当前未聚焦：所有会话都有话题');
+  lines.push(focus ? `\n当前聚焦: ${focus}（点选其它可切换）` : '\n当前未聚焦：将自动聚焦默认会话所在的 tmux');
   return lines.join('\n');
 }
 
 function tmuxButtons(names, focus) {
-  const rows = names.map((g, i) => [{ label: `${g === focus ? '🎯 ' : ''}${i + 1}. ${g}`, data: `fc:${i}` }]);
-  rows.push([{ label: '📖 全部显示（取消聚焦）', data: 'fc:all' }]);
-  return rows;
+  return names.map((g, i) => [{ label: `${g === focus ? '🎯 ' : ''}${i + 1}. ${g}`, data: `fc:${i}` }]);
 }
 
 /**
- * Set (or clear, groupName=null) the focused tmux session and kick a topic
- * sync. Shared by the #fc command and the fc:<idx> button callback. The reply
- * goes out before the sync — deleting/recreating many topics can take a while
- * and busy sessions defer their deletion to a later sync anyway.
+ * Probe every existing topic in the focused group and unbind any the user
+ * deleted in Telegram (there is no "topic deleted" update, so a stale imTarget
+ * otherwise lingers and planTopicSync never recreates the tab). reopen() is the
+ * probe: it fails with "thread not found"/TOPIC_DELETED for a dead thread, and
+ * for a live one it's a no-op (an open topic just returns TOPIC_NOT_MODIFIED,
+ * a closed one is reopened — which is what a focused topic should be anyway).
+ * Runs only on user-initiated /fc, so the handful of extra API calls is fine.
+ */
+async function repairFocusedTopics(groupName) {
+  if (!transport?.topics || !transport.caps.topics) return;
+  const reg = readSessions();
+  const members = tmuxGroups(reg).get(groupName) || [];
+  let changed = false;
+  for (const name of members) {
+    const s = reg.sessions[name];
+    if (!s?.imTarget) continue;
+    try {
+      await transport.topics.reopen(s.imTarget);
+    } catch (err) {
+      const m = err?.message || String(err);
+      if (!/thread not found|TOPIC_DELETED/i.test(m)) continue; // live topic / transient
+      delete s.imTarget;
+      delete s.topicName;
+      s.topicPurged = true; // recreated tab replays recent context
+      changed = true;
+      logger.info('Focus repair: topic gone, will recreate', { name });
+    }
+  }
+  if (changed) writeSessions(reg);
+}
+
+/**
+ * Switch the focused tmux session and kick a topic sync. Shared by the #fc
+ * command and the fc:<idx> button callback. Focus is sticky — groupName is
+ * always a real group (there is no unfocus). The reply goes out before the sync
+ * — deleting/recreating many topics can take a while and busy sessions defer
+ * their deletion to a later sync anyway.
  */
 async function performFocus(groupName, send) {
   const reg = readSessions();
-  reg.focusedTmuxSession = groupName || null;
+  reg.focusedTmuxSession = groupName;
   writeSessions(reg);
-  if (!groupName) {
-    await send('📖 已取消聚焦：将为所有会话恢复话题（重建的话题会回放最近上下文）。');
-  } else {
-    const members = new Set(tmuxGroups(reg).get(groupName) || []);
-    // Count only topics that actually exist and will be deleted.
-    const toRemove = Object.entries(reg.sessions)
-      .filter(([n, s]) => !members.has(n) && s.imTarget).length;
-    await send(
-      `🎯 已聚焦 tmux 会话 ${groupName}：${members.size} 个会话保留/新建话题`
-      + (toRemove > 0 ? `，其余 ${toRemove} 个话题将被删除（历史随之删除，切回时重建并回放上下文）` : '')
-      + `。\n默认路由不变: ${reg.active || '无'}\n/fc all 恢复全部`);
-  }
+  const members = new Set(tmuxGroups(reg).get(groupName) || []);
+  // Count only topics that actually exist and will be deleted.
+  const toRemove = Object.entries(reg.sessions)
+    .filter(([n, s]) => !members.has(n) && s.imTarget).length;
+  await send(
+    `🎯 已聚焦 tmux 会话 ${groupName}：${members.size} 个会话保留/新建话题`
+    + (toRemove > 0 ? `，其余 ${toRemove} 个话题将被删除（历史随之删除，切回时重建并回放上下文）` : '')
+    + `。\n默认路由不变: ${reg.active || '无'}\n用 /fc 切换其它 tmux 会话`);
+  // Recreate any tab the user manually deleted in the (re)focused group before
+  // the sync runs, so re-selecting the current focus brings deleted tabs back.
+  await repairFocusedTopics(groupName);
   syncSessionTopics().catch(() => {});
-  logger.info('Focus switched', { focus: groupName || null });
+  logger.info('Focus switched', { focus: groupName });
 }
 
 /**
@@ -1787,7 +1856,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     return;
   }
 
-  // #fc [name|number|all] — focus one tmux session (see the /fc block above).
+  // #fc [name|number] — focus one tmux session (see the /fc block above).
   if (cmd === '#fc') {
     if (!transport.caps.topics) {
       await send('话题模式未开启（先在开启「话题」的超级群里 /bind），/fc 无效');
@@ -1803,11 +1872,10 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
         await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
           .catch(err => logger.error('Focus menu push failed', { error: err.message }));
       } else {
-        await send(`${list}\n\n用法: /fc <名字/序号|all>`);
+        await send(`${list}\n\n用法: /fc <名字/序号>`);
       }
       return;
     }
-    if (/^(all|全部)$/i.test(arg)) { await performFocus(null, send); return; }
     let groupName = null;
     const num = parseInt(arg, 10);
     if (!isNaN(num) && num >= 1 && num <= groupNames.length) {
@@ -1968,12 +2036,11 @@ async function handleCallback(inbound) {
     return;
   }
 
-  // ── fc:<idx|all> — focus a tmux session from the /fc menu ──
+  // ── fc:<idx> — focus a tmux session from the /fc menu ──
   // (Not sid-scoped: the payload indexes the fcMenu snapshot taken when the
   // menu was sent; a stale/pre-restart tap lands on the expired ack.)
   if (verb === 'fc') {
     if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
-    if (segs[1] === 'all') { ack('显示全部'); await performFocus(null, send); return; }
     const groupName = fcMenu.names[parseInt(segs[1], 10)];
     if (!groupName) { ack('无效选项'); return; }
     ack(`聚焦 ${groupName}`);

@@ -850,9 +850,11 @@ For validating a code change to the bridge itself (not a user-facing sub-command
 10. `/fc` in General → grouped tmux-session menu; tap one → other sessions' topics are
     deleted (`sessions.json` gains `focusedTmuxSession`, hidden entries lose `imTarget`
     and gain `topicPurged`), busy sessions keep theirs until the turn ends. New panes in
-    a hidden tmux session get a one-line notice in General instead of a topic. `/fc all`
-    (or focusing back) recreates topics with a 📜 context replay. Kill the focused tmux
-    session entirely → focus auto-clears on the next scan.
+    a hidden tmux session get a one-line notice in General instead of a topic. Focus is
+    sticky — there is no "show all"; switching to another group (or re-selecting the
+    current one after manually deleting a topic) recreates topics with a 📜 context
+    replay. With >1 tmux session and none focused (fresh start, or after the focused
+    session is killed) the next scan auto-focuses the default-route session's group.
 11. WeChat smoke test: single active session, numbered menus, `#sw` still works, `/fc`
     replies "话题模式未开启", and switching no longer clears the other session's queue.
 
