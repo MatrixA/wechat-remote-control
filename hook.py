@@ -14,6 +14,9 @@ def main():
         payload = {}
 
     payload["_hookType"] = event_type
+    # Self-report which tmux pane this agent lives in (inherited env; empty when
+    # not under tmux). The bridge routes hook events to the right session by it.
+    payload["_tmuxPane"] = os.environ.get("TMUX_PANE", "")
 
     # Connect to bridge socket
     if not os.path.exists(SOCK_PATH):

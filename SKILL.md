@@ -6,9 +6,11 @@ description: |
   transport is selected by --telegram / --wechat (default: WeChat). Sub-commands:
   - login:  Authenticate the chosen IM. WeChat = scan a QR code; Telegram = paste
             a BotFather token, then /start the bot. Run once before first use.
-  - attach: Register this Claude Code / Codex session as the remote target.
+  - attach: Register this Claude Code / Codex session as a remote target.
             Bridge daemon starts in background; it watches the session transcript
-            and forwards assistant output to the IM.
+            and forwards assistant output to the IM. All discovered tmux sessions
+            run CONCURRENTLY; on Telegram, /bind a Topics supergroup to give every
+            session its own forum topic (channel-per-session).
   - sync:   Show conversation history since last attach, for context.
   - uninstall: Remove every trace attach left behind (agent hooks, Claude status
             line, bridge daemon, socket, runtime state); login credentials are
@@ -45,32 +47,56 @@ Never ask the user to copy-paste and run commands themselves — handle everythi
 
 The bridge uses a **tmux-injection** model, bundled in this skill directory. It drives two
 coding agents — **Claude Code** (`claude`) and **OpenAI Codex CLI** (`codex`) — auto-detecting
-which one runs in each tmux pane via process ancestry. The multi-session registry records a
-`kind` per session, so claude and codex sessions can coexist and be switched with `#sw`.
+which one runs in each tmux pane via process ancestry.
 
-- **Bridge daemon** (`node src/index.js`): polls ilink WeChat API for messages, injects
-  them into the user's tmux-hosted agent session via `tmux send-keys`.
+**Concurrent multi-session model.** Every discovered tmux session owns an independent
+runtime state (message queue, in-flight turn, quiz, live status message, orphan polls),
+so multiple sessions work **at the same time** — messaging session B while session A is
+mid-turn just works, and each response returns to the conversation that asked for it.
+Hook events route to the right session by the tmux pane id that `hook.py` self-reports
+(the `TMUX_PANE` env var, recorded as `paneId` in the registry). `#sw` only moves the
+*default-route* pointer for private-chat/WeChat messages — it never cancels or clears
+any session's in-flight work.
+
+**Telegram Forum Topics mode (best experience).** Bind a Topics-enabled supergroup with
+`/bind` (bot must be an admin with *Manage Topics*): every session automatically gets
+its own forum topic — like a Slack channel per session. Messages typed inside a topic go
+to that session; its replies, status updates and quizzes stay in the topic. The group's
+General topic and the private chat keep working as the "lobby" (global commands,
+`/ls` dashboard, default-route messages).
+
+- **Bridge daemon** (`node src/index.js`): polls the IM (WeChat ilink API / Telegram Bot
+  API) for messages, injects them into the addressed tmux-hosted agent session via
+  `tmux send-keys` (targets the stable pane id).
 - **Hook server**: listens on Unix socket `/tmp/cc_wechat_hook.sock`. Agent hooks send events
-  here via `hook.py`. Claude Code fires PreToolUse / Stop / Notification; Codex fires
-  PreToolUse / Stop / UserPromptSubmit (Codex has no Notification event).
-- **Response forwarding**: on Stop, the bridge forwards the assistant response to the WeChat
-  message it injected. For Claude it parses the transcript JSONL; for Codex it uses the Stop
-  payload's `last_assistant_message`, gated on the rollout's latest user message matching what
-  was injected. Terminal-initiated responses are NOT forwarded.
+  here via `hook.py` (each payload carries `_tmuxPane` for session routing). Claude Code fires
+  PreToolUse / Stop / Notification; Codex fires PreToolUse / Stop / UserPromptSubmit (Codex
+  has no Notification event).
+- **Response forwarding**: on Stop, the bridge forwards the assistant response to the IM
+  conversation it injected from. For Claude it parses the transcript JSONL; for Codex it uses
+  the Stop payload's `last_assistant_message`, gated on the rollout's latest user message
+  matching what was injected. Terminal-initiated responses are NOT forwarded.
+- **Telegram UX**: per-turn live status message edited in place (elapsed time, current tool,
+  ⏹ interrupt button), 👀/👍/💔 reactions on the user's message (received / answered /
+  abandoned), long replies collapse into expandable quotes, very long replies (>8k chars)
+  arrive as a Markdown file, native bot command menu (/ls /sw /model /rename /esc /bind).
 - **Auto-approve**: PreToolUse returns `permissionDecision: "allow"` (plus the legacy
   `decision: "approve"`). Both agents honor this — Codex honors `permissionDecision` and
   ignores `decision`, so one payload works for both.
 - **All state lives in one directory**: `~/.wechat-remote-control/`
   - `accounts/<accountId>.json` — WeChat credentials
-  - `telegram/account.json` — Telegram bot token + locked `allowedChatId`;
-    `telegram/offset.json` — Telegram long-poll cursor (Telegram transport only)
+  - `telegram/account.json` — Telegram bot token + locked `allowedChatId` + bound
+    `groupChatId` (topics group); `telegram/offset.json` — Telegram long-poll cursor
   - `state.json` — tmux target, autoApprove, transcriptPath (legacy single-session)
-  - `sessions.json` — multi-session registry (active session + per-tmux-target metadata)
-  - `ilink_session.json` — ilink long-poll session cache
+  - `sessions.json` — multi-session registry (`active` default-route pointer +
+    per-session `tmux`/`paneId`/`cwd`/`transcriptPath`/`kind`/`imTarget` (topic) +
+    `closedTopics` tombstones for reopening a pruned session's topic)
+  - `sessions_state.json` — per-session in-flight turns (crash-recovery)
+  - `ilink_session.json` — last reply target/user (ilink long-poll session cache)
   - `get_updates_buf` — ilink sync buffer cursor
   - `bridge.json` / `bridge.pid` / `cc_pid` — daemon metadata
   - `logs/bridge-YYYY-MM-DD.log` — rotated logs (30-day retention)
-  - `history.jsonl` — injected messages and forwarded responses
+  - `history.jsonl` — injected messages and forwarded responses, tagged per session
 
 **Critical: process kill safety.** Do NOT use `pgrep -f` or `grep` with bridge path strings
 in the same bash command that does other work. Claude Code wraps commands in `bash -c "..."`,
@@ -350,6 +376,24 @@ cat ~/.wechat-remote-control/telegram/account.json 2>/dev/null | grep -o '"allow
 If present, confirm success and tell the user to run **attach** (with Telegram). If `NOT_LOCKED`,
 re-run Step 4.
 
+### Optional Step 6: Bind a Topics group (best multi-session experience)
+
+With a topics group bound, **every tmux session gets its own forum topic** — an isolated
+channel with its own history, status messages and quiz buttons; sessions can be driven
+concurrently without any switching. Tell the user how to set it up (this happens in the
+Telegram app, not the terminal):
+
+1. Create a new Telegram **group**, then in group settings enable **Topics**
+   (群设置 → 话题). This silently upgrades it to a supergroup.
+2. Add the bot to the group and promote it to **admin** with the **Manage Topics**
+   permission (管理话题). Admin status also lets the bot read all topic messages.
+3. Send `/bind` in the group (any topic). The bridge verifies the group is
+   forum-enabled, saves it, and creates one topic per discovered session within ~30s.
+
+No re-login or re-attach is needed — `/bind` works any time the bridge daemon is running.
+The private chat keeps working as a fallback (messages there go to the default-route
+session; `/ls` shows a dashboard with deep links into each topic).
+
 ---
 
 ## attach — Register this session as WeChat remote target
@@ -499,20 +543,24 @@ json.dump({
 # cc_pid file (used by status.sh)
 open(os.path.join(d, 'cc_pid'), 'w').write(str(info['cc_pid']))
 
-# sessions.json — match by tmux target; create entry if new; set active directly.
-# Never set active=None — the bridge's auto-pick heuristic can pick the wrong CC
-# when multiple sessions share a cwd.
+# sessions.json — match by stable pane id (fallback: tmux coordinates); create entry
+# if new; set active directly. Never set active=None — the bridge's auto-pick heuristic
+# can pick the wrong CC when multiple sessions share a cwd.
 sp = os.path.join(d, 'sessions.json')
 sessions = json.load(open(sp)) if os.path.exists(sp) else {'active': None, 'sessions': {}}
 sessions.setdefault('sessions', {})
 
 kind = info.get('agent', 'claude')
+pane_id = info.get('tmux_pane_id') or ''
 matched = None
 for name, s in sessions['sessions'].items():
-    if s.get('tmux') == target:
+    if (pane_id and s.get('paneId') == pane_id) or s.get('tmux') == target:
         matched = name
+        s['tmux'] = target
         s['transcriptPath'] = info.get('transcript')
         s['kind'] = kind
+        if pane_id:
+            s['paneId'] = pane_id
         s['lastSeen'] = int(time.time() * 1000)
         break
 
@@ -529,12 +577,15 @@ if not matched:
     suffix = 2
     while matched in sessions['sessions']:
         matched = f'{base}-{suffix}'; suffix += 1
-    sessions['sessions'][matched] = {
+    entry = {
         'tmux': target, 'cwd': info['cwd'],
         'transcriptPath': info.get('transcript'),
         'kind': kind,
         'lastSeen': int(time.time() * 1000),
     }
+    if pane_id:
+        entry['paneId'] = pane_id
+    sessions['sessions'][matched] = entry
 
 sessions['active'] = matched
 json.dump(sessions, open(sp, 'w'), indent=2)
@@ -756,11 +807,50 @@ Terminal-initiated responses are NOT forwarded to the IM.
 For Claude, a status-line indicator shows bridge state in the terminal; Codex has no
 status line, so that indicator is Claude-only.
 
+If the transport is Telegram and no topics group is bound yet
+(`grep -o '"groupChatId"' ~/.wechat-remote-control/telegram/account.json` is empty),
+also mention: creating a Topics-enabled supergroup, adding the bot as admin (Manage
+Topics) and sending `/bind` gives every session its own channel — see *login (Telegram)
+Optional Step 6*.
+
+**Multi-session semantics.** All sessions the bridge discovers run **concurrently** —
+each with its own queue, in-flight turn and status message. In the topics group, each
+topic addresses its own session. In the private chat / WeChat, plain messages go to the
+*default-route* session shown by `/ls`; `/sw` moves only that pointer and never cancels
+another session's in-flight work. IM-side commands: `/ls` (dashboard with busy state),
+`/sw`, `/rename`, `/model`, `/esc` (interrupt), `/bind`, plus the `#`-prefixed aliases.
+
 ---
 
-## sync — Show WeChat conversation history
+## verify — Manual end-to-end checklist (multi-session + Topics)
+
+For validating a code change to the bridge itself (not a user-facing sub-command):
+
+1. Two tmux panes, one running `claude`, one running `codex`; attach from each once.
+2. Telegram: create a Topics supergroup, add the bot as admin (Manage Topics), `/bind`.
+3. Confirm two topics appear within ~30s, each with a 🆕 intro message.
+4. Send a long-running prompt in topic A, then immediately a prompt in topic B: both
+   inject (independent queues), two status messages update independently, 👀 → 👍
+   reactions land on each user message, each reply returns to its own topic.
+5. Tap ⏹ on a running turn's status message → the pane receives Escape.
+6. `/rename` inside a topic → tmux window, registry and the topic itself are renamed.
+7. `kill $(cat ~/.wechat-remote-control/bridge.pid)` mid-turn, relaunch the daemon →
+   the in-flight turn is recovered from sessions_state.json (reply arrives or the turn
+   is abandoned with ⚠️ after the grace window).
+8. Delete a topic in Telegram → next send recreates it automatically.
+9. Close one pane → its topic is closed within ~60s; reopen a session with the same
+   name → the old topic is reopened, not duplicated.
+10. WeChat smoke test: single active session, numbered menus, `#sw` still works, and
+    switching no longer clears the other session's queue.
+
+---
+
+## sync — Show conversation history
 
 ### Step 1: Format and show history
+
+History entries are tagged per session; pass an optional session-name argument to filter
+(substring match), e.g. `format_history.py miami-v2`.
 
 ```bash
 # Resolve the install dir dynamically (Claude: ~/.claude/skills; Codex: ~/.agents/skills).
@@ -768,7 +858,7 @@ status line, so that indicator is Claude-only.
 SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name format_history.py 2>/dev/null \
   | grep "wechat-remote-control/format_history.py" | head -1 | sed 's|/format_history.py||')
 python3 "$SKILL_DIR/format_history.py" 2>/dev/null \
-  || (tail -20 ~/.wechat-remote-control/history.jsonl 2>/dev/null || echo "No WeChat history found.")
+  || (tail -20 ~/.wechat-remote-control/history.jsonl 2>/dev/null || echo "No history found.")
 ```
 
 If no history exists, check the bridge logs:
@@ -789,9 +879,11 @@ Reverses everything **attach** installed, so Claude Code / Codex go back to thei
 behaviour. This is a single global cleanup — it does not distinguish between sessions; it
 removes the shared hooks, status line, daemon, socket and runtime state outright.
 
-**Kept on purpose:** login credentials (`accounts/`, `telegram/`), `history.jsonl`, and
-`logs/`. A future **attach** therefore needs no re-login. (To wipe those too, the user can
-`rm -rf ~/.wechat-remote-control` afterwards — mention this at the end.)
+**Kept on purpose:** login credentials (`accounts/`, `telegram/` — including the bound
+topics group), `history.jsonl`, and `logs/`. A future **attach** therefore needs no
+re-login or re-bind. Forum topics created in the Telegram group are left in place with
+their history — the group is the user's, not runtime state. (To wipe local state too, the
+user can `rm -rf ~/.wechat-remote-control` afterwards — mention this at the end.)
 
 > Note on no-op hooks: even before uninstall, the hooks attach registers are harmless when
 > no daemon is running — `hook.py` exits 0 immediately if the socket is absent. uninstall
@@ -895,7 +987,7 @@ sleep 1
 D="$HOME/.wechat-remote-control"
 rm -f /tmp/cc_wechat_hook.sock \
       "$D/bridge.pid" "$D/cc_pid" "$D/bridge.json" \
-      "$D/state.json" "$D/sessions.json"
+      "$D/state.json" "$D/sessions.json" "$D/sessions_state.json"
 echo "runtime state cleared (accounts/ and history.jsonl kept)"
 ```
 

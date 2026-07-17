@@ -4,16 +4,21 @@
  * Mirrors src/wechat/monitor.ts: a getUpdates() loop with backoff, a defensive
  * floor between iterations, and offset persistence. Two Telegram-specific
  * concerns: (1) the update offset is advanced and persisted BEFORE processing so
- * a crash never replays a handled update; (2) the single-chat authorization lock
- * is enforced here — the first chat to message an unbound bot is captured and
- * locked, and every other chat is dropped.
+ * a crash never replays a handled update; (2) the chat authorization lock is
+ * enforced here — the first chat to message an unbound bot is captured and
+ * locked; thereafter only that chat, the bound topics group, and the owner
+ * themself pass (see auth.isChatAllowed).
+ *
+ * Forum topics: a message inside a topic carries message_thread_id +
+ * is_topic_message; its reply target is encoded as "<chatId>:<threadId>" so the
+ * bridge can route by topic without ever parsing the target itself.
  */
 import { TelegramApi } from './api.js';
 import { saveOffset, loadOffset, saveAllowedChat, isChatAllowed } from './auth.js';
 import type { TelegramAccount } from './auth.js';
 import { logger } from '../logger.js';
 import type { InboundMessage } from '../transport/types.js';
-import type { TgUpdate } from './types.js';
+import type { TgUpdate, TgMessage } from './types.js';
 
 const BACKOFF_THRESHOLD = 3;
 const BACKOFF_LONG_MS = 30_000;
@@ -32,21 +37,29 @@ const LONG_POLL_TIMEOUT_S = (() => {
   return Number.isFinite(v) && v >= 0 ? v : 0;
 })();
 
-function mediaNoteFor(msg: NonNullable<TgUpdate['message']>): string | null {
+function mediaNoteFor(msg: TgMessage): string | null {
   if (msg.voice || msg.audio) return '⚠️ 暂不支持语音消息，请发送文字';
   if (msg.photo) return '⚠️ 暂不支持图片消息，请发送文字';
   if (msg.video || msg.document || msg.sticker) return '⚠️ 暂不支持该类型消息，请发送文字';
   return null;
 }
 
+/** Encode a message's reply destination: plain chat, or "<chatId>:<threadId>" inside a topic. */
+function targetOf(msg: TgMessage): string {
+  if (msg.is_topic_message && msg.message_thread_id) {
+    return `${msg.chat.id}:${msg.message_thread_id}`;
+  }
+  return String(msg.chat.id);
+}
+
 /** Normalise a Telegram Update into the shared inbound shape (pure). */
 export function normalizeUpdate(update: TgUpdate): InboundMessage | null {
   const cq = update.callback_query;
   if (cq) {
-    const chat = cq.message?.chat;
-    if (!chat) return null; // can't route a reply without a chat
+    const msg = cq.message;
+    if (!msg) return null; // can't route a reply without a chat
     return {
-      target: String(chat.id),
+      target: targetOf(msg),
       replyToken: cq.id,
       text: '',
       kind: 'callback',
@@ -57,18 +70,25 @@ export function normalizeUpdate(update: TgUpdate): InboundMessage | null {
 
   const msg = update.message;
   if (!msg) return null;
-  const target = String(msg.chat.id);
+  const target = targetOf(msg);
   const userKey = String(msg.from?.id ?? msg.chat.id);
+  const messageId = String(msg.message_id);
 
   if (typeof msg.text === 'string' && msg.text.length > 0) {
-    return { target, replyToken: '', text: msg.text, kind: 'text', userKey };
+    return { target, replyToken: '', text: msg.text, kind: 'text', userKey, messageId };
   }
 
   const note = mediaNoteFor(msg);
   if (note) {
-    return { target, replyToken: '', text: '', kind: 'unsupported_media', mediaNote: note, userKey };
+    return { target, replyToken: '', text: '', kind: 'unsupported_media', mediaNote: note, userKey, messageId };
   }
   return null; // service message / unhandled
+}
+
+/** The plain chat id an update came from (authorization is chat-level, not thread-level). */
+function chatIdOf(update: TgUpdate): string | null {
+  const chat = update.message?.chat ?? update.callback_query?.message?.chat;
+  return chat ? String(chat.id) : null;
 }
 
 /** Username best-effort, for capturing the locked chat. */
@@ -108,16 +128,23 @@ export function createTelegramMonitor(
           const inbound = normalizeUpdate(u);
           if (!inbound) continue;
 
-          // ── Single-chat authorization lock ──
-          if (!isChatAllowed(account, inbound.target)) {
-            logger.warn('Dropping message from unauthorized chat', { chatId: inbound.target });
+          // ── Chat authorization lock ──
+          const chatId = chatIdOf(u) ?? inbound.target;
+          if (!isChatAllowed(account, chatId, inbound.userKey)) {
+            logger.warn('Dropping message from unauthorized chat', { chatId });
             continue;
           }
-          if (!account.allowedChatId) {
-            account.allowedChatId = inbound.target;
+          // Capture-lock only a PRIVATE chat: locking a group id would block the
+          // owner's own DM forever (the owner exception compares fromUserId to
+          // allowedChatId, which equals the user id only for private chats).
+          // A group that messages an unbound bot passes through un-captured, so
+          // the /bind-before-first-DM order still works.
+          const chatType = (u.message?.chat ?? u.callback_query?.message?.chat)?.type;
+          if (!account.allowedChatId && chatType === 'private') {
+            account.allowedChatId = chatId;
             account.allowedUsername = usernameOf(u);
-            saveAllowedChat(inbound.target, account.allowedUsername);
-            logger.info('Telegram locked to chat', { chatId: inbound.target, username: account.allowedUsername });
+            saveAllowedChat(chatId, account.allowedUsername);
+            logger.info('Telegram locked to chat', { chatId, username: account.allowedUsername });
           }
 
           try { onMessage(inbound); }

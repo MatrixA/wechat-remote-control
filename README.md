@@ -53,22 +53,42 @@
 
 ---
 
-## 也支持 Telegram
+## 多会话完全并发
 
-同一套机制（tmux 注入、hook 转发、多 session、自动放行）现在可以接入 **Telegram bot**——IM 层已抽象成
+桥接会自动发现 tmux 里**所有**正在跑 claude / codex 的面板，每个会话有独立的消息队列、
+独立的进行中回合、独立的状态提示——A 会话跑长任务时照样可以指挥 B 会话，各自的回复回到
+各自的对话里，互不阻塞。hook 事件按 `TMUX_PANE`（面板 id）权威路由，同目录多会话也不会串。
+`/sw` 只移动私聊消息的「默认路由」指针，不会打断任何会话的进行中工作。
+
+---
+
+## Telegram 深度支持（推荐）
+
+同一套机制（tmux 注入、hook 转发、多 session、自动放行）可以接入 **Telegram bot**——IM 层已抽象成
 `Transport` 接口（`src/transport/`），微信和 Telegram 各是一个 adapter，核心代码只面对一个不透明的回复 `target`。
 
 - **登录**：`/wechat-remote-control login --telegram` —— 在 **@BotFather** 创建 bot、拿到 token 粘贴给我，
   再在 Telegram 里给 bot 发 `/start`。第一个跟 bot 说话的会话会被**锁定**为唯一授权会话（其他人发消息一律忽略；
   bot token 等同于终端控制权，请妥善保管）。
+- **话题模式（Forum Topics，体验最佳）**：建一个开启「话题」的超级群，把 bot 加为管理员
+  （勾选「管理话题」），在群里发 `/bind` —— 之后**每个 tmux 会话自动获得一个专属话题**，
+  像 Slack 频道一样隔离：在话题里发消息就发到对应会话，回复、状态、问卷都留在话题里；
+  会话改名话题跟着改名，会话关掉话题自动归档、同名会话回来自动复用。General 话题和私聊
+  继续作为「大厅」：`/ls` 仪表盘（带忙碌状态和话题深链）、全局命令、默认路由消息。
 - **启动**：`attach` 时守护进程按 `WCC_TRANSPORT` 环境变量 > `--telegram/--wechat` > 已有凭据 自动选择 IM。
 - **充分利用 Telegram 原生能力**（微信不支持的能力自动回退到文字菜单）：
-  - 原生命令菜单（`setMyCommands`）：`/ls` `/sw` `/model`
+  - 原生命令菜单（`setMyCommands`）：`/ls` `/sw` `/model` `/rename` `/esc` `/bind` `/help`
+  - **实时回合状态**：每个回合一条实时编辑的状态消息——耗时、已调用工具数、最近工具名，
+    附 **⏹ 中断按钮**（点一下向对应面板发 Escape）
+  - **消息回应（reactions）**：你的消息注入后打 👀，回复送达打 👍，超时放弃打 💔——一眼看懂进展
   - `/model`、`/sw` 用**内联键盘**点选切换；`AskUserQuestion` 问卷渲染成**选项按钮**（多选可勾选后「完成」）
-  - 长任务进度用**编辑同一条消息**的方式刷新「🔧 处理中…」，不再刷屏
-  - 打字状态用 `sendChatAction`；输出按 Markdown 渲染（代码块、粗体、链接、标题），按 4096 上限分片
-- **数据目录**：Telegram 凭据存在 `~/.wechat-remote-control/telegram/account.json`（含锁定的 chat id），
-  长轮询游标存 `telegram/offset.json`；微信文件原样不动，完全向后兼容。
+  - **长回复不刷屏**：中长回复自动折叠进「展开引用」，超过 8000 字符直接发成 Markdown **文件**
+  - 打字状态用 `sendChatAction`（每个话题独立）；输出按 Markdown 渲染（代码块、粗体、链接、标题）；
+    遇到限流自动按 `retry_after` 退避
+- **数据目录**：Telegram 凭据存在 `~/.wechat-remote-control/telegram/account.json`（含锁定的 chat id 与
+  绑定的话题群 id），长轮询游标存 `telegram/offset.json`；微信文件原样不动，完全向后兼容。
+
+微信侧保持可用但降级：单活跃会话 + 数字文字菜单，行为与之前一致。
 
 ---
 
