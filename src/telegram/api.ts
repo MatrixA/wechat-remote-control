@@ -166,6 +166,11 @@ export class TelegramApi {
     return this.request('reopenForumTopic', { chat_id: chatId, message_thread_id: threadId }, 10_000);
   }
 
+  /** Deletes the topic AND its message history — the thread id is dead afterwards. */
+  deleteForumTopic(chatId: string, threadId: number): Promise<unknown> {
+    return this.request('deleteForumTopic', { chat_id: chatId, message_thread_id: threadId }, 10_000);
+  }
+
   /**
    * Upload a document (multipart/form-data — the one non-JSON request). Used
    * for very long responses that would otherwise arrive as many chunks.

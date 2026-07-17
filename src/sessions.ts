@@ -30,6 +30,12 @@ export interface RegistryEntry {
   imTarget?: string;
   /** Name the imTarget (topic) currently displays; drift from the registry key means "rename the topic". */
   topicName?: string;
+  /**
+   * The session's topic was deleted (focus switch or user deletion). When a
+   * topic is created for it again, replay recent conversation context — the
+   * old thread's history is gone.
+   */
+  topicPurged?: boolean;
 }
 
 export interface Registry {
@@ -41,11 +47,68 @@ export interface Registry {
    * creating a duplicate.
    */
   closedTopics?: Record<string, string>;
+  /**
+   * When set, only sessions living in this tmux session keep forum topics;
+   * every other session's topic is deleted (recreated with a context replay on
+   * refocus). Unset/null = no filter, every session gets a topic.
+   */
+  focusedTmuxSession?: string | null;
 }
 
 /** Stable runtime key for a registry entry. */
 export function sessionKeyFor(entry: Pick<RegistryEntry, 'paneId' | 'tmux'>): string {
   return entry.paneId || `tmux:${entry.tmux}`;
+}
+
+/**
+ * The tmux session an entry lives in, from its "session:window.pane"
+ * coordinates. tmux forbids ':' in session names, so the first segment is
+ * always the session; the scanner refreshes coordinates every pass, so this
+ * self-heals when a window moves between sessions.
+ */
+export function tmuxSessionOf(entry: Pick<RegistryEntry, 'tmux'>): string {
+  return entry.tmux.split(':')[0];
+}
+
+/**
+ * The focus filter to actually apply: a focusedTmuxSession that no longer has
+ * any live registry entry degrades to null (no filter) so the user is never
+ * left staring at an empty topic list.
+ */
+export function effectiveFocus(reg: Registry): string | null {
+  const focus = reg.focusedTmuxSession;
+  if (!focus) return null;
+  for (const s of Object.values(reg.sessions ?? {})) {
+    if (tmuxSessionOf(s) === focus) return focus;
+  }
+  return null;
+}
+
+/**
+ * Registry names grouped by tmux session — the focused group first, groups and
+ * members otherwise in registry order. The single source of display order for
+ * the session list, its buttons and `#sw <n>` numeric resolution, so the
+ * numbers the user sees always resolve to the sessions they name.
+ */
+export function orderedSessionNames(reg: Registry): string[] {
+  const focus = effectiveFocus(reg);
+  const groups = new Map<string, string[]>();
+  for (const [name, s] of Object.entries(reg.sessions ?? {})) {
+    const group = tmuxSessionOf(s);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push(name);
+  }
+  const ordered = [...groups.keys()].sort((a, b) => (a === focus ? -1 : 0) - (b === focus ? -1 : 0));
+  return ordered.flatMap((g) => groups.get(g)!);
+}
+
+/**
+ * Make a Telegram-typed name safe as a bridge session name: tmux window
+ * targets use ':' and '.' as separators and injection is line-based, so those
+ * become '-'. Returns '' when nothing usable survives.
+ */
+export function sanitizeSessionName(raw: string): string {
+  return raw.trim().replace(/[:.\n\t]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '').trim();
 }
 
 export interface QueuedMessage {
@@ -317,22 +380,33 @@ export function migrateLegacyIlink(
 // ── Topic lifecycle planning ─────────────────────────────────────────
 
 export type TopicOp =
-  | { op: 'create'; name: string }
+  | { op: 'create'; name: string; replay: boolean }
   | { op: 'reopen'; name: string; imTarget: string }
-  | { op: 'rename'; name: string; imTarget: string };
+  | { op: 'rename'; name: string; imTarget: string }
+  | { op: 'remove'; name: string; imTarget: string };
 
 /**
  * Compute the topic operations needed to make the transport's forum topics
- * mirror the registry: every session gets a topic (reopening its tombstone if
- * one exists), renamed entries get their topic renamed. Pure — the caller
- * executes the ops and persists results.
+ * mirror the registry: every session in focus gets a topic (reopening its
+ * tombstone if one exists; `replay` marks a recreate after a purge, so the
+ * executor replays recent context into the fresh thread), renamed entries get
+ * their topic renamed, and — when a tmux-session focus is set — sessions
+ * outside the focus get their topic deleted. `busy` names sessions with an
+ * in-flight turn or queued messages: their removal is deferred to a later sync
+ * so a reply is never aimed at a thread this pass just deleted. Pure — the
+ * caller executes the ops and persists results.
  */
-export function planTopicSync(reg: Registry): TopicOp[] {
+export function planTopicSync(reg: Registry, busy: ReadonlySet<string> = new Set()): TopicOp[] {
+  const focus = effectiveFocus(reg);
   const ops: TopicOp[] = [];
   for (const [name, s] of Object.entries(reg.sessions ?? {})) {
+    const inFocus = !focus || tmuxSessionOf(s) === focus;
     if (!s.imTarget) {
+      if (!inFocus) continue;
       const tomb = reg.closedTopics?.[name];
-      ops.push(tomb ? { op: 'reopen', name, imTarget: tomb } : { op: 'create', name });
+      ops.push(tomb ? { op: 'reopen', name, imTarget: tomb } : { op: 'create', name, replay: !!s.topicPurged });
+    } else if (!inFocus) {
+      if (!busy.has(name)) ops.push({ op: 'remove', name, imTarget: s.imTarget });
     } else if (s.topicName && s.topicName !== name) {
       ops.push({ op: 'rename', name, imTarget: s.imTarget });
     }

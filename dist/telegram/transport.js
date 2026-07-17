@@ -246,6 +246,14 @@ export function createTelegramTransport() {
                     return;
                 await api.reopenForumTopic(chatId, threadId);
             },
+            async remove(target) {
+                if (!api)
+                    return;
+                const { chatId, threadId } = decodeTarget(target);
+                if (!threadId)
+                    return;
+                await api.deleteForumTopic(chatId, threadId);
+            },
             link(target) {
                 const { chatId, threadId } = decodeTarget(target);
                 if (!threadId)

@@ -259,6 +259,13 @@ export function createTelegramTransport(): Transport {
         await api.reopenForumTopic(chatId, threadId);
       },
 
+      async remove(target: string): Promise<void> {
+        if (!api) return;
+        const { chatId, threadId } = decodeTarget(target);
+        if (!threadId) return;
+        await api.deleteForumTopic(chatId, threadId);
+      },
+
       link(target: string): string | null {
         const { chatId, threadId } = decodeTarget(target);
         if (!threadId) return null;
