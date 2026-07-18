@@ -73,25 +73,29 @@ works over a **Telegram bot** — the IM layer is abstracted behind a `Transport
   there. Renames propagate to the topic — and **renaming a topic directly in the Telegram
   UI syncs back** (the pane's tmux window is renamed and pinned, so rescans keep it).
   A closed session's topic is archived and reused if the session comes back. The General
-  topic and the private chat remain the "lobby" (the `/ls` dashboard with busy states and
-  topic deep links, grouped by tmux session; global commands; the default-route destination).
+  topic and the private chat remain the "lobby" (the compact `/ls` tmux-session list with
+  tap-to-focus buttons; the `/sw` menu with busy states and topic deep links; global
+  commands; the default-route destination).
 - **Focus mode (`/fc`)** for when the topic list explodes: `/fc` lists your tmux sessions
   (one tmux session ≈ one project) with tap-to-focus buttons. Focusing keeps topics only
   for panes of that tmux session and **deletes every other topic** (Telegram has no true
   per-topic hide — closing merely greys a topic out — so focus deletes; **topic history is
-  deleted with it**). Refocusing (`/fc <other>` / `/fc all`) recreates topics with a replay
-  of the last few conversation rounds. Focus only filters topic visibility: the default
+  deleted with it**). Focus is **sticky** — `/fc` only switches which session is focused
+  (there is no "show all"); with several tmux sessions and none focused, the default
+  route's session is auto-focused. Refocusing — `/fc <other>`, or `/fc` the same session
+  after manually deleting a topic — recreates topics with a replay of the last few
+  conversation rounds. Focus only filters topic visibility: the default
   route (`/sw`) and in-flight turns are untouched (a busy session's topic is deleted only
   after its turn ends; output for an already-deleted topic falls back to General, tagged
   with the session name).
 - **Transport selection** at attach: `WCC_TRANSPORT` env > `--telegram`/`--wechat` > whichever
   credentials exist on disk.
 - **Native Telegram capabilities**:
-  - command menu (`/ls` `/sw` `/fc` `/model` `/rename` `/esc` `/bind` `/help`)
+  - command menu (`/ls` `/sw` `/fc` `/model` `/rename` `/esc` `/bind` `/start`)
   - **live turn status**: one message per turn, edited in place with elapsed time, tool
     count and the current tool, plus a **⏹ interrupt button** (sends Escape to the pane)
   - **reactions** on your message: 👀 injected, 👍 answered, 💔 abandoned
-  - inline keyboards for `/sw`, `/fc` & `/model`; quiz option buttons (multi-select supported)
+  - inline keyboards for `/ls`, `/sw`, `/fc` & `/model`; quiz option buttons (multi-select supported)
   - **long replies don't wallpaper the chat**: medium ones collapse into an expandable
     quote; anything over 8k chars arrives as a Markdown **file**
   - per-topic typing indicator, markdown-rendered output, automatic `retry_after`
