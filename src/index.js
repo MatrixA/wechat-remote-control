@@ -15,8 +15,9 @@
  * WeChat fallback).
  *
  * Commands (also mapped from /-aliases and the Telegram command menu):
- *   #ls            — list all discovered sessions
+ *   #ls            — compact tmux-session list (tap a button to switch focus)
  *   #sw <n|name>   — move the default-route pointer (other sessions keep running)
+ *   #fc <n|name>   — focus one tmux session (other topics removed, rebuilt on refocus)
  *   #rename <name> — rename a session (tmux window + registry + topic, pinned)
  *   #model         — model menu; #esc — interrupt; #bind — bind a topics group
  */
@@ -1076,7 +1077,7 @@ function scanTmuxForCC() {
           const home = transport.homeTarget?.();
           if (home) {
             transport.sendText(home,
-              `🎯 检测到多个 tmux 会话，已自动聚焦 ${target}（其余 tmux 会话的话题已隐藏）。用 /fc 切换。`,
+              `🎯 检测到多个 tmux 会话，已自动聚焦 ${target}（其余话题已收起，切回时重建）。/fc 切换。`,
             ).catch(() => {});
           }
         }
@@ -1320,7 +1321,7 @@ function handleTopicSendError(target, err) {
 
 function formatSessionList(reg) {
   const names = orderedSessionNames(reg);
-  if (names.length === 0) return '暂无发现活跃的 CC session\n（等待自动扫描，约30秒）';
+  if (names.length === 0) return '暂无发现活跃的会话（等待自动扫描，约30秒）';
   const home = homedir();
   const focus = effectiveFocus(reg);
   const topics = !!transport?.caps.topics;
@@ -1335,7 +1336,7 @@ function formatSessionList(reg) {
       lastGroup = group;
       const mark = group === focus ? ' 🎯' : '';
       // Only the topics transport hides out-of-focus groups; WeChat has no topics.
-      const hidden = topics && focus && group !== focus ? '（话题已隐藏）' : '';
+      const hidden = topics && focus && group !== focus ? '（话题已收起）' : '';
       lines.push(`▸ tmux: ${group}${mark}${hidden}`);
     }
     const sess = getStateFor(name, s);
@@ -1347,7 +1348,7 @@ function formatSessionList(reg) {
     lines.push(`      ${shortPath}`);
   });
   lines.push(`\n默认路由: ${reg.active || '无'}`);
-  if (focus) lines.push(`🎯 聚焦: ${focus}（其他 tmux 会话的话题已隐藏，用 /fc 切换）`);
+  if (focus) lines.push(`🎯 聚焦: ${focus}（其余话题已收起，切回时重建；/fc 切换）`);
   if (topics) lines.push('每个会话有独立话题，进入话题即可对话');
   lines.push('切换默认: /sw <名字/序号>；改名: /rename <新名字>；聚焦: /fc');
   return lines.join('\n');
@@ -1605,7 +1606,7 @@ async function performSwitch(targetName, send) {
 // this feature exists to avoid). The scanner auto-focuses the default-route
 // session's group whenever >1 session is live and none is focused.
 let fcMenu = null; // { names: string[], expires: number } — snapshot behind fc:<idx> callbacks
-const FC_MENU_TTL = 5 * 60 * 1000;
+const FC_MENU_TTL = 15 * 60 * 1000;
 
 /** Registry names grouped by tmux session, in orderedSessionNames order. */
 function tmuxGroups(reg) {
@@ -1618,11 +1619,15 @@ function tmuxGroups(reg) {
   return groups;
 }
 
+// Shared by /ls and the bare /fc menu: one line per tmux session, members
+// inline. Focus markers only exist in topics mode; WeChat / unbound chats get
+// a plain numbered list.
 function formatTmuxList(reg) {
   const groups = tmuxGroups(reg);
   if (groups.size === 0) return '暂无发现活跃的会话（等待自动扫描，约30秒）';
-  const focus = effectiveFocus(reg);
-  const lines = ['🗂 tmux 会话（聚焦后，其余会话的话题将被删除，切回时重建）:'];
+  const topics = !!transport?.caps.topics;
+  const focus = topics ? effectiveFocus(reg) : null;
+  const lines = ['📋 tmux 会话:'];
   let i = 0;
   for (const [g, members] of groups) {
     i++;
@@ -1630,11 +1635,12 @@ function formatTmuxList(reg) {
       const st = sessionStates.get(sessionKeyFor(reg.sessions[n]));
       return st && (st.busy || st.lastInjectedText);
     }).length;
-    const mark = g === focus ? '🎯' : '○';
-    lines.push(`${mark} ${i}. ${g} — ${members.length} 个会话${busyCount ? `（${busyCount} 忙碌）` : ''}`);
-    lines.push(`   ${members.join(', ')}`);
+    // sendButtons never splits the message — cap the inline member list.
+    const shown = members.length > 6 ? [...members.slice(0, 5), `…+${members.length - 5}`] : members;
+    const mark = topics ? (g === focus ? '🎯 ' : '○ ') : '';
+    lines.push(`${mark}${i}. ${g} — ${shown.join(', ')}${busyCount ? `（${busyCount} 忙碌）` : ''}`);
   }
-  lines.push(focus ? `\n当前聚焦: ${focus}（点选其它可切换）` : '\n当前未聚焦：将自动聚焦默认会话所在的 tmux');
+  lines.push('', `默认路由: ${reg.active || '无'}` + (focus ? ` · 🎯 聚焦: ${focus}` : ''));
   return lines.join('\n');
 }
 
@@ -1690,9 +1696,10 @@ async function performFocus(groupName, send) {
   const toRemove = Object.entries(reg.sessions)
     .filter(([n, s]) => !members.has(n) && s.imTarget).length;
   await send(
-    `🎯 已聚焦 tmux 会话 ${groupName}：${members.size} 个会话保留/新建话题`
-    + (toRemove > 0 ? `，其余 ${toRemove} 个话题将被删除（历史随之删除，切回时重建并回放上下文）` : '')
-    + `。\n默认路由不变: ${reg.active || '无'}\n用 /fc 切换其它 tmux 会话`);
+    (toRemove > 0
+      ? `🎯 已聚焦 ${groupName}：保留 ${members.size} 个会话话题，收起（删除）其余 ${toRemove} 个，切回时重建并回放上下文。`
+      : `🎯 已聚焦 ${groupName}（${members.size} 个会话）。`)
+    + `\n默认路由不变: ${reg.active || '无'}`);
   // Recreate any tab the user manually deleted in the (re)focused group before
   // the sync runs, so re-selecting the current focus brings deleted tabs back.
   await repairFocusedTopics(groupName);
@@ -1809,15 +1816,22 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     return;
   }
 
-  // #ls / #sessions — list all sessions (with tap-to-switch buttons where supported)
+  // #ls / #sessions — compact tmux-session list (tap a button to switch
+  // focus). Per-session detail (paths, sw buttons, topic links) lives in /sw.
   if (cmd === '#ls' || cmd === '#sessions') {
     const reg = readSessions();
-    const list = formatSessionList(reg);
-    if (transport.caps.inlineKeyboards && Object.keys(reg.sessions).length > 0) {
-      await transport.sendButtons(replyTarget, list, sessionButtons(reg))
+    const groupNames = [...tmuxGroups(reg).keys()];
+    const list = formatTmuxList(reg);
+    // Focus buttons only make sense where topics exist; otherwise plain text.
+    if (transport.caps.topics && transport.caps.inlineKeyboards && groupNames.length > 0) {
+      fcMenu = { names: groupNames, expires: Date.now() + FC_MENU_TTL };
+      await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
         .catch(err => logger.error('Session list push failed', { error: err.message }));
     } else {
-      await send(list);
+      // No focus buttons on this transport — leave a /sw pointer so the
+      // numbered list isn't a dead end (its numbers are /fc's, not /sw's).
+      const hint = !transport.caps.topics && groupNames.length > 0 ? '\n切换默认: /sw <名字/序号>' : '';
+      await send(list + hint);
     }
     return;
   }
@@ -1837,8 +1851,9 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     }
 
     const reg = readSessions();
-    // Same ordering as the /ls display and its buttons, so "/sw 3" always
-    // means the session shown as 3.
+    // Same ordering as the bare-/sw menu (formatSessionList) and its buttons,
+    // so "/sw 3" always means the session shown there as 3. (/ls numbers tmux
+    // groups for /fc — different numbering.)
     const names = orderedSessionNames(reg);
     let targetName = null;
     const num = parseInt(arg, 10);
@@ -1968,7 +1983,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     return;
   }
 
-  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 sessions\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号|all> — 聚焦 tmux 会话（删除其他话题）\n  /rename <新名字> — 重命名\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
+  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 tmux 会话\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号> — 聚焦 tmux 会话（其余话题收起，切回重建）\n  /rename <新名字> — 重命名\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
 }
 
 /**
@@ -2043,7 +2058,7 @@ async function handleCallback(inbound) {
     if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
     const groupName = fcMenu.names[parseInt(segs[1], 10)];
     if (!groupName) { ack('无效选项'); return; }
-    ack(`聚焦 ${groupName}`);
+    ack(`🎯 已聚焦 ${groupName}`);
     await performFocus(groupName, send);
     return;
   }
@@ -2943,9 +2958,9 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
       : '');
   return header + topicsHint +
     '可用指令：\n' +
-    '  /ls — 列出所有 session（Claude Code / Codex，含忙碌状态）\n' +
+    '  /ls — 列出 tmux 会话' + (transport?.caps.topics ? '（点按切换聚焦）' : '') + '\n' +
     '  /sw <名字/序号> — 切换默认路由\n' +
-    '  /fc <名字/序号|all> — 聚焦一个 tmux 会话，收起其他话题\n' +
+    '  /fc <名字/序号> — 聚焦一个 tmux 会话（其余话题收起，切回重建）\n' +
     '  /rename <新名字> — 重命名会话（TG 里直接改话题名也会同步）\n' +
     '  /model — 切换模型（文字菜单，无需终端交互）\n' +
     '  /esc — 中断当前回合\n\n' +
@@ -3129,9 +3144,9 @@ function onInboundMessage(inbound) {
 // Native command menu (Telegram setMyCommands). Each entry, when tapped, sends
 // the "/<command>" text which the slash-alias router maps to a bridge command.
 const MENU_COMMANDS = [
-  { command: 'ls',     description: '列出所有会话（含忙碌状态）' },
+  { command: 'ls',     description: '列出 tmux 会话（点按切换聚焦）' },
   { command: 'sw',     description: '切换默认路由会话' },
-  { command: 'fc',     description: '聚焦一个 tmux 会话（删除其他话题）' },
+  { command: 'fc',     description: '聚焦一个 tmux 会话（其余话题收起，切回重建）' },
   { command: 'model',  description: '切换模型' },
   { command: 'rename', description: '重命名当前会话' },
   { command: 'esc',    description: '中断当前回合' },

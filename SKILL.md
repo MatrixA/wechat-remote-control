@@ -63,7 +63,7 @@ any session's in-flight work.
 its own forum topic — like a Slack channel per session. Messages typed inside a topic go
 to that session; its replies, status updates and quizzes stay in the topic. The group's
 General topic and the private chat keep working as the "lobby" (global commands,
-`/ls` dashboard, default-route messages).
+the `/ls` tmux-session list, the `/sw` session menu, default-route messages).
 
 - **Bridge daemon** (`node src/index.js`): polls the IM (WeChat ilink API / Telegram Bot
   API) for messages, injects them into the addressed tmux-hosted agent session via
@@ -79,7 +79,7 @@ General topic and the private chat keep working as the "lobby" (global commands,
 - **Telegram UX**: per-turn live status message edited in place (elapsed time, current tool,
   ⏹ interrupt button), 👀/👍/💔 reactions on the user's message (received / answered /
   abandoned), long replies collapse into expandable quotes, very long replies (>8k chars)
-  arrive as a Markdown file, native bot command menu (/ls /sw /model /rename /esc /bind).
+  arrive as a Markdown file, native bot command menu (/ls /sw /fc /model /rename /esc /bind /start).
 - **Auto-approve**: PreToolUse returns `permissionDecision: "allow"` (plus the legacy
   `decision: "approve"`). Both agents honor this — Codex honors `permissionDecision` and
   ignores `decision`, so one payload works for both.
@@ -392,7 +392,8 @@ Telegram app, not the terminal):
 
 No re-login or re-attach is needed — `/bind` works any time the bridge daemon is running.
 The private chat keeps working as a fallback (messages there go to the default-route
-session; `/ls` shows a dashboard with deep links into each topic).
+session; `/ls` lists tmux sessions with tap-to-focus buttons, and `/sw` shows the
+session menu with deep links into each topic).
 
 ---
 
@@ -817,10 +818,11 @@ Optional Step 6*.
 each with its own queue, in-flight turn and status message. In the topics group, each
 topic addresses its own session. In the private chat / WeChat, plain messages go to the
 *default-route* session shown by `/ls`; `/sw` moves only that pointer and never cancels
-another session's in-flight work. IM-side commands: `/ls` (dashboard with busy state,
-grouped by tmux session), `/sw`, `/fc` (focus one tmux session — topics of all other
-sessions are DELETED, history included, and recreated with a context replay on refocus),
-`/rename`, `/model`, `/esc` (interrupt), `/bind`, plus the `#`-prefixed aliases.
+another session's in-flight work. IM-side commands: `/ls` (compact tmux-session list
+with tap-to-focus buttons), `/sw` (session menu with busy state and topic deep links),
+`/fc` (focus one tmux session — topics of all other sessions are DELETED, history
+included, and recreated with a context replay on refocus), `/rename`, `/model`,
+`/esc` (interrupt), `/bind`, plus the `#`-prefixed aliases.
 Renaming a topic directly in the Telegram UI also syncs back: the pane's tmux window is
 renamed (pinned against rescans) and illegal characters (`: . tab newline`) become `-`.
 
