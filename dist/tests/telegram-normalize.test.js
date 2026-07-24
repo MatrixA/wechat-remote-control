@@ -51,6 +51,7 @@ test('normalizeUpdate maps a callback_query (button tap)', () => {
     };
     assert.deepStrictEqual(normalizeUpdate(u), {
         target: '42', replyToken: 'cb-1', text: '', kind: 'callback', callbackData: 'quiz:1:0:1', userKey: '7',
+        messageId: '11',
     });
 });
 test('normalizeUpdate routes a callback tapped inside a topic back into that topic', () => {

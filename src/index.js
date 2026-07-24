@@ -1605,7 +1605,7 @@ async function performSwitch(targetName, send) {
 // "unfocus"/"show all" (spreading every session's topics at once is the bad UX
 // this feature exists to avoid). The scanner auto-focuses the default-route
 // session's group whenever >1 session is live and none is focused.
-let fcMenu = null; // { names: string[], expires: number } — snapshot behind fc:<idx> callbacks
+let fcMenu = null; // { names, expires, target, messageId } — snapshot behind fc:<idx> callbacks; target/messageId let a focus switch re-render the menu in place
 const FC_MENU_TTL = 15 * 60 * 1000;
 
 /** Registry names grouped by tmux session, in orderedSessionNames order. */
@@ -1681,13 +1681,33 @@ async function repairFocusedTopics(groupName) {
 }
 
 /**
+ * Re-render the /ls //fc menu message in place after a focus change, so its 🎯
+ * marker and「聚焦」footer track reality instead of going stale. Edits the
+ * tapped message when the callback names one (menuMessageId), else the menu
+ * recorded at send time; fcMenu.names is refreshed so fc:<idx> payloads keep
+ * matching the keyboard the edited message now shows. Best-effort — a deleted
+ * or too-old message must never break the focus switch itself.
+ */
+async function refreshFcMenu(menuMessageId) {
+  const messageId = menuMessageId ?? fcMenu?.messageId;
+  if (!transport?.caps.editMessages || !fcMenu?.target || !messageId) return;
+  const reg = readSessions();
+  const groupNames = [...tmuxGroups(reg).keys()];
+  if (groupNames.length === 0) return;
+  fcMenu.names = groupNames;
+  await transport.editText(fcMenu.target, messageId, formatTmuxList(reg), tmuxButtons(groupNames, effectiveFocus(reg)))
+    .catch(err => logger.debug('fc menu edit skipped', { error: err.message }));
+}
+
+/**
  * Switch the focused tmux session and kick a topic sync. Shared by the #fc
  * command and the fc:<idx> button callback. Focus is sticky — groupName is
- * always a real group (there is no unfocus). The reply goes out before the sync
- * — deleting/recreating many topics can take a while and busy sessions defer
- * their deletion to a later sync anyway.
+ * always a real group (there is no unfocus). `reply` is the caller's feedback
+ * channel (a chat message for #fc, the callback toast for button taps); it goes
+ * out before the sync — deleting/recreating many topics can take a while and
+ * busy sessions defer their deletion to a later sync anyway.
  */
-async function performFocus(groupName, send) {
+async function performFocus(groupName, reply, { menuMessageId } = {}) {
   const reg = readSessions();
   reg.focusedTmuxSession = groupName;
   writeSessions(reg);
@@ -1695,11 +1715,12 @@ async function performFocus(groupName, send) {
   // Count only topics that actually exist and will be deleted.
   const toRemove = Object.entries(reg.sessions)
     .filter(([n, s]) => !members.has(n) && s.imTarget).length;
-  await send(
+  await reply(
     (toRemove > 0
       ? `🎯 已聚焦 ${groupName}：保留 ${members.size} 个会话话题，收起（删除）其余 ${toRemove} 个，切回时重建并回放上下文。`
       : `🎯 已聚焦 ${groupName}（${members.size} 个会话）。`)
     + `\n默认路由不变: ${reg.active || '无'}`);
+  await refreshFcMenu(menuMessageId);
   // Recreate any tab the user manually deleted in the (re)focused group before
   // the sync runs, so re-selecting the current focus brings deleted tabs back.
   await repairFocusedTopics(groupName);
@@ -1824,9 +1845,9 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     const list = formatTmuxList(reg);
     // Focus buttons only make sense where topics exist; otherwise plain text.
     if (transport.caps.topics && transport.caps.inlineKeyboards && groupNames.length > 0) {
-      fcMenu = { names: groupNames, expires: Date.now() + FC_MENU_TTL };
-      await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
-        .catch(err => logger.error('Session list push failed', { error: err.message }));
+      const sent = await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
+        .catch(err => { logger.error('Session list push failed', { error: err.message }); return null; });
+      fcMenu = { names: groupNames, expires: Date.now() + FC_MENU_TTL, target: replyTarget, messageId: sent?.messageId };
     } else {
       // No focus buttons on this transport — leave a /sw pointer so the
       // numbered list isn't a dead end (its numbers are /fc's, not /sw's).
@@ -1881,11 +1902,11 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     const reg = readSessions();
     const groupNames = [...tmuxGroups(reg).keys()];
     if (!arg) {
-      fcMenu = { names: groupNames, expires: Date.now() + FC_MENU_TTL };
       const list = formatTmuxList(reg);
       if (transport.caps.inlineKeyboards && groupNames.length > 0) {
-        await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
-          .catch(err => logger.error('Focus menu push failed', { error: err.message }));
+        const sent = await transport.sendButtons(replyTarget, list, tmuxButtons(groupNames, effectiveFocus(reg)))
+          .catch(err => { logger.error('Focus menu push failed', { error: err.message }); return null; });
+        fcMenu = { names: groupNames, expires: Date.now() + FC_MENU_TTL, target: replyTarget, messageId: sent?.messageId };
       } else {
         await send(`${list}\n\n用法: /fc <名字/序号>`);
       }
@@ -2058,8 +2079,9 @@ async function handleCallback(inbound) {
     if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
     const groupName = fcMenu.names[parseInt(segs[1], 10)];
     if (!groupName) { ack('无效选项'); return; }
-    ack(`🎯 已聚焦 ${groupName}`);
-    await performFocus(groupName, send);
+    // The summary rides the toast and the tapped menu is edited in place (🎯
+    // moves) — a tap must not grow the chat with one more confirmation message.
+    await performFocus(groupName, ack, { menuMessageId: inbound.messageId });
     return;
   }
 
