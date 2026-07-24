@@ -478,10 +478,12 @@ function sendQuiz(sess, question, replyTarget, qIdx) {
 /**
  * Inject key presses into tmux to answer an AskUserQuestion TUI.
  *
- * CC renders: ❯ Option1 / Option2 / ... / Other
- * First option is pre-selected.  Down to navigate, Enter to select.
- * For "Other": navigate past all options, Enter, type text, Enter.
- * For multiSelect: Space to toggle, Enter to confirm.
+ * CC renders the options as a numbered select list with a free-text row
+ * immediately after the last option ("Type something." on current builds,
+ * "Other" on older ones; a trailing "Chat about this" row sits further down
+ * and is never navigated to). First option is pre-selected. Down to navigate,
+ * Enter to select. For free text: navigate past all options, Enter, type,
+ * Enter. For multiSelect: Space to toggle, Enter to confirm.
  *
  * Returns a human-readable string of what was selected.
  */
@@ -547,24 +549,28 @@ function quizNorm(s) {
  * as blind keystrokes, so this screen check is the safety gate (it replaced the
  * old 5-min TTL — the screen is the truth, not the clock).
  *
- * Visible pane ONLY, no scrollback: after a terminal-side answer, CC's
- * transcript echo (question + chosen label) sits in scrollback and would
- * false-positive. Match rule — the "Other" row must be on screen (always
- * rendered live — injectQuizAnswer's navigation already relies on it — absent
- * from echoes), plus EITHER:
- *   - ALL option-label prefixes on screen IN ORDER with "other" after the last
- *     (exactly how the live list renders; an echo shows only the chosen label
- *     and prose rarely reproduces the full ordered list). This branch keeps
- *     short panes working when a long question is clipped above the options;
- *   - or the question TAIL plus ≥ min(2, n) label prefixes on screen (tail,
- *     not head: small panes clip the top first).
+ * Visible pane ONLY, no scrollback: the dismissed-quiz echoes repeat our own
+ * text — the answered echo shows "question → chosen label" and the Esc echo
+ * shows the question plus ALL labels in order ("(Red / Green / Blue)",
+ * verified empirically) — so question/label needles alone cannot tell a dead
+ * quiz from a live one. Match rule:
+ *   - quiz-specific live chrome must be on screen: the "Type something." /
+ *     "Chat about this" rows (current CC), or a line-anchored "Other" row
+ *     (older CC; line-anchored so prose like "otherwise" can't fake it).
+ *     Deliberately NOT the generic "Enter to select" hint — permission
+ *     dialogs share that chrome and must never pass;
+ *   - plus EITHER all option-label prefixes IN ORDER (how the live list
+ *     renders; keeps short panes working when a long question is clipped
+ *     above the options) OR the question TAIL + ≥ min(2, n) label prefixes
+ *     (tail, not head: small panes clip the top first).
  *
  * Retries once after a 500ms blocking wait: a tap can land while the TUI is
  * still redrawing the next question. Callers are sync, so the wait is sync too
  * (same Atomics.wait pattern as injectQuizAnswer) — paid only on mismatch.
  */
 function quizOnScreen(target, question, attempt = 0) {
-  const hay = quizNorm(stripAnsi(capturePaneContent(target, 0)));
+  const raw = stripAnsi(capturePaneContent(target, 0));
+  const hay = quizNorm(raw);
   const qTail = quizNorm(question.question).slice(-24);
   const labels = question.options.map(o => quizNorm(o.label).slice(0, 12)).filter(Boolean);
   const hits = labels.filter(l => hay.includes(l)).length;
@@ -575,8 +581,10 @@ function quizOnScreen(target, question, attempt = 0) {
     if (at < 0) { orderedList = false; break; }
     pos = at + l.length;
   }
-  const ok = hay.includes('other')
-    && ((orderedList && hay.includes('other', pos))
+  const liveChrome = hay.includes('typesomething') || hay.includes('chataboutthis')
+    || /^\s*(?:❯\s*)?\d*\.?\s*(?:\[[ x]\]\s*)?Other\.?\s*$/im.test(raw);
+  const ok = liveChrome
+    && (orderedList
       || ((!qTail || hay.includes(qTail)) && hits >= Math.min(2, labels.length)));
   if (ok) return true;
   if (attempt === 0) {
