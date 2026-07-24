@@ -46,6 +46,9 @@ export function normalizeUpdate(update) {
             kind: 'callback',
             callbackData: cq.data ?? '',
             userKey: String(cq.from.id),
+            // The tapped message, so handlers can edit it in place (e.g. move the
+            // 🎯 marker on the /fc menu instead of sending a fresh message).
+            messageId: String(msg.message_id),
         };
     }
     const msg = update.message;
