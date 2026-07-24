@@ -1175,6 +1175,13 @@ function busySessionNames(reg) {
   return busy;
 }
 
+// Telegram errors that all mean "this forum topic no longer exists" — which
+// one comes back varies by method (sendMessage → "message thread not found",
+// deleteForumTopic → TOPIC_ID_INVALID, reopen/edit → TOPIC_DELETED). Every
+// dead-topic check must use this, or the unmatched spelling loops forever
+// (e.g. a remove op re-failing with TOPIC_ID_INVALID every 30s sync).
+const DEAD_TOPIC_RE = /thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i;
+
 async function syncSessionTopics() {
   if (!transport?.topics || !transport.caps.topics) return;
   if (topicSyncBusy) return;
@@ -1217,7 +1224,7 @@ async function syncSessionTopics() {
             // Already gone (the user deleted it first): treat as success so the
             // binding is cleared — otherwise this op re-fails every 30s forever
             // and the entry stays bound to a dead thread, blocking recreation.
-            if (!/thread not found|TOPIC_DELETED/i.test(m)) throw err;
+            if (!DEAD_TOPIC_RE.test(m)) throw err;
           }
           applyTopicRemoved(op.name, op.imTarget);
         }
@@ -1279,7 +1286,7 @@ function applyTopicRemoved(name, imTarget) {
  *  - TOPIC_CLOSED: the topic still exists but is closed (e.g. a send raced the
  *    reopen after a session reappeared) → reopen it and let the caller retry.
  *    Recreating here would leave a duplicate closed topic behind.
- *  - thread not found / TOPIC_DELETED: the topic is gone (user deletion, or an
+ *  - dead topic (DEAD_TOPIC_RE): the topic is gone (user deletion, or an
  *    /fc focus purge racing an in-flight reply) → clear the binding so the next
  *    sync recreates it (focused sessions only), and return the session's name
  *    so the caller can re-route the undeliverable text instead of dropping it.
@@ -1292,7 +1299,7 @@ function handleTopicSendError(target, err) {
     if (transport?.topics) transport.topics.reopen(target).catch(() => {});
     return null; // let the caller's retry re-send into the reopened topic
   }
-  if (!/thread not found|TOPIC_DELETED/i.test(m)) return null;
+  if (!DEAD_TOPIC_RE.test(m)) return null;
   const reg = readSessions();
   let hit = null;
   for (const [name, s] of Object.entries(reg.sessions)) {
@@ -1652,7 +1659,7 @@ function tmuxButtons(names, focus) {
  * Probe every existing topic in the focused group and unbind any the user
  * deleted in Telegram (there is no "topic deleted" update, so a stale imTarget
  * otherwise lingers and planTopicSync never recreates the tab). reopen() is the
- * probe: it fails with "thread not found"/TOPIC_DELETED for a dead thread, and
+ * probe: it fails with a dead-topic error (DEAD_TOPIC_RE) for a dead thread, and
  * for a live one it's a no-op (an open topic just returns TOPIC_NOT_MODIFIED,
  * a closed one is reopened — which is what a focused topic should be anyway).
  * Runs only on user-initiated /fc, so the handful of extra API calls is fine.
@@ -1669,7 +1676,7 @@ async function repairFocusedTopics(groupName) {
       await transport.topics.reopen(s.imTarget);
     } catch (err) {
       const m = err?.message || String(err);
-      if (!/thread not found|TOPIC_DELETED/i.test(m)) continue; // live topic / transient
+      if (!DEAD_TOPIC_RE.test(m)) continue; // live topic / transient
       delete s.imTarget;
       delete s.topicName;
       s.topicPurged = true; // recreated tab replays recent context
