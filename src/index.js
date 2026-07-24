@@ -556,11 +556,34 @@ function handleQuizResponse(sess, text, replyTarget) {
   advanceQuiz(sess, replyTarget);
 }
 
+/**
+ * After the last question, CC's AskUserQuestion TUI auto-advances to a final
+ * "Review your answers" screen with "❯ Submit answers" already focused — one
+ * Enter submits.  The per-question answers each sent an Enter that advanced the
+ * tab, but nothing ever presses that final Submit, so CC hangs.  Send it here.
+ *
+ * Guarded on the pane so we NEVER inject a stray Enter: we match only the
+ * review-screen text ("Submit answers" / "Review your answers"), not the tab
+ * bar's bare "✔ Submit" that shows on every question screen.  Retries a few
+ * times because the review screen takes a moment to render after the last Enter.
+ */
+function submitQuizForm(target, attempt = 0) {
+  if (!target || !paneExists(target)) return;
+  const content = stripAnsi(capturePaneContent(target, 20));
+  if (/submit (your )?answers|review your answers/i.test(content)) {
+    sendTmuxKey(target, 'Enter');
+    return;
+  }
+  if (attempt < 4) setTimeout(() => submitQuizForm(target, attempt + 1), 500);
+}
+
 /** Advance to the next quiz question (or clear state). Shared by text + callback paths. */
 function advanceQuiz(sess, replyTarget) {
   sess.pendingQuiz.questionIndex++;
   if (sess.pendingQuiz.questionIndex >= sess.pendingQuiz.questions.length) {
+    const target = tmuxTargetFor(sess);
     sess.pendingQuiz = null;
+    setTimeout(() => submitQuizForm(target), 500);
   } else {
     setTimeout(() => {
       if (sess.pendingQuiz) {
