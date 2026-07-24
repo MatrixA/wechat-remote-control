@@ -66,6 +66,11 @@ for e in entries:
         if len(e.get('text', '')) > 300:
             text += '…'
         print(f'[{t}] {tag}🤖 {text}')
+    elif typ == 'assistant_interim':
+        text = e.get('text', '')[:300]
+        if len(e.get('text', '')) > 300:
+            text += '…'
+        print(f'[{t}] {tag}🤖⏳ {text}')
     elif typ == 'auto_approve':
         print(f'[{t}] {tag}⚡ 自动允许: {e.get("desc", e.get("tool", "?"))}')
     elif typ == 'user_wechat':

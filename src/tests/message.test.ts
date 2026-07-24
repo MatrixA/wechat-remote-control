@@ -6,6 +6,7 @@ import {
   splitMessage,
   textFromContent,
   findResponseToInjected,
+  findInterimTexts,
   findLastCompleteResponse,
   transcriptHasUserText,
 } from '../message.js';
@@ -103,6 +104,84 @@ test('findResponseToInjected matches the most recent occurrence of the injected 
     user('ping'), asst('second answer', 'end_turn'),
   );
   assert.deepStrictEqual(findResponseToInjected(t, 'ping'), { text: 'second answer', complete: true });
+});
+
+// ── findInterimTexts ─────────────────────────────────────────────────
+// Real transcripts carry ONE content block per JSONL line; every line of an API
+// message replicates its message.id and stop_reason.
+const line = (uuid: string, msgId: string, block: any, stop: string | null, extra: any = {}) =>
+  ({ type: 'assistant', uuid, message: { id: msgId, content: [block], stop_reason: stop }, ...extra });
+const textLine  = (uuid: string, msgId: string, text: string, stop: string | null = 'tool_use', extra: any = {}) =>
+  line(uuid, msgId, { type: 'text', text }, stop, extra);
+const thinkLine = (uuid: string, msgId: string, stop: string | null = 'tool_use') =>
+  line(uuid, msgId, { type: 'thinking', thinking: 'hmm' }, stop);
+const toolLine  = (uuid: string, msgId: string, stop: string | null = 'tool_use') =>
+  line(uuid, msgId, { type: 'tool_use', name: 'Bash' }, stop);
+const toolResult = () => ({ type: 'user', message: { content: [{ type: 'tool_result' }] } });
+
+test('findInterimTexts returns [] without an anchor', () => {
+  const t = entries(user('other'), textLine('u1', 'm1', 'x'.repeat(300)));
+  assert.deepStrictEqual(findInterimTexts(t, 'do X'), []);
+  assert.deepStrictEqual(findInterimTexts(t, null), []);
+});
+
+test('findInterimTexts extracts tool_use text and excludes the end_turn final', () => {
+  const t = entries(
+    user('do X'),
+    thinkLine('u1', 'm1'),
+    textLine('u2', 'm1', 'interim one'),
+    toolLine('u3', 'm1'),
+    toolResult(),
+    textLine('u4', 'm2', 'final answer', 'end_turn'),
+  );
+  assert.deepStrictEqual(findInterimTexts(t, 'do X'), [{ uuids: ['u2'], text: 'interim one' }]);
+});
+
+test('findInterimTexts refuses stop_reason null (still streaming) and sidechain lines', () => {
+  const t = entries(
+    user('do X'),
+    textLine('u1', 'm1', 'not flushed yet', null),
+    textLine('u2', 'm2', 'subagent text', 'tool_use', { isSidechain: true }),
+    textLine('u3', 'm3', 'real interim'),
+  );
+  assert.deepStrictEqual(findInterimTexts(t, 'do X'), [{ uuids: ['u3'], text: 'real interim' }]);
+});
+
+test('findInterimTexts merges adjacent text lines of the same message only', () => {
+  const t = entries(
+    user('do X'),
+    textLine('u1', 'm1', 'part A '),
+    textLine('u2', 'm1', 'part B'),
+    toolLine('u3', 'm1'),
+    toolResult(),
+    thinkLine('u4', 'm2'),                 // same-message thinking must not glue m2 onto m1
+    textLine('u5', 'm2', 'second block'),
+    toolLine('u6', 'm2'),
+  );
+  assert.deepStrictEqual(findInterimTexts(t, 'do X'), [
+    { uuids: ['u1', 'u2'], text: 'part A part B' },
+    { uuids: ['u5'], text: 'second block' },
+  ]);
+});
+
+test('findInterimTexts stops at the next typed user message but scans past tool results', () => {
+  const t = entries(
+    user('do X'),
+    textLine('u1', 'm1', 'first turn interim'),
+    toolLine('u2', 'm1'),
+    toolResult(),
+    user('typed at terminal'),
+    textLine('u3', 'm2', 'next turn interim'),
+  );
+  assert.deepStrictEqual(findInterimTexts(t, 'do X'), [{ uuids: ['u1'], text: 'first turn interim' }]);
+});
+
+test('findInterimTexts anchors on the most recent occurrence of the injected text', () => {
+  const t = entries(
+    user('ping'), textLine('u1', 'm1', 'old interim'), textLine('u2', 'm2', 'old final', 'end_turn'),
+    user('ping'), textLine('u3', 'm3', 'new interim'),
+  );
+  assert.deepStrictEqual(findInterimTexts(t, 'ping'), [{ uuids: ['u3'], text: 'new interim' }]);
 });
 
 // ── findLastCompleteResponse ─────────────────────────────────────────

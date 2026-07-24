@@ -37,6 +37,7 @@ import {
   splitMessage,
   textFromContent,
   findResponseToInjected,
+  findInterimTexts,
   findLastCompleteResponse,
   transcriptHasUserText,
 } from '../dist/message.js';
@@ -75,6 +76,15 @@ const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switc
 // emits no decision, so the agent falls back to its own permission flow instead
 // of granting remote, unsandboxed tool execution unconditionally.
 const AUTO_APPROVE = !(process.env.WRC_AUTO_APPROVE === '0' || process.env.WRC_AUTO_APPROVE === 'false');
+
+// Forward meaningful interim assistant text (prose between tool calls) to the
+// IM as it appears, instead of only the final end_turn response. Claude-only.
+// WRC_FORWARD_INTERIM=0|false disables; WRC_INTERIM_MIN_LEN tunes the noise
+// threshold (chars — shorter blocks like "让我看看…" status chatter are skipped).
+const FORWARD_INTERIM = !(process.env.WRC_FORWARD_INTERIM === '0' || process.env.WRC_FORWARD_INTERIM === 'false');
+const _rawInterimMin = parseInt(process.env.WRC_INTERIM_MIN_LEN ?? '', 10);
+const INTERIM_MIN_LEN = Number.isFinite(_rawInterimMin) && _rawInterimMin >= 0 ? _rawInterimMin : 200;
+const INTERIM_SCAN_GAP_MS = 2000;  // min gap between PreToolUse-triggered scans
 
 // Shell names that should NOT be used as session display names
 const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh']);
@@ -438,20 +448,28 @@ function tryAutoConfirmCompaction(sess, target) {
 /**
  * Forward an AskUserQuestion question to the IM. On transports with inline
  * keyboards (Telegram) each option is a tap-able button (callback_data
- * `quiz:<sid>:<qIdx>:<optIdx>`, plus a "完成" button for multi-select);
+ * `quiz:<sid>:<gen>:<qIdx>:<optIdx>`, plus a "完成" button for multi-select);
  * otherwise a numbered text menu (WeChat). A typed custom answer also works.
  */
 function sendQuiz(sess, question, replyTarget, qIdx) {
+  const pq = sess.pendingQuiz;
   if (transport.caps.inlineKeyboards) {
-    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${sess.sid}:${qIdx}:${i}` }]);
+    const gen = pq?.gen ?? '0';
+    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${sess.sid}:${gen}:${qIdx}:${i}` }]);
     let text;
     if (question.multiSelect) {
-      rows.push([{ label: '✅ 完成', data: `quiz:${sess.sid}:${qIdx}:done` }]);
+      rows.push([{ label: '✅ 完成', data: `quiz:${sess.sid}:${gen}:${qIdx}:done` }]);
       text = `❓ ${question.question}\n\n（多选：点选切换，选好后按"完成"，或直接输入自定义回答）`;
     } else {
       text = `❓ ${question.question}\n\n（点选项，或直接输入自定义回答）`;
     }
     transport.sendButtons(replyTarget, text, rows)
+      .then(sent => {
+        // Identity guard: the quiz may have been cancelled/replaced before the ack.
+        if (sent?.messageId && pq && sess.pendingQuiz === pq) {
+          pq.msgIds[qIdx] = { messageId: sent.messageId, target: replyTarget, text };
+        }
+      })
       .catch(err => logger.error('Quiz push failed', { error: err.message }));
     return;
   }
@@ -470,10 +488,12 @@ function sendQuiz(sess, question, replyTarget, qIdx) {
 /**
  * Inject key presses into tmux to answer an AskUserQuestion TUI.
  *
- * CC renders: ❯ Option1 / Option2 / ... / Other
- * First option is pre-selected.  Down to navigate, Enter to select.
- * For "Other": navigate past all options, Enter, type text, Enter.
- * For multiSelect: Space to toggle, Enter to confirm.
+ * CC renders the options as a numbered select list with a free-text row
+ * immediately after the last option ("Type something." on current builds,
+ * "Other" on older ones; a trailing "Chat about this" row sits further down
+ * and is never navigated to). First option is pre-selected. Down to navigate,
+ * Enter to select. For free text: navigate past all options, Enter, type,
+ * Enter. For multiSelect: Space to toggle, Enter to confirm.
  *
  * Returns a human-readable string of what was selected.
  */
@@ -527,6 +547,82 @@ function injectQuizAnswer(target, question, input) {
   return `Other: "${trimmed}"`;
 }
 
+/** Normalize for screen matching: keep only letters+digits, lowercase.
+ *  Collapsing everything else absorbs TUI line wraps, box borders, bullets,
+ *  numbering and punctuation drift between the tool input and what CC renders. */
+function quizNorm(s) {
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+/**
+ * Is `question` the quiz currently rendered in the pane? Answers are injected
+ * as blind keystrokes, so this screen check is the safety gate (it replaced the
+ * old 5-min TTL — the screen is the truth, not the clock).
+ *
+ * Visible pane ONLY, no scrollback: the dismissed-quiz echoes repeat our own
+ * text — the answered echo shows "question → chosen label" and the Esc echo
+ * shows the question plus ALL labels in order ("(Red / Green / Blue)",
+ * verified empirically) — so question/label needles alone cannot tell a dead
+ * quiz from a live one. Match rule:
+ *   - quiz-specific live chrome must be on screen: the "Type something." /
+ *     "Chat about this" rows (current CC), or a line-anchored "Other" row
+ *     (older CC; line-anchored so prose like "otherwise" can't fake it).
+ *     Deliberately NOT the generic "Enter to select" hint — permission
+ *     dialogs share that chrome and must never pass;
+ *   - plus EITHER all option-label prefixes IN ORDER (how the live list
+ *     renders; keeps short panes working when a long question is clipped
+ *     above the options) OR the question TAIL + ≥ min(2, n) label prefixes
+ *     (tail, not head: small panes clip the top first).
+ *
+ * Retries once after a 500ms blocking wait: a tap can land while the TUI is
+ * still redrawing the next question. Callers are sync, so the wait is sync too
+ * (same Atomics.wait pattern as injectQuizAnswer) — paid only on mismatch.
+ */
+function quizOnScreen(target, question, attempt = 0) {
+  const raw = stripAnsi(capturePaneContent(target, 0));
+  const hay = quizNorm(raw);
+  const qTail = quizNorm(question.question).slice(-24);
+  const labels = question.options.map(o => quizNorm(o.label).slice(0, 12)).filter(Boolean);
+  const hits = labels.filter(l => hay.includes(l)).length;
+  let pos = 0;
+  let orderedList = labels.length > 0;
+  for (const l of labels) {
+    const at = hay.indexOf(l, pos);
+    if (at < 0) { orderedList = false; break; }
+    pos = at + l.length;
+  }
+  const liveChrome = hay.includes('typesomething') || hay.includes('chataboutthis')
+    || /^\s*(?:❯\s*)?\d*\.?\s*(?:\[[ x]\]\s*)?Other\.?\s*$/im.test(raw);
+  const ok = liveChrome
+    && (orderedList
+      || ((!qTail || hay.includes(qTail)) && hits >= Math.min(2, labels.length)));
+  if (ok) return true;
+  if (attempt === 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    return quizOnScreen(target, question, 1);
+  }
+  // debug level: the pane may contain sensitive terminal content.
+  logger.debug('quizOnScreen mismatch', { snippet: hay.slice(-300) });
+  return false;
+}
+
+/** Strip the inline keyboard from a sent quiz question so dead buttons don't
+ *  linger in chat (no-op on transports without editable messages/keyboards). */
+function stripQuizButtons(quiz, qIdx, note) {
+  if (!transport?.caps.editMessages || !transport.caps.inlineKeyboards) return;
+  const rec = quiz.msgIds?.[qIdx];
+  if (!rec) return;
+  transport.editText(rec.target, rec.messageId, rec.text + (note ? `\n\n${note}` : ''))
+    .catch(err => logger.debug('Quiz button strip skipped', { error: err.message }));
+}
+
+/** Cancel the pending quiz and strip the current question's dead buttons. */
+function cancelQuiz(sess, note) {
+  const quiz = sess.pendingQuiz;
+  sess.pendingQuiz = null;
+  if (quiz) stripQuizButtons(quiz, quiz.questionIndex, note);
+}
+
 /**
  * Handle a typed reply to a pending quiz (button taps go through handleCallback).
  * `replyTarget` is the opaque IM target; `target` below is the tmux pane.
@@ -539,7 +635,7 @@ function handleQuizResponse(sess, text, replyTarget) {
   const target = tmuxTargetFor(sess);
   if (!target || !paneExists(target)) {
     send('❌ tmux 不可用');
-    sess.pendingQuiz = null;
+    cancelQuiz(sess, '（已失效）');
     return;
   }
 
@@ -579,17 +675,20 @@ function submitQuizForm(target, attempt = 0) {
 
 /** Advance to the next quiz question (or clear state). Shared by text + callback paths. */
 function advanceQuiz(sess, replyTarget) {
-  sess.pendingQuiz.questionIndex++;
-  if (sess.pendingQuiz.questionIndex >= sess.pendingQuiz.questions.length) {
+  const quiz = sess.pendingQuiz;
+  stripQuizButtons(quiz, quiz.questionIndex, '（已回答 ✅）');
+  quiz.questionIndex++;
+  if (quiz.questionIndex >= quiz.questions.length) {
     const target = tmuxTargetFor(sess);
     sess.pendingQuiz = null;
     setTimeout(() => submitQuizForm(target), 500);
   } else {
     setTimeout(() => {
-      if (sess.pendingQuiz) {
-        sess.pendingQuiz.selected = new Set();
-        sendQuiz(sess, sess.pendingQuiz.questions[sess.pendingQuiz.questionIndex], replyTarget, sess.pendingQuiz.questionIndex);
-      }
+      // Identity, not truthiness: a cancel + NEW quiz within the delay must not
+      // get the old quiz's next question sent on top of it.
+      if (sess.pendingQuiz !== quiz) return;
+      quiz.selected = new Set();
+      sendQuiz(sess, quiz.questions[quiz.questionIndex], replyTarget, quiz.questionIndex);
     }, 800);
   }
 }
@@ -2211,7 +2310,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false)
 
 /**
  * Handle an inline-keyboard button tap (Telegram). Decodes the index-encoded
- * callback data (`model:<i>` / `sw:<i>` / `quiz:<qIdx>:<optIdx|done>`) and routes
+ * callback data (`model:<i>` / `sw:<i>` / `quiz:<gen>:<qIdx>:<optIdx|done>`) and routes
  * into the SAME handlers the text path uses. Stale taps (expired menu / removed
  * session / wrong question) are acknowledged gracefully without mis-injecting.
  */
@@ -2338,24 +2437,32 @@ async function handleCallback(inbound) {
     return;
   }
 
-  // ── quiz:<sid>:<qIdx>:<optIdx|done> ──
+  // ── quiz:<sid>:<gen>:<qIdx>:<optIdx|done> ──
   if (verb === 'quiz') {
-    if (!sess || !sess.pendingQuiz || Date.now() > sess.pendingQuiz.expires) {
-      if (sess) sess.pendingQuiz = null;
-      ack('问卷已过期'); return;
-    }
+    if (!sess || !sess.pendingQuiz) { ack('该问卷已失效'); return; }
     const quiz = sess.pendingQuiz;
-    const qIdx = parseInt(segs[2], 10);
-    const rest = segs[3];
-    if (qIdx !== quiz.questionIndex) { ack('该问题已过期'); return; }
+    const gen  = segs[2];
+    const qIdx = parseInt(segs[3], 10);
+    const rest = segs[4];
+    // gen mismatch = buttons from an earlier quiz. The screen check below can't
+    // catch this (the CURRENT quiz is legitimately on screen) — without it the
+    // old optIdx would be injected into the new question's options.
+    if (gen !== quiz.gen) { ack('该问卷已失效'); return; }
+    if (qIdx !== quiz.questionIndex) { ack('该问题已回答'); return; }
     const q = quiz.questions[quiz.questionIndex];
     const tmux = tmuxTargetFor(sess);
+    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); cancelQuiz(sess, '（已失效）'); return; }
+    if (!quizOnScreen(tmux, q)) {
+      cancelQuiz(sess, '（已失效）');
+      ack('终端已离开问卷界面');
+      send('⚠️ 终端已离开问卷界面（可能已在终端作答或已取消），问卷已关闭');
+      return;
+    }
 
     if (q.multiSelect) {
       if (rest === 'done') {
         const sel = [...(quiz.selected || new Set())].sort((a, b) => a - b);
         if (sel.length === 0) { ack('请至少选择一项'); return; }
-        if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); sess.pendingQuiz = null; return; }
         try {
           const selected = injectQuizAnswer(tmux, q, sel.map(n => n + 1).join(','));
           ack('已提交'); send(`✅ ${selected}`);
@@ -2377,7 +2484,6 @@ async function handleCallback(inbound) {
     // single-select
     const optIdx = parseInt(rest, 10);
     if (isNaN(optIdx) || optIdx < 0 || optIdx >= q.options.length) { ack('无效选项'); return; }
-    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); sess.pendingQuiz = null; return; }
     try {
       const selected = injectQuizAnswer(tmux, q, String(optIdx + 1));
       ack(selected); send(`✅ ${selected}`);
@@ -2420,6 +2526,13 @@ function scheduleInject(sess) {
       sess.lastInjectedTranscript = entry.transcriptPath || null;
       sess.injectedTarget         = item.target;
       sess.injectedMessageId      = item.messageId || '';
+      sess.interimLastScanAt      = 0;
+      // Reset interim dedup state ON the chain, not synchronously: a previous
+      // turn's still-queued scan or end-of-turn flush must keep seeing its own
+      // turn's sent-uuids (else it re-sends everything), while the new turn's
+      // scans — always chained later — start from a clean slate.
+      const interimReset = () => { sess.interimSentUuids = []; sess.interimLastText = null; };
+      sess.interimChain = (sess.interimChain || Promise.resolve()).then(interimReset, interimReset);
       persistStates();
       appendHistory({ type: 'user_wechat', session: sess.name, text: item.text });
       reactTo(item.target, item.messageId, '👀');
@@ -2511,14 +2624,77 @@ async function forwardResponse(target, fullText, opts = {}) {
 // ── Hook event handlers ──────────────────────────────────────────────
 
 /**
+ * Private-chat / WeChat fallback: several sessions share one conversation, so
+ * tag a reply with its origin session. Topic-routed replies need no tag.
+ */
+function tagForTarget(reg, sess, target, text) {
+  const entry = reg.sessions[sess.name];
+  const viaTopic = !!(entry?.imTarget && entry.imTarget === target);
+  return (!viaTopic && Object.keys(reg.sessions).length > 1) ? `【${sess.name}】\n${text}` : text;
+}
+
+/**
+ * Scan the turn's transcript for unsent interim text blocks (prose emitted
+ * before tool calls — the pieces findResponseToInjected drops) and forward the
+ * meaningful ones in order. Every scan is chained on sess.interimChain, so
+ * overlapping scans, the end-of-turn flush, and the final forward can never
+ * interleave or reorder. `anchor` is the lastInjectedText captured when the
+ * scan was scheduled; live scans abort once the turn resolves or changes,
+ * while the end-of-turn flush passes live=false because it runs on the
+ * captured anchor AFTER pushResponse cleared the session state.
+ * Returns the chained promise so callers can order work after it.
+ */
+function runInterimScan(sess, anchor, readPath, { live = true } = {}) {
+  const job = async () => {
+    if (!FORWARD_INTERIM || !transport || !anchor || !readPath) return;
+    if (live && sess.lastInjectedText !== anchor) return;   // turn resolved/changed
+    const entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
+    const blocks = findInterimTexts(entries, anchor);
+    const target = sess.injectedTarget || lastTarget;
+    if (!target) return;
+    const reg = readSessions();
+    for (const b of blocks) {
+      if (b.text.length < INTERIM_MIN_LEN) continue;
+      // ANY overlap with the sent set counts as sent: if a message's text lines
+      // flushed across two scans, re-sending the merged block would duplicate
+      // the part that already went out — losing a rare tail fragment is the
+      // lesser evil.
+      if (b.uuids.some(u => sess.interimSentUuids.includes(u))) continue;
+      if (live && sess.lastInjectedText !== anchor) return;  // re-check before each send
+      // forwardResponse handles its own retries and never throws — a send
+      // failure cannot wedge the chain.
+      await forwardResponse(target, tagForTarget(reg, sess, target, b.text),
+                            { filename: docFilename(sess.name) });
+      sess.interimSentUuids.push(...b.uuids);
+      if (sess.interimSentUuids.length > 400) sess.interimSentUuids = sess.interimSentUuids.slice(-200);
+      sess.interimLastText = b.text;
+      persistStates();  // restart mid-turn must not resend these blocks
+      appendHistory({ type: 'assistant_interim', session: sess.name, text: b.text.slice(0, 500) });
+      logger.info('Forwarded interim block', { session: sess.name, chars: b.text.length });
+    }
+  };
+  const chained = (sess.interimChain || Promise.resolve()).then(job, job);
+  sess.interimChain = chained.catch(err => logger.warn('Interim scan failed', { error: err.message }));
+  return sess.interimChain;
+}
+
+/**
  * Forward a complete assistant response to the IM and clear injection state.
  * Uses the reply target captured at injection time (injectedTarget) — NOT the
  * live "latest" target — so a newer incoming message can't redirect this reply
  * to the wrong conversation. Shared by every Claude/Codex forward path.
+ * opts.dedupeInterim: the caller pushed an INCOMPLETE text (idle cleanup) —
+ * that is really the last interim block, so skip the final forward when the
+ * flush (or an earlier scan) already delivered it. Decided AFTER the flush
+ * runs, because the flush itself may be the one that sends it.
  */
-function pushResponse(sess, responseText) {
+function pushResponse(sess, responseText, opts = {}) {
   const target = sess.injectedTarget || lastTarget;
   const messageId = sess.injectedMessageId;
+  // Snapshot the turn BEFORE clearing it: the end-of-turn interim flush below
+  // runs on the captured anchor after lastInjectedText is gone.
+  const flushAnchor   = sess.lastInjectedText;
+  const flushReadPath = sess.lastInjectedTranscript;
   // Final status-message edit: turn summary replaces the live progress line.
   finishTurnStatus(sess, `✅ 完成 · ${sess.turnToolCount} 个工具 · ${fmtDur(Date.now() - sess.turnStartedAt)}`);
   if (transport && target) transport.sendTyping(target, false).catch(() => {});
@@ -2536,16 +2712,29 @@ function pushResponse(sess, responseText) {
     logger.error('pushResponse: no reply target, dropping forward', { chars: responseText.length });
     return;
   }
-  // Private-chat / WeChat fallback: several sessions share one conversation, so
-  // tag the response with its origin. Topic-routed replies need no tag.
-  let out = responseText;
   const reg = readSessions();
-  const entry = reg.sessions[sess.name];
-  const viaTopic = !!(entry?.imTarget && entry.imTarget === target);
-  if (!viaTopic && Object.keys(reg.sessions).length > 1) {
-    out = `【${sess.name}】\n${responseText}`;
-  }
-  forwardResponse(target, out, { filename: docFilename(sess.name) });
+  const out = tagForTarget(reg, sess, target, responseText);
+  // Backstop: interim blocks the PreToolUse ticks missed go out BEFORE the
+  // final response. Chained on interimChain, so an in-flight scheduled scan
+  // finishes first, then this flush, then the final — never out of order.
+  const flush = (FORWARD_INTERIM && sessionKind(reg.sessions[sess.name]) === 'claude')
+    ? runInterimScan(sess, flushAnchor, flushReadPath, { live: false })
+    : Promise.resolve();
+  const finalJob = async () => {
+    // interimLastText is read AFTER the flush: it reflects everything delivered
+    // as interim, including a block the flush itself just sent. endsWith covers
+    // a merged multi-line block whose tail line is the pseudo-final text.
+    if (opts.dedupeInterim && sess.interimLastText
+        && (sess.interimLastText === responseText || sess.interimLastText.endsWith(responseText))) {
+      logger.info('Final text already delivered as interim, skipping forward', { session: sess.name, chars: responseText.length });
+      return;
+    }
+    await forwardResponse(target, out, { filename: docFilename(sess.name) });
+  };
+  // The final forward joins the chain too, so the NEXT turn's first interim
+  // scan (chained later) cannot land between this turn's response chunks.
+  sess.interimChain = flush.then(finalJob, finalJob)
+    .catch(err => logger.warn('Final forward failed', { error: err.message }));
 }
 
 /** Safe .md filename for a session's long response. */
@@ -2561,6 +2750,11 @@ function docFilename(name) {
  */
 function abandonTurn(sess, reason) {
   const target = sess.injectedTarget || lastTarget;
+  // The turn died — flush any captured interim text first; it is all the user
+  // will ever get from this turn.
+  if (FORWARD_INTERIM && sess.lastInjectedText) {
+    runInterimScan(sess, sess.lastInjectedText, sess.lastInjectedTranscript, { live: false });
+  }
   finishTurnStatus(sess, `⚠️ ${reason || '未捕获到回复'}`);
   if (transport && target) transport.sendTyping(target, false).catch(() => {});
   reactTo(target, sess.injectedMessageId, '💔');
@@ -2801,6 +2995,12 @@ async function onStop(payload) {
 
   // ── Path A: Complete response → forward to the IM
   if (responseText && responseComplete && sess.lastInjectedText) {
+    if (sess.pendingQuiz) {
+      // A complete response means AskUserQuestion has returned — the quiz was
+      // answered (or dismissed) at the terminal without the bridge seeing it.
+      logger.info('Quiz resolved in terminal, clearing', { session: sess.name });
+      cancelQuiz(sess, '（已在终端处理）');
+    }
     pushResponse(sess, responseText);
     logger.info('Pushed response', { chars: responseText.length });
     scheduleInject(sess);
@@ -2918,6 +3118,23 @@ function onPreToolUse(payload) {
   sess.busy = true;
   cancelPending(sess);
 
+  // Interim forwarding: check for meaningful mid-turn text at every tool-call
+  // gap. Deferred to a later tick so the synchronous approval reply below is
+  // never delayed; debounced so a rapid tool loop doesn't stack scans. Placed
+  // before the AUTO_APPROVE opt-out so the feature works either way.
+  if (FORWARD_INTERIM && kind === 'claude' && sess.lastInjectedText
+      && Date.now() - sess.interimLastScanAt >= INTERIM_SCAN_GAP_MS) {
+    sess.interimLastScanAt = Date.now();
+    const anchor = sess.lastInjectedText;
+    // Pane-routed payloads report their own transcript — trust it over the
+    // scanner's inject-time guess (same trust model as onStop). A wrong path
+    // is harmless either way: no anchor match → nothing sent.
+    const readPath = (route.via === 'pane' && payload.transcript_path)
+      ? payload.transcript_path
+      : (sess.lastInjectedTranscript || payload.transcript_path || null);
+    setTimeout(() => { runInterimScan(sess, anchor, readPath); }, 0);
+  }
+
   if (!AUTO_APPROVE) return undefined;
 
   const toolName  = payload.tool_name || '?';
@@ -2945,9 +3162,14 @@ function onPreToolUse(payload) {
       sess.pendingQuiz = {
         questions,
         questionIndex: 0,
-        expires: Date.now() + 5 * 60 * 1000, // 5 min timeout
+        // Taps on a PREVIOUS quiz's leftover buttons must not answer this one.
+        // Timestamp, not a counter: counters (and sids) reset deterministically
+        // on daemon restart, so a pre-restart button could collide with a fresh
+        // quiz. Chat buttons outlive the process; the guard must too.
+        gen: Date.now().toString(36),
         target: quizTarget,
         selected: new Set(),
+        msgIds: {},      // qIdx → {messageId, target, text}, for stripping dead buttons
       };
       sendQuiz(sess, questions[0], quizTarget, 0);
       logger.info('Quiz forwarded', { session: sess.name, numQuestions: questions.length, q: questions[0].question.slice(0, 80) });
@@ -3005,8 +3227,17 @@ async function onNotification(payload) {
     // 3. lastInjectedText still set → CC stopped without triggering Stop
     //    (shouldn't happen, but clean up to avoid stuck state)
     if (sess.pendingQuiz) {
-      logger.info('Notification: CC waiting for quiz input', { session: sess.name });
-      return;
+      const quizTmux = tmuxTargetFor(sess);
+      const q = sess.pendingQuiz.questions[sess.pendingQuiz.questionIndex];
+      if (quizTmux && paneExists(quizTmux) && quizOnScreen(quizTmux, q)) {
+        logger.info('Notification: CC waiting for quiz input', { session: sess.name });
+        return;
+      }
+      // A stale quiz would suppress the compaction/orphan handling below (and
+      // the status heartbeat) indefinitely now that there is no TTL — this
+      // Notification is the sweeper that keeps staleness bounded.
+      logger.info('Notification: pendingQuiz no longer on screen, clearing', { session: sess.name });
+      cancelQuiz(sess, '（已失效）');
     }
     const target = tmuxTargetFor(sess);
     if (target && tryAutoConfirmCompaction(sess, target)) {
@@ -3054,7 +3285,10 @@ async function onNotification(payload) {
         }
       }
       if (result?.text) {
-          pushResponse(sess, result.text);
+          // An incomplete result here is really the LAST interim text, not a
+          // final — let pushResponse skip the forward if interim delivery
+          // (including its own end-of-turn flush) already sent it.
+          pushResponse(sess, result.text, { dedupeInterim: !result.complete });
           logger.info('Pushed response via idle cleanup', { chars: result.text.length, complete: result.complete });
           scheduleInject(sess);
           return;
@@ -3345,16 +3579,24 @@ function onInboundMessage(inbound) {
     }
   }
 
-  // Consume a pending quiz (typed answer) for the context session.
+  // Consume a pending quiz (typed answer) for the context session — but only
+  // while the quiz is really still on the terminal screen (see quizOnScreen).
   if (sess?.pendingQuiz) {
-    if (Date.now() > sess.pendingQuiz.expires) {
-      logger.info('pendingQuiz expired, clearing');
-      sess.pendingQuiz = null;
-      transport.sendText(replyTarget, '⏰ 问卷已超时取消，本条按普通消息处理').catch(() => {});
-    } else {
+    const quiz = sess.pendingQuiz;
+    const q = quiz.questions[quiz.questionIndex];
+    const quizTmux = tmuxTargetFor(sess);
+    if (!quizTmux || !paneExists(quizTmux)) {
+      cancelQuiz(sess, '（已失效）');
+      transport.sendText(replyTarget, '❌ tmux 不可用，问卷已取消').catch(() => {});
+      return;
+    }
+    if (quizOnScreen(quizTmux, q)) {
       handleQuizResponse(sess, text, replyTarget);
       return;
     }
+    logger.info('pendingQuiz no longer on screen, clearing');
+    cancelQuiz(sess, '（已失效）');
+    transport.sendText(replyTarget, '💤 终端已离开问卷界面（可能已在终端作答或已取消），问卷已取消，本条按普通消息处理').catch(() => {});
   }
 
   // ── Route slash commands ─────────────────────────────────────────
@@ -3473,6 +3715,8 @@ async function main() {
     sess.lastInjectedTranscript = turn.lastInjectedTranscript || null;
     sess.injectedTarget         = turn.injectedTarget || '';
     sess.injectedMessageId      = turn.injectedMessageId || '';
+    sess.interimSentUuids       = turn.interimSentUuids || [];
+    sess.interimLastText        = turn.interimLastText || null;
     sessionStates.set(key, sess);
     sidToState.set(sess.sid, sess);
     logger.warn('Startup: restored in-flight turn', { session: sess.name, text: turn.lastInjectedText.slice(0, 40) });

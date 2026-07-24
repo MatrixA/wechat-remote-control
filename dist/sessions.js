@@ -126,6 +126,10 @@ export function newSessionState(key, name) {
         compactionGraceUntil: 0,
         compactionGraceTranscript: null,
         lastPushedText: null,
+        interimSentUuids: [],
+        interimLastScanAt: 0,
+        interimChain: null,
+        interimLastText: null,
     };
 }
 /**
@@ -223,6 +227,8 @@ export function persistableState(s) {
         lastInjectedTranscript: s.lastInjectedTranscript,
         injectedTarget: s.injectedTarget,
         injectedMessageId: s.injectedMessageId,
+        interimSentUuids: s.interimSentUuids,
+        interimLastText: s.interimLastText,
     };
 }
 /**
@@ -244,6 +250,8 @@ export function migrateLegacyIlink(ilink, reg) {
             lastInjectedTranscript: ilink.lastInjectedTranscript ?? null,
             injectedTarget: ilink.target || '',
             injectedMessageId: '',
+            interimSentUuids: [],
+            interimLastText: null,
         },
     };
 }

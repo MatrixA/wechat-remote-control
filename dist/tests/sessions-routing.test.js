@@ -82,6 +82,8 @@ test('persistableState round-trips the crash-recovery fields', () => {
         lastInjectedTranscript: '/t/p-alpha/a.jsonl',
         injectedTarget: '42',
         injectedMessageId: '10',
+        interimSentUuids: [],
+        interimLastText: null,
     });
 });
 test('migrateLegacyIlink attaches a legacy in-flight turn to the active session key', () => {
