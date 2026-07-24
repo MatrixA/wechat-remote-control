@@ -58,6 +58,14 @@ export interface InboundMessage {
     userKey: string;
     /** IM message id of this inbound message (Telegram; used for reactions). */
     messageId?: string;
+    /**
+     * IM message id this message replies to (Telegram reply_to_message). Caveat:
+     * inside a forum topic, a NON-reply message still carries reply_to_message
+     * pointing at the topic's root service message — presence alone never means
+     * "the user replied"; only exact equality with a message id the bridge sent
+     * (e.g. a ForceReply prompt) is meaningful.
+     */
+    replyToMessageId?: string;
     /** Present when kind === 'topic_edited': the topic's new display name. */
     topicName?: string;
 }
@@ -119,7 +127,15 @@ export interface Transport {
     /** Begin receiving. Resolves once the receive loop is wired; runs until stop(). */
     start(onMessage: (m: InboundMessage) => void, onEvent: (e: TransportEvent) => void): Promise<void>;
     stop(): void;
-    sendText(target: string, text: string): Promise<SentMessage>;
+    /**
+     * `opts.forceReply` asks the client to open its reply UI on this message
+     * (Telegram ForceReply) so the user's next message arrives as a reply the
+     * core can match by id. Transports without the concept ignore it — an
+     * implementation may declare fewer parameters (WeChat does).
+     */
+    sendText(target: string, text: string, opts?: {
+        forceReply?: boolean;
+    }): Promise<SentMessage>;
     /**
      * Edit a prior message. Only meaningful when caps.editMessages. `buttons`
      * (when given) replaces the message's inline keyboard — Telegram drops the

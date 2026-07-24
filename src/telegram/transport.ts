@@ -20,7 +20,7 @@ import { logger } from '../logger.js';
 import type {
   Transport, TransportCapabilities, SentMessage, Button, MenuCommand, OutboundDocument,
 } from '../transport/types.js';
-import type { TgInlineKeyboardMarkup } from './types.js';
+import type { TgInlineKeyboardMarkup, TgForceReply } from './types.js';
 
 const TYPING_REFRESH_MS = 4_000; // Telegram chat-action expires after ~5s
 
@@ -81,7 +81,7 @@ export function createTelegramTransport(): Transport {
   async function deliver(
     target: string,
     text: string,
-    reply_markup?: TgInlineKeyboardMarkup,
+    reply_markup?: TgInlineKeyboardMarkup | TgForceReply,
     opts: { expandable?: boolean } = {},
   ): Promise<SentMessage> {
     const { chatId, threadId } = decodeTarget(target);
@@ -146,8 +146,9 @@ export function createTelegramTransport(): Transport {
       monitor?.stop();
     },
 
-    async sendText(target: string, text: string): Promise<SentMessage> {
-      return deliver(target, text, undefined, { expandable: true });
+    async sendText(target: string, text: string, opts?: { forceReply?: boolean }): Promise<SentMessage> {
+      const markup: TgForceReply | undefined = opts?.forceReply ? { force_reply: true } : undefined;
+      return deliver(target, text, markup, { expandable: true });
     },
 
     async editText(target: string, messageId: string, text: string, buttons?: Button[][]): Promise<void> {

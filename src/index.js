@@ -49,6 +49,7 @@ import {
   resolveSessionForHook, resolveSessionForInbound,
   persistableState, migrateLegacyIlink, planTopicSync,
   tmuxSessionOf, effectiveFocus, orderedSessionNames, sanitizeSessionName,
+  renameTmuxGroupInRegistry,
 } from '../dist/sessions.js';
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -555,11 +556,34 @@ function handleQuizResponse(sess, text, replyTarget) {
   advanceQuiz(sess, replyTarget);
 }
 
+/**
+ * After the last question, CC's AskUserQuestion TUI auto-advances to a final
+ * "Review your answers" screen with "❯ Submit answers" already focused — one
+ * Enter submits.  The per-question answers each sent an Enter that advanced the
+ * tab, but nothing ever presses that final Submit, so CC hangs.  Send it here.
+ *
+ * Guarded on the pane so we NEVER inject a stray Enter: we match only the
+ * review-screen text ("Submit answers" / "Review your answers"), not the tab
+ * bar's bare "✔ Submit" that shows on every question screen.  Retries a few
+ * times because the review screen takes a moment to render after the last Enter.
+ */
+function submitQuizForm(target, attempt = 0) {
+  if (!target || !paneExists(target)) return;
+  const content = stripAnsi(capturePaneContent(target, 20));
+  if (/submit (your )?answers|review your answers/i.test(content)) {
+    sendTmuxKey(target, 'Enter');
+    return;
+  }
+  if (attempt < 4) setTimeout(() => submitQuizForm(target, attempt + 1), 500);
+}
+
 /** Advance to the next quiz question (or clear state). Shared by text + callback paths. */
 function advanceQuiz(sess, replyTarget) {
   sess.pendingQuiz.questionIndex++;
   if (sess.pendingQuiz.questionIndex >= sess.pendingQuiz.questions.length) {
+    const target = tmuxTargetFor(sess);
     sess.pendingQuiz = null;
+    setTimeout(() => submitQuizForm(target), 500);
   } else {
     setTimeout(() => {
       if (sess.pendingQuiz) {
@@ -1615,6 +1639,19 @@ async function performSwitch(targetName, send) {
 let fcMenu = null; // { names, expires, target, messageId } — snapshot behind fc:<idx> callbacks; target/messageId let a focus switch re-render the menu in place
 const FC_MENU_TTL = 15 * 60 * 1000;
 
+// ── tmux-session (group) rename ──────────────────────────────────────
+// Renaming a GROUP (`tmux rename-session`) is distinct from renameSession()'s
+// window rename: the /ls //fc menu's ✏️ flow sends a ForceReply prompt and the
+// user's REPLY to that prompt carries the new name. In-memory only (like
+// fcMenu): a daemon restart invalidates the prompt — a reply to a pre-restart
+// prompt is unrecognizable and routes to the agent as normal text.
+let pendingTmuxRename = null; // { groupName, promptMessageId, target, expires }
+// Prompt ids no longer active (superseded / expired / consumed). A reply to a
+// retired prompt was clearly meant as a rename, so it gets an "expired" notice
+// instead of being injected into the agent. Bounded: cleared when it grows.
+const retiredRenamePrompts = new Set();
+const TMUX_RENAME_TTL = 5 * 60 * 1000;
+
 /** Registry names grouped by tmux session, in orderedSessionNames order. */
 function tmuxGroups(reg) {
   const groups = new Map();
@@ -1652,7 +1689,19 @@ function formatTmuxList(reg) {
 }
 
 function tmuxButtons(names, focus) {
-  return names.map((g, i) => [{ label: `${g === focus ? '🎯 ' : ''}${i + 1}. ${g}`, data: `fc:${i}` }]);
+  const rows = names.map((g, i) => [{ label: `${g === focus ? '🎯 ' : ''}${i + 1}. ${g}`, data: `fc:${i}` }]);
+  // Rename lives behind one extra tap (rnm flips the menu into rename mode) so
+  // the frequent action — focus — keeps full-width rows.
+  rows.push([{ label: '✏️ 重命名', data: 'rnm' }]);
+  return rows;
+}
+
+// Rename mode: same menu message edited in place, each row picks a group to
+// rename (rn:<idx> against the fcMenu snapshot), ↩︎ flips back to focus mode.
+function tmuxRenameButtons(names) {
+  const rows = names.map((g, i) => [{ label: `✏️ ${i + 1}. ${g}`, data: `rn:${i}` }]);
+  rows.push([{ label: '↩︎ 返回', data: 'rnb' }]);
+  return rows;
 }
 
 /**
@@ -1773,6 +1822,116 @@ function renameSession(reg, oldName, newName, { topicName } = {}) {
 }
 
 /**
+ * Resolve a user-typed group reference — /ls number, exact name, then
+ * substring — against the current group list. Shared by #fc and #rnt so both
+ * commands accept the same references the /ls menu displays.
+ */
+function resolveGroupArg(groupNames, arg) {
+  const num = parseInt(arg, 10);
+  if (!isNaN(num) && num >= 1 && num <= groupNames.length) return groupNames[num - 1];
+  return groupNames.find(g => g.toLowerCase() === arg.toLowerCase())
+    ?? groupNames.find(g => g.toLowerCase().includes(arg.toLowerCase()))
+    ?? null;
+}
+
+/** Error string when newName can't be a tmux-session name, else null. */
+function validateGroupRename(reg, newName) {
+  if (!newName) return '名字不能为空';
+  // tmux targets use ':' and '.' as separators — same rule as #rename.
+  if (/[:.\n\t]/.test(newName)) return '名字不能包含 : . 制表符或换行';
+  if (tmuxGroups(reg).has(newName)) return `已存在同名 tmux 会话: ${newName}`;
+  return null;
+}
+
+/**
+ * Rename a tmux SESSION (the /ls group). tmux first, registry second: the
+ * scanner rewrites entry.tmux from live tmux every pass, so a registry-only
+ * rename would be reverted within 30s — tmux failure therefore ABORTS with no
+ * registry write (the opposite of renameSession's non-fatal window rename).
+ * On success one writeSessions rewrites every member's coordinates AND
+ * focusedTmuxSession (otherwise the scanner's focus-vanished check clears the
+ * focus for a scan interval), then migrates the runtime-state keys of
+ * paneId-less members (their sessionKeyFor embeds the coordinates).
+ */
+function performTmuxGroupRename(reg, oldName, newName) {
+  const members = tmuxGroups(reg).get(oldName) || [];
+  if (members.length === 0) return { ok: false, error: `tmux 会话「${oldName}」已不存在` };
+  // A member pane id resolves to its session and survives window moves; '='
+  // forces an exact name match for pre-paneId entries.
+  const anchor = members.map(n => reg.sessions[n].paneId).find(Boolean) || ('=' + oldName);
+  try {
+    execFileSync('tmux', ['rename-session', '-t', anchor, newName],
+      { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
+  } catch (err) {
+    // stderr carries tmux's own reason (e.g. "duplicate session: x" for a
+    // session outside the registry that the collision pre-check can't see).
+    const detail = String(err.stderr || err.message || '').trim();
+    logger.error('tmux rename-session failed', { oldName, newName, error: detail });
+    return { ok: false, error: detail || 'tmux rename-session 失败' };
+  }
+  const { keyMigrations } = renameTmuxGroupInRegistry(reg, oldName, newName);
+  writeSessions(reg);
+  // Same key-migration pattern as reconcileStates; sidToState references the
+  // same state object, so it needs no touch-up.
+  for (const { from, to } of keyMigrations) {
+    const st = sessionStates.get(from);
+    if (!st || sessionStates.has(to)) continue;
+    sessionStates.delete(from);
+    st.key = to;
+    sessionStates.set(to, st);
+  }
+  if (keyMigrations.length > 0) persistStates();
+  logger.info('tmux session renamed', { oldName, newName });
+  return { ok: true };
+}
+
+/**
+ * Consume the user's reply to a ✏️ ForceReply prompt (the caller already
+ * matched replyToMessageId === promptMessageId). Validation failures KEEP the
+ * pending so the user just replies again; terminal outcomes (success, group
+ * gone, tmux failure, expiry) retire the prompt — a later reply to it gets
+ * the "expired" notice instead of reaching the agent.
+ */
+async function handleTmuxRenameReply(inbound) {
+  const pending = pendingTmuxRename;
+  const send = (m) => transport.sendText(inbound.target, m).catch(() => {});
+  const retire = () => { retiredRenamePrompts.add(pending.promptMessageId); pendingTmuxRename = null; };
+  if (Date.now() > pending.expires) {
+    retire();
+    await send('⏰ 已过期，请重新点击 ✏️');
+    return;
+  }
+  const reg = readSessions();
+  // The registry may have moved since the prompt (scanner rename, session gone).
+  if (!tmuxGroups(reg).has(pending.groupName)) {
+    retire();
+    await send(`❌ tmux 会话「${pending.groupName}」已不存在，可能已被关闭或重命名`);
+    return;
+  }
+  const newName = inbound.text.trim();
+  if (newName === pending.groupName) {
+    retire();
+    await send(`已经叫 ${newName} 了，无需修改`);
+    return;
+  }
+  const invalid = validateGroupRename(reg, newName);
+  if (invalid) { await send(`${invalid}，请重新回复新名字`); return; }
+  const r = performTmuxGroupRename(reg, pending.groupName, newName);
+  retire();
+  if (!r.ok) { await send(`❌ tmux 重命名失败: ${r.error}`); return; }
+  // Fold the receipt into the prompt message instead of growing the chat; a
+  // fresh send is the fallback for a deleted prompt.
+  const receipt = `✅ 已重命名 tmux 会话: ${pending.groupName} → ${newName}（话题与聚焦不受影响）`;
+  if (transport.caps.editMessages) {
+    await transport.editText(pending.target, pending.promptMessageId, receipt)
+      .catch(() => send(receipt));
+  } else {
+    await send(receipt);
+  }
+  await refreshFcMenu(); // the /ls menu tracks the new name in place
+}
+
+/**
  * A topic was renamed in the Telegram UI (long-press → Edit): apply it to the
  * bound session's tmux window + registry. The bridge's own editForumTopic
  * calls echo the same service message — absorbed by the name-equality guard,
@@ -1810,7 +1969,9 @@ async function handleTopicRename(inbound) {
   if (raw !== newName) syncSessionTopics().catch(() => {});
 }
 
-async function handleBridgeCommand(text, replyTarget, ctxSess) {
+// `viaTopic` — whether ctxSess was routed through its own forum topic (vs the
+// General/private-chat active fallback); only #rnt's context resolution cares.
+async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false) {
   const send = (msg) => transport.sendText(replyTarget, msg)
     .catch(err => logger.error('Bridge command reply failed', { error: err.message }));
 
@@ -1858,7 +2019,8 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     } else {
       // No focus buttons on this transport — leave a /sw pointer so the
       // numbered list isn't a dead end (its numbers are /fc's, not /sw's).
-      const hint = !transport.caps.topics && groupNames.length > 0 ? '\n切换默认: /sw <名字/序号>' : '';
+      const hint = !transport.caps.topics && groupNames.length > 0
+        ? '\n切换默认: /sw <名字/序号> · 重命名 tmux 会话: /rnt <新名>' : '';
       await send(list + hint);
     }
     return;
@@ -1919,14 +2081,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
       }
       return;
     }
-    let groupName = null;
-    const num = parseInt(arg, 10);
-    if (!isNaN(num) && num >= 1 && num <= groupNames.length) {
-      groupName = groupNames[num - 1];
-    } else {
-      groupName = groupNames.find(g => g.toLowerCase() === arg.toLowerCase())
-        ?? groupNames.find(g => g.toLowerCase().includes(arg.toLowerCase()));
-    }
+    const groupName = resolveGroupArg(groupNames, arg);
     if (!groupName) { await send(`找不到 tmux 会话: "${arg}"\n\n${formatTmuxList(reg)}`); return; }
     await performFocus(groupName, send);
     return;
@@ -1952,6 +2107,46 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     renameSession(reg, oldName, newName);
     logger.info(`Session renamed via #rename: ${oldName} → ${newName} [${tmuxCoords}]`);
     await send(`✅ 已重命名: ${oldName} → ${newName} [${tmuxCoords}]`);
+    return;
+  }
+
+  // #rnt [<序号|旧名>] <新名> — rename a tmux SESSION (the /ls group), not a
+  // window. Argument rule: with ≥2 tokens, IF the first resolves to an
+  // existing group (number → exact → substring, same as #fc) it names the
+  // group and the rest is the new name; otherwise ALL tokens are the new name
+  // for the context group (topic → that session's group; General / private /
+  // WeChat → the focused group, else the active session's group).
+  if (cmd === '#rnt') {
+    const args = parts.slice(1);
+    if (args.length === 0) {
+      await send('用法: /rnt <新名>（重命名当前 tmux 会话）\n或: /rnt <序号|旧名> <新名>');
+      return;
+    }
+    const reg = readSessions();
+    const groups = tmuxGroups(reg);
+    const groupNames = [...groups.keys()];
+    let oldName = null, newName = null;
+    if (args.length >= 2) {
+      const explicit = resolveGroupArg(groupNames, args[0]);
+      if (explicit) { oldName = explicit; newName = args.slice(1).join(' ').trim(); }
+    }
+    if (!oldName) {
+      newName = args.join(' ').trim();
+      if (viaTopic && ctxSess?.name && reg.sessions[ctxSess.name]) {
+        oldName = tmuxSessionOf(reg.sessions[ctxSess.name]);
+      } else {
+        oldName = effectiveFocus(reg)
+          ?? (reg.active && reg.sessions[reg.active] ? tmuxSessionOf(reg.sessions[reg.active]) : null);
+      }
+    }
+    if (!oldName || !groups.has(oldName)) { await send('当前没有活动 tmux 会话'); return; }
+    if (newName === oldName) { await send(`已经叫 ${newName} 了`); return; }
+    const invalid = validateGroupRename(reg, newName);
+    if (invalid) { await send(invalid); return; }
+    const r = performTmuxGroupRename(reg, oldName, newName);
+    if (!r.ok) { await send(`❌ tmux 重命名失败: ${r.error}`); return; }
+    await send(`✅ 已重命名 tmux 会话: ${oldName} → ${newName}（话题与聚焦不受影响）`);
+    await refreshFcMenu();
     return;
   }
 
@@ -2011,7 +2206,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess) {
     return;
   }
 
-  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 tmux 会话\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号> — 聚焦 tmux 会话（其余话题收起，切回重建）\n  /rename <新名字> — 重命名\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
+  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 tmux 会话\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号> — 聚焦 tmux 会话（其余话题收起，切回重建）\n  /rename <新名字> — 重命名\n  /rnt <新名> — 重命名 tmux 会话（组）\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
 }
 
 /**
@@ -2089,6 +2284,57 @@ async function handleCallback(inbound) {
     // The summary rides the toast and the tapped menu is edited in place (🎯
     // moves) — a tap must not grow the chat with one more confirmation message.
     await performFocus(groupName, ack, { menuMessageId: inbound.messageId });
+    return;
+  }
+
+  // ── rnm — flip the /ls //fc menu into rename mode (edit in place) ──
+  if (verb === 'rnm') {
+    if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
+    const reg = readSessions();
+    const groupNames = [...tmuxGroups(reg).keys()];
+    if (groupNames.length === 0) { ack('暂无会话'); return; }
+    fcMenu.names = groupNames; // rn:<idx> resolves against what this keyboard shows
+    await transport.editText(inbound.target, inbound.messageId,
+      formatTmuxList(reg) + '\n\n✏️ 点选要重命名的 tmux 会话',
+      tmuxRenameButtons(groupNames))
+      .catch(err => logger.debug('rename-mode edit skipped', { error: err.message }));
+    ack();
+    return;
+  }
+
+  // ── rnb — rename mode → back to the normal focus menu ──
+  if (verb === 'rnb') {
+    if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
+    await refreshFcMenu(inbound.messageId);
+    ack();
+    return;
+  }
+
+  // ── rn:<idx> — pick a group to rename → ForceReply prompt ──
+  if (verb === 'rn') {
+    if (!fcMenu || Date.now() > fcMenu.expires) { ack('菜单已过期'); return; }
+    const groupName = fcMenu.names[parseInt(segs[1], 10)];
+    const reg = readSessions();
+    if (!groupName || !tmuxGroups(reg).has(groupName)) {
+      ack('该 tmux 会话已不存在');
+      await refreshFcMenu(inbound.messageId);
+      return;
+    }
+    const sent = await transport.sendText(inbound.target,
+      `✏️ 重命名 tmux 会话「${groupName}」\n回复本条消息，输入新名字（5 分钟内有效）`,
+      { forceReply: true })
+      .catch(err => { logger.error('Rename prompt send failed', { error: err.message }); return null; });
+    if (!sent?.messageId) { ack('发送提示失败'); return; }
+    if (pendingTmuxRename) retiredRenamePrompts.add(pendingTmuxRename.promptMessageId);
+    if (retiredRenamePrompts.size > 50) retiredRenamePrompts.clear();
+    pendingTmuxRename = {
+      groupName,
+      promptMessageId: sent.messageId,
+      target: inbound.target,
+      expires: Date.now() + TMUX_RENAME_TTL,
+    };
+    await refreshFcMenu(inbound.messageId); // flip the menu back to focus mode
+    ack(`回复提示消息，输入「${groupName}」的新名字`);
     return;
   }
 
@@ -2991,6 +3237,7 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
     '  /sw <名字/序号> — 切换默认路由\n' +
     '  /fc <名字/序号> — 聚焦一个 tmux 会话（其余话题收起，切回重建）\n' +
     '  /rename <新名字> — 重命名会话（TG 里直接改话题名也会同步）\n' +
+    '  /rnt <新名> — 重命名 tmux 会话（组）' + (transport?.caps.topics ? '，/ls 菜单里也可点 ✏️' : '') + '\n' +
     '  /model — 切换模型（文字菜单，无需终端交互）\n' +
     '  /esc — 中断当前回合\n\n' +
     '直接发消息即注入对应 session，回复将自动转发；各会话互不阻塞。';
@@ -3037,6 +3284,24 @@ function onInboundMessage(inbound) {
   if (inbound.mediaNote) transport.sendText(replyTarget, inbound.mediaNote).catch(() => {});
 
   logger.info('Inbound message', { from: inbound.userKey, text: text.slice(0, 80) });
+
+  // ── Pending tmux-session rename (reply to a ✏️ ForceReply prompt) ──
+  // Only an EXACT prompt-id match intercepts: forum-topic messages carry
+  // reply_to_message pointing at the topic's root service message even when
+  // the user didn't reply, so mere presence must never trigger this. Non-reply
+  // text always falls through to normal routing/injection.
+  if (inbound.replyToMessageId) {
+    if (retiredRenamePrompts.has(inbound.replyToMessageId)) {
+      // A name meant for a superseded/expired prompt — never inject it.
+      transport.sendText(replyTarget, '⏰ 已过期，请重新点击 ✏️').catch(() => {});
+      return;
+    }
+    if (pendingTmuxRename && inbound.replyToMessageId === pendingTmuxRename.promptMessageId) {
+      handleTmuxRenameReply(inbound)
+        .catch(err => logger.error('tmux rename reply failed', { error: err.message }));
+      return;
+    }
+  }
 
   // Resolve the context session: a topic target routes to its bound session;
   // private chat / General topic / WeChat route to the active session. When
@@ -3102,6 +3367,7 @@ function onInboundMessage(inbound) {
   else if (/^\/fc(\s|$)/i.test(cmdText)) cmdText = '#fc' + cmdText.slice(3);
   else if (/^\/rename(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(7);
   else if (/^\/mv(\s|$)/i.test(cmdText)) cmdText = '#rename' + cmdText.slice(3);
+  else if (/^\/rnt(\s|$)/i.test(cmdText)) cmdText = '#rnt' + cmdText.slice(4);
   else if (/^\/model(\s|$)/i.test(cmdText)) cmdText = '#model' + cmdText.slice(6);
   else if (/^\/bind\b/i.test(cmdText)) cmdText = '#bind';
   else if (/^\/esc\b/i.test(cmdText)) cmdText = '#esc';
@@ -3114,7 +3380,7 @@ function onInboundMessage(inbound) {
   }
 
   if (cmdText.startsWith('#')) {
-    handleBridgeCommand(cmdText, replyTarget, sess);
+    handleBridgeCommand(cmdText, replyTarget, sess, !!routed?.viaTopic);
     return;
   }
 
@@ -3178,6 +3444,7 @@ const MENU_COMMANDS = [
   { command: 'fc',     description: '聚焦一个 tmux 会话（其余话题收起，切回重建）' },
   { command: 'model',  description: '切换模型' },
   { command: 'rename', description: '重命名当前会话' },
+  { command: 'rnt',    description: '重命名 tmux 会话（组）' },
   { command: 'esc',    description: '中断当前回合' },
   { command: 'bind',   description: '在话题群里绑定（每会话一个话题）' },
   { command: 'start',  description: '使用说明' },

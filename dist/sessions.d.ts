@@ -63,6 +63,31 @@ export declare function orderedSessionNames(reg: Registry): string[];
  * become '-'. Returns '' when nothing usable survives.
  */
 export declare function sanitizeSessionName(raw: string): string;
+export interface GroupRenameResult {
+    /** Registry entry names whose tmux coordinates were rewritten. */
+    renamed: string[];
+    /**
+     * Runtime-state key migrations for entries WITHOUT a paneId: their
+     * sessionKeyFor() is `tmux:<coords>` and changes with the rewrite, so the
+     * caller must re-key any live state maps. paneId-bearing entries keep their
+     * key and produce no migration.
+     */
+    keyMigrations: Array<{
+        from: string;
+        to: string;
+    }>;
+}
+/**
+ * Rewrite every registry trace of a tmux-session (group) rename: each member
+ * entry's coordinates get the new session prefix, and focusedTmuxSession
+ * follows when it named the old group. Membership is decided by tmuxSessionOf
+ * EQUALITY, never a string prefix — renaming "alpha" must not capture
+ * "alpha2:1.0". Mutates reg in place; the caller runs `tmux rename-session`
+ * FIRST and only calls this on success — the scanner rewrites coords from
+ * live tmux every pass, so a registry-only rename would be reverted within
+ * one scan interval.
+ */
+export declare function renameTmuxGroupInRegistry(reg: Registry, oldName: string, newName: string): GroupRenameResult;
 export interface QueuedMessage {
     text: string;
     /** Opaque reply target captured at receive time. */

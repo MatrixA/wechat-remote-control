@@ -69,6 +69,32 @@ export function orderedSessionNames(reg) {
 export function sanitizeSessionName(raw) {
     return raw.trim().replace(/[:.\n\t]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '').trim();
 }
+/**
+ * Rewrite every registry trace of a tmux-session (group) rename: each member
+ * entry's coordinates get the new session prefix, and focusedTmuxSession
+ * follows when it named the old group. Membership is decided by tmuxSessionOf
+ * EQUALITY, never a string prefix — renaming "alpha" must not capture
+ * "alpha2:1.0". Mutates reg in place; the caller runs `tmux rename-session`
+ * FIRST and only calls this on success — the scanner rewrites coords from
+ * live tmux every pass, so a registry-only rename would be reverted within
+ * one scan interval.
+ */
+export function renameTmuxGroupInRegistry(reg, oldName, newName) {
+    const renamed = [];
+    const keyMigrations = [];
+    for (const [name, s] of Object.entries(reg.sessions ?? {})) {
+        if (tmuxSessionOf(s) !== oldName)
+            continue;
+        const from = sessionKeyFor(s);
+        s.tmux = newName + s.tmux.slice(oldName.length);
+        renamed.push(name);
+        if (!s.paneId)
+            keyMigrations.push({ from, to: sessionKeyFor(s) });
+    }
+    if (reg.focusedTmuxSession === oldName)
+        reg.focusedTmuxSession = newName;
+    return { renamed, keyMigrations };
+}
 let nextSid = 1;
 /** Reset the sid counter (tests only). */
 export function resetSidCounter() {

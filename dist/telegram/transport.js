@@ -130,8 +130,9 @@ export function createTelegramTransport() {
                 clearTypingTimer(target);
             monitor?.stop();
         },
-        async sendText(target, text) {
-            return deliver(target, text, undefined, { expandable: true });
+        async sendText(target, text, opts) {
+            const markup = opts?.forceReply ? { force_reply: true } : undefined;
+            return deliver(target, text, markup, { expandable: true });
         },
         async editText(target, messageId, text, buttons) {
             const { chatId } = decodeTarget(target);

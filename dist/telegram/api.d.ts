@@ -10,13 +10,13 @@
  * and retry once (bounded) — enough to absorb the occasional edit-heavy burst
  * from live turn-status updates without turning the client into a retry loop.
  */
-import type { TgUser, TgUpdate, TgMessage, TgChat, TgInlineKeyboardMarkup, TgBotCommand, TgForumTopic } from './types.js';
+import type { TgUser, TgUpdate, TgMessage, TgChat, TgInlineKeyboardMarkup, TgForceReply, TgBotCommand, TgForumTopic } from './types.js';
 export declare const DEFAULT_TELEGRAM_BASE = "https://api.telegram.org";
 /** Strip the bot token from a Telegram API URL so it is safe to log. */
 export declare function redactUrl(url: string): string;
 export interface SendMessageOpts {
     parse_mode?: 'HTML' | 'MarkdownV2';
-    reply_markup?: TgInlineKeyboardMarkup;
+    reply_markup?: TgInlineKeyboardMarkup | TgForceReply;
     disable_web_page_preview?: boolean;
     /** Forum-topic thread to post into. */
     message_thread_id?: number;
