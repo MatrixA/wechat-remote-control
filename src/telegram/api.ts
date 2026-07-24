@@ -11,7 +11,7 @@
  * from live turn-status updates without turning the client into a retry loop.
  */
 import type {
-  TgResponse, TgUser, TgUpdate, TgMessage, TgChat, TgInlineKeyboardMarkup, TgBotCommand, TgForumTopic,
+  TgResponse, TgUser, TgUpdate, TgMessage, TgChat, TgInlineKeyboardMarkup, TgForceReply, TgBotCommand, TgForumTopic,
 } from './types.js';
 import { logger } from '../logger.js';
 
@@ -26,7 +26,7 @@ const MAX_RETRY_AFTER_S = 30;
 
 export interface SendMessageOpts {
   parse_mode?: 'HTML' | 'MarkdownV2';
-  reply_markup?: TgInlineKeyboardMarkup;
+  reply_markup?: TgInlineKeyboardMarkup | TgForceReply;
   disable_web_page_preview?: boolean;
   /** Forum-topic thread to post into. */
   message_thread_id?: number;

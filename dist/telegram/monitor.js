@@ -71,7 +71,15 @@ export function normalizeUpdate(update) {
         };
     }
     if (typeof msg.text === 'string' && msg.text.length > 0) {
-        return { target, replyToken: '', text: msg.text, kind: 'text', userKey, messageId };
+        return {
+            target, replyToken: '', text: msg.text, kind: 'text', userKey, messageId,
+            // Conditional spread: inside a forum topic even non-reply messages carry
+            // reply_to_message (the topic's root service message), so consumers must
+            // match exact ids; absence stays absence (not `undefined`) so strict
+            // object comparisons of the normalized shape keep working.
+            ...(msg.reply_to_message?.message_id != null
+                ? { replyToMessageId: String(msg.reply_to_message.message_id) } : {}),
+        };
     }
     const note = mediaNoteFor(msg);
     if (note) {

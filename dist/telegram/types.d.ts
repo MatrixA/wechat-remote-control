@@ -36,6 +36,14 @@ export interface TgMessage {
         name?: string;
         icon_custom_emoji_id?: string;
     };
+    /**
+     * The message this one replies to (only message_id is consumed). Inside a
+     * forum topic this is ALSO set on non-reply messages (the topic's root
+     * service message) — consumers must match exact ids, never mere presence.
+     */
+    reply_to_message?: {
+        message_id: number;
+    };
     photo?: unknown[];
     document?: unknown;
     voice?: unknown;
@@ -62,6 +70,12 @@ export interface TgInlineKeyboardButton {
 }
 export interface TgInlineKeyboardMarkup {
     inline_keyboard: TgInlineKeyboardButton[][];
+}
+/** sendMessage reply_markup variant that opens the client's reply UI. */
+export interface TgForceReply {
+    force_reply: true;
+    input_field_placeholder?: string;
+    selective?: boolean;
 }
 export interface TgBotCommand {
     command: string;

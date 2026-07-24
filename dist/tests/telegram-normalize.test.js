@@ -24,6 +24,26 @@ test('normalizeUpdate encodes a forum-topic message as chatId:threadId', () => {
         target: '-1001234567890:55', replyToken: '', text: 'run tests', kind: 'text', userKey: '7', messageId: '20',
     });
 });
+test('normalizeUpdate surfaces reply_to_message as replyToMessageId, absent otherwise', () => {
+    const u = {
+        update_id: 15,
+        message: {
+            message_id: 50, chat: privateChat, from: { id: 7, is_bot: false }, date: 0,
+            text: 'new-name', reply_to_message: { message_id: 77 },
+        },
+    };
+    assert.deepStrictEqual(normalizeUpdate(u), {
+        target: '42', replyToken: '', text: 'new-name', kind: 'text', userKey: '7', messageId: '50',
+        replyToMessageId: '77',
+    });
+    // No reply → the property is ABSENT (not undefined) so full-shape
+    // deepStrictEqual comparisons of normalized messages stay valid.
+    const plain = normalizeUpdate({
+        update_id: 16,
+        message: { message_id: 51, chat: privateChat, from: { id: 7, is_bot: false }, date: 0, text: 'hi' },
+    });
+    assert.ok(plain && !('replyToMessageId' in plain));
+});
 test('normalizeUpdate keeps a General-topic message on the plain chat target', () => {
     // General has no is_topic_message/message_thread_id → plain chat id.
     const u = {
