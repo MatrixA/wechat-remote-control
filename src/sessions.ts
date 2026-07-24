@@ -158,9 +158,12 @@ export interface QueuedMessage {
 export interface PendingQuiz {
   questions: Array<{ question: string; options: Array<{ label: string; description?: string }>; multiSelect?: boolean }>;
   questionIndex: number;
-  expires: number;
+  /** Per-quiz nonce (timestamp) — a tap on a previous quiz's leftover buttons, even from before a daemon restart, must not answer this one. */
+  gen: string;
   target: string;
   selected: Set<number>;
+  /** qIdx → sent IM message, so answered/cancelled questions can drop their inline keyboard. */
+  msgIds: Record<number, { messageId: string; target: string; text: string }>;
 }
 
 export interface PendingSelect {

@@ -438,20 +438,28 @@ function tryAutoConfirmCompaction(sess, target) {
 /**
  * Forward an AskUserQuestion question to the IM. On transports with inline
  * keyboards (Telegram) each option is a tap-able button (callback_data
- * `quiz:<sid>:<qIdx>:<optIdx>`, plus a "完成" button for multi-select);
+ * `quiz:<sid>:<gen>:<qIdx>:<optIdx>`, plus a "完成" button for multi-select);
  * otherwise a numbered text menu (WeChat). A typed custom answer also works.
  */
 function sendQuiz(sess, question, replyTarget, qIdx) {
+  const pq = sess.pendingQuiz;
   if (transport.caps.inlineKeyboards) {
-    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${sess.sid}:${qIdx}:${i}` }]);
+    const gen = pq?.gen ?? '0';
+    const rows = question.options.map((opt, i) => [{ label: `${i + 1}. ${opt.label}`, data: `quiz:${sess.sid}:${gen}:${qIdx}:${i}` }]);
     let text;
     if (question.multiSelect) {
-      rows.push([{ label: '✅ 完成', data: `quiz:${sess.sid}:${qIdx}:done` }]);
+      rows.push([{ label: '✅ 完成', data: `quiz:${sess.sid}:${gen}:${qIdx}:done` }]);
       text = `❓ ${question.question}\n\n（多选：点选切换，选好后按"完成"，或直接输入自定义回答）`;
     } else {
       text = `❓ ${question.question}\n\n（点选项，或直接输入自定义回答）`;
     }
     transport.sendButtons(replyTarget, text, rows)
+      .then(sent => {
+        // Identity guard: the quiz may have been cancelled/replaced before the ack.
+        if (sent?.messageId && pq && sess.pendingQuiz === pq) {
+          pq.msgIds[qIdx] = { messageId: sent.messageId, target: replyTarget, text };
+        }
+      })
       .catch(err => logger.error('Quiz push failed', { error: err.message }));
     return;
   }
@@ -527,6 +535,76 @@ function injectQuizAnswer(target, question, input) {
   return `Other: "${trimmed}"`;
 }
 
+/** Normalize for screen matching: keep only letters+digits, lowercase.
+ *  Collapsing everything else absorbs TUI line wraps, box borders, bullets,
+ *  numbering and punctuation drift between the tool input and what CC renders. */
+function quizNorm(s) {
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+/**
+ * Is `question` the quiz currently rendered in the pane? Answers are injected
+ * as blind keystrokes, so this screen check is the safety gate (it replaced the
+ * old 5-min TTL — the screen is the truth, not the clock).
+ *
+ * Visible pane ONLY, no scrollback: after a terminal-side answer, CC's
+ * transcript echo (question + chosen label) sits in scrollback and would
+ * false-positive. Match rule — the "Other" row must be on screen (always
+ * rendered live — injectQuizAnswer's navigation already relies on it — absent
+ * from echoes), plus EITHER:
+ *   - ALL option-label prefixes on screen IN ORDER with "other" after the last
+ *     (exactly how the live list renders; an echo shows only the chosen label
+ *     and prose rarely reproduces the full ordered list). This branch keeps
+ *     short panes working when a long question is clipped above the options;
+ *   - or the question TAIL plus ≥ min(2, n) label prefixes on screen (tail,
+ *     not head: small panes clip the top first).
+ *
+ * Retries once after a 500ms blocking wait: a tap can land while the TUI is
+ * still redrawing the next question. Callers are sync, so the wait is sync too
+ * (same Atomics.wait pattern as injectQuizAnswer) — paid only on mismatch.
+ */
+function quizOnScreen(target, question, attempt = 0) {
+  const hay = quizNorm(stripAnsi(capturePaneContent(target, 0)));
+  const qTail = quizNorm(question.question).slice(-24);
+  const labels = question.options.map(o => quizNorm(o.label).slice(0, 12)).filter(Boolean);
+  const hits = labels.filter(l => hay.includes(l)).length;
+  let pos = 0;
+  let orderedList = labels.length > 0;
+  for (const l of labels) {
+    const at = hay.indexOf(l, pos);
+    if (at < 0) { orderedList = false; break; }
+    pos = at + l.length;
+  }
+  const ok = hay.includes('other')
+    && ((orderedList && hay.includes('other', pos))
+      || ((!qTail || hay.includes(qTail)) && hits >= Math.min(2, labels.length)));
+  if (ok) return true;
+  if (attempt === 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    return quizOnScreen(target, question, 1);
+  }
+  // debug level: the pane may contain sensitive terminal content.
+  logger.debug('quizOnScreen mismatch', { snippet: hay.slice(-300) });
+  return false;
+}
+
+/** Strip the inline keyboard from a sent quiz question so dead buttons don't
+ *  linger in chat (no-op on transports without editable messages/keyboards). */
+function stripQuizButtons(quiz, qIdx, note) {
+  if (!transport?.caps.editMessages || !transport.caps.inlineKeyboards) return;
+  const rec = quiz.msgIds?.[qIdx];
+  if (!rec) return;
+  transport.editText(rec.target, rec.messageId, rec.text + (note ? `\n\n${note}` : ''))
+    .catch(err => logger.debug('Quiz button strip skipped', { error: err.message }));
+}
+
+/** Cancel the pending quiz and strip the current question's dead buttons. */
+function cancelQuiz(sess, note) {
+  const quiz = sess.pendingQuiz;
+  sess.pendingQuiz = null;
+  if (quiz) stripQuizButtons(quiz, quiz.questionIndex, note);
+}
+
 /**
  * Handle a typed reply to a pending quiz (button taps go through handleCallback).
  * `replyTarget` is the opaque IM target; `target` below is the tmux pane.
@@ -539,7 +617,7 @@ function handleQuizResponse(sess, text, replyTarget) {
   const target = tmuxTargetFor(sess);
   if (!target || !paneExists(target)) {
     send('❌ tmux 不可用');
-    sess.pendingQuiz = null;
+    cancelQuiz(sess, '（已失效）');
     return;
   }
 
@@ -579,17 +657,20 @@ function submitQuizForm(target, attempt = 0) {
 
 /** Advance to the next quiz question (or clear state). Shared by text + callback paths. */
 function advanceQuiz(sess, replyTarget) {
-  sess.pendingQuiz.questionIndex++;
-  if (sess.pendingQuiz.questionIndex >= sess.pendingQuiz.questions.length) {
+  const quiz = sess.pendingQuiz;
+  stripQuizButtons(quiz, quiz.questionIndex, '（已回答 ✅）');
+  quiz.questionIndex++;
+  if (quiz.questionIndex >= quiz.questions.length) {
     const target = tmuxTargetFor(sess);
     sess.pendingQuiz = null;
     setTimeout(() => submitQuizForm(target), 500);
   } else {
     setTimeout(() => {
-      if (sess.pendingQuiz) {
-        sess.pendingQuiz.selected = new Set();
-        sendQuiz(sess, sess.pendingQuiz.questions[sess.pendingQuiz.questionIndex], replyTarget, sess.pendingQuiz.questionIndex);
-      }
+      // Identity, not truthiness: a cancel + NEW quiz within the delay must not
+      // get the old quiz's next question sent on top of it.
+      if (sess.pendingQuiz !== quiz) return;
+      quiz.selected = new Set();
+      sendQuiz(sess, quiz.questions[quiz.questionIndex], replyTarget, quiz.questionIndex);
     }, 800);
   }
 }
@@ -2211,7 +2292,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false)
 
 /**
  * Handle an inline-keyboard button tap (Telegram). Decodes the index-encoded
- * callback data (`model:<i>` / `sw:<i>` / `quiz:<qIdx>:<optIdx|done>`) and routes
+ * callback data (`model:<i>` / `sw:<i>` / `quiz:<gen>:<qIdx>:<optIdx|done>`) and routes
  * into the SAME handlers the text path uses. Stale taps (expired menu / removed
  * session / wrong question) are acknowledged gracefully without mis-injecting.
  */
@@ -2338,24 +2419,32 @@ async function handleCallback(inbound) {
     return;
   }
 
-  // ── quiz:<sid>:<qIdx>:<optIdx|done> ──
+  // ── quiz:<sid>:<gen>:<qIdx>:<optIdx|done> ──
   if (verb === 'quiz') {
-    if (!sess || !sess.pendingQuiz || Date.now() > sess.pendingQuiz.expires) {
-      if (sess) sess.pendingQuiz = null;
-      ack('问卷已过期'); return;
-    }
+    if (!sess || !sess.pendingQuiz) { ack('该问卷已失效'); return; }
     const quiz = sess.pendingQuiz;
-    const qIdx = parseInt(segs[2], 10);
-    const rest = segs[3];
-    if (qIdx !== quiz.questionIndex) { ack('该问题已过期'); return; }
+    const gen  = segs[2];
+    const qIdx = parseInt(segs[3], 10);
+    const rest = segs[4];
+    // gen mismatch = buttons from an earlier quiz. The screen check below can't
+    // catch this (the CURRENT quiz is legitimately on screen) — without it the
+    // old optIdx would be injected into the new question's options.
+    if (gen !== quiz.gen) { ack('该问卷已失效'); return; }
+    if (qIdx !== quiz.questionIndex) { ack('该问题已回答'); return; }
     const q = quiz.questions[quiz.questionIndex];
     const tmux = tmuxTargetFor(sess);
+    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); cancelQuiz(sess, '（已失效）'); return; }
+    if (!quizOnScreen(tmux, q)) {
+      cancelQuiz(sess, '（已失效）');
+      ack('终端已离开问卷界面');
+      send('⚠️ 终端已离开问卷界面（可能已在终端作答或已取消），问卷已关闭');
+      return;
+    }
 
     if (q.multiSelect) {
       if (rest === 'done') {
         const sel = [...(quiz.selected || new Set())].sort((a, b) => a - b);
         if (sel.length === 0) { ack('请至少选择一项'); return; }
-        if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); sess.pendingQuiz = null; return; }
         try {
           const selected = injectQuizAnswer(tmux, q, sel.map(n => n + 1).join(','));
           ack('已提交'); send(`✅ ${selected}`);
@@ -2377,7 +2466,6 @@ async function handleCallback(inbound) {
     // single-select
     const optIdx = parseInt(rest, 10);
     if (isNaN(optIdx) || optIdx < 0 || optIdx >= q.options.length) { ack('无效选项'); return; }
-    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); send('❌ tmux 不可用'); sess.pendingQuiz = null; return; }
     try {
       const selected = injectQuizAnswer(tmux, q, String(optIdx + 1));
       ack(selected); send(`✅ ${selected}`);
@@ -2801,6 +2889,12 @@ async function onStop(payload) {
 
   // ── Path A: Complete response → forward to the IM
   if (responseText && responseComplete && sess.lastInjectedText) {
+    if (sess.pendingQuiz) {
+      // A complete response means AskUserQuestion has returned — the quiz was
+      // answered (or dismissed) at the terminal without the bridge seeing it.
+      logger.info('Quiz resolved in terminal, clearing', { session: sess.name });
+      cancelQuiz(sess, '（已在终端处理）');
+    }
     pushResponse(sess, responseText);
     logger.info('Pushed response', { chars: responseText.length });
     scheduleInject(sess);
@@ -2945,9 +3039,14 @@ function onPreToolUse(payload) {
       sess.pendingQuiz = {
         questions,
         questionIndex: 0,
-        expires: Date.now() + 5 * 60 * 1000, // 5 min timeout
+        // Taps on a PREVIOUS quiz's leftover buttons must not answer this one.
+        // Timestamp, not a counter: counters (and sids) reset deterministically
+        // on daemon restart, so a pre-restart button could collide with a fresh
+        // quiz. Chat buttons outlive the process; the guard must too.
+        gen: Date.now().toString(36),
         target: quizTarget,
         selected: new Set(),
+        msgIds: {},      // qIdx → {messageId, target, text}, for stripping dead buttons
       };
       sendQuiz(sess, questions[0], quizTarget, 0);
       logger.info('Quiz forwarded', { session: sess.name, numQuestions: questions.length, q: questions[0].question.slice(0, 80) });
@@ -3005,8 +3104,17 @@ async function onNotification(payload) {
     // 3. lastInjectedText still set → CC stopped without triggering Stop
     //    (shouldn't happen, but clean up to avoid stuck state)
     if (sess.pendingQuiz) {
-      logger.info('Notification: CC waiting for quiz input', { session: sess.name });
-      return;
+      const quizTmux = tmuxTargetFor(sess);
+      const q = sess.pendingQuiz.questions[sess.pendingQuiz.questionIndex];
+      if (quizTmux && paneExists(quizTmux) && quizOnScreen(quizTmux, q)) {
+        logger.info('Notification: CC waiting for quiz input', { session: sess.name });
+        return;
+      }
+      // A stale quiz would suppress the compaction/orphan handling below (and
+      // the status heartbeat) indefinitely now that there is no TTL — this
+      // Notification is the sweeper that keeps staleness bounded.
+      logger.info('Notification: pendingQuiz no longer on screen, clearing', { session: sess.name });
+      cancelQuiz(sess, '（已失效）');
     }
     const target = tmuxTargetFor(sess);
     if (target && tryAutoConfirmCompaction(sess, target)) {
@@ -3345,16 +3453,24 @@ function onInboundMessage(inbound) {
     }
   }
 
-  // Consume a pending quiz (typed answer) for the context session.
+  // Consume a pending quiz (typed answer) for the context session — but only
+  // while the quiz is really still on the terminal screen (see quizOnScreen).
   if (sess?.pendingQuiz) {
-    if (Date.now() > sess.pendingQuiz.expires) {
-      logger.info('pendingQuiz expired, clearing');
-      sess.pendingQuiz = null;
-      transport.sendText(replyTarget, '⏰ 问卷已超时取消，本条按普通消息处理').catch(() => {});
-    } else {
+    const quiz = sess.pendingQuiz;
+    const q = quiz.questions[quiz.questionIndex];
+    const quizTmux = tmuxTargetFor(sess);
+    if (!quizTmux || !paneExists(quizTmux)) {
+      cancelQuiz(sess, '（已失效）');
+      transport.sendText(replyTarget, '❌ tmux 不可用，问卷已取消').catch(() => {});
+      return;
+    }
+    if (quizOnScreen(quizTmux, q)) {
       handleQuizResponse(sess, text, replyTarget);
       return;
     }
+    logger.info('pendingQuiz no longer on screen, clearing');
+    cancelQuiz(sess, '（已失效）');
+    transport.sendText(replyTarget, '💤 终端已离开问卷界面（可能已在终端作答或已取消），问卷已取消，本条按普通消息处理').catch(() => {});
   }
 
   // ── Route slash commands ─────────────────────────────────────────
