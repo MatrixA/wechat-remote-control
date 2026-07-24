@@ -37,6 +37,7 @@ import {
   splitMessage,
   textFromContent,
   findResponseToInjected,
+  findInterimTexts,
   findLastCompleteResponse,
   transcriptHasUserText,
 } from '../dist/message.js';
@@ -75,6 +76,15 @@ const CONTEXT_ROUNDS = 3;      // conversation rounds to replay on session switc
 // emits no decision, so the agent falls back to its own permission flow instead
 // of granting remote, unsandboxed tool execution unconditionally.
 const AUTO_APPROVE = !(process.env.WRC_AUTO_APPROVE === '0' || process.env.WRC_AUTO_APPROVE === 'false');
+
+// Forward meaningful interim assistant text (prose between tool calls) to the
+// IM as it appears, instead of only the final end_turn response. Claude-only.
+// WRC_FORWARD_INTERIM=0|false disables; WRC_INTERIM_MIN_LEN tunes the noise
+// threshold (chars — shorter blocks like "让我看看…" status chatter are skipped).
+const FORWARD_INTERIM = !(process.env.WRC_FORWARD_INTERIM === '0' || process.env.WRC_FORWARD_INTERIM === 'false');
+const _rawInterimMin = parseInt(process.env.WRC_INTERIM_MIN_LEN ?? '', 10);
+const INTERIM_MIN_LEN = Number.isFinite(_rawInterimMin) && _rawInterimMin >= 0 ? _rawInterimMin : 200;
+const INTERIM_SCAN_GAP_MS = 2000;  // min gap between PreToolUse-triggered scans
 
 // Shell names that should NOT be used as session display names
 const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'tcsh', 'csh', 'ksh']);
@@ -2516,6 +2526,13 @@ function scheduleInject(sess) {
       sess.lastInjectedTranscript = entry.transcriptPath || null;
       sess.injectedTarget         = item.target;
       sess.injectedMessageId      = item.messageId || '';
+      sess.interimLastScanAt      = 0;
+      // Reset interim dedup state ON the chain, not synchronously: a previous
+      // turn's still-queued scan or end-of-turn flush must keep seeing its own
+      // turn's sent-uuids (else it re-sends everything), while the new turn's
+      // scans — always chained later — start from a clean slate.
+      const interimReset = () => { sess.interimSentUuids = []; sess.interimLastText = null; };
+      sess.interimChain = (sess.interimChain || Promise.resolve()).then(interimReset, interimReset);
       persistStates();
       appendHistory({ type: 'user_wechat', session: sess.name, text: item.text });
       reactTo(item.target, item.messageId, '👀');
@@ -2607,14 +2624,77 @@ async function forwardResponse(target, fullText, opts = {}) {
 // ── Hook event handlers ──────────────────────────────────────────────
 
 /**
+ * Private-chat / WeChat fallback: several sessions share one conversation, so
+ * tag a reply with its origin session. Topic-routed replies need no tag.
+ */
+function tagForTarget(reg, sess, target, text) {
+  const entry = reg.sessions[sess.name];
+  const viaTopic = !!(entry?.imTarget && entry.imTarget === target);
+  return (!viaTopic && Object.keys(reg.sessions).length > 1) ? `【${sess.name}】\n${text}` : text;
+}
+
+/**
+ * Scan the turn's transcript for unsent interim text blocks (prose emitted
+ * before tool calls — the pieces findResponseToInjected drops) and forward the
+ * meaningful ones in order. Every scan is chained on sess.interimChain, so
+ * overlapping scans, the end-of-turn flush, and the final forward can never
+ * interleave or reorder. `anchor` is the lastInjectedText captured when the
+ * scan was scheduled; live scans abort once the turn resolves or changes,
+ * while the end-of-turn flush passes live=false because it runs on the
+ * captured anchor AFTER pushResponse cleared the session state.
+ * Returns the chained promise so callers can order work after it.
+ */
+function runInterimScan(sess, anchor, readPath, { live = true } = {}) {
+  const job = async () => {
+    if (!FORWARD_INTERIM || !transport || !anchor || !readPath) return;
+    if (live && sess.lastInjectedText !== anchor) return;   // turn resolved/changed
+    const entries = parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES);
+    const blocks = findInterimTexts(entries, anchor);
+    const target = sess.injectedTarget || lastTarget;
+    if (!target) return;
+    const reg = readSessions();
+    for (const b of blocks) {
+      if (b.text.length < INTERIM_MIN_LEN) continue;
+      // ANY overlap with the sent set counts as sent: if a message's text lines
+      // flushed across two scans, re-sending the merged block would duplicate
+      // the part that already went out — losing a rare tail fragment is the
+      // lesser evil.
+      if (b.uuids.some(u => sess.interimSentUuids.includes(u))) continue;
+      if (live && sess.lastInjectedText !== anchor) return;  // re-check before each send
+      // forwardResponse handles its own retries and never throws — a send
+      // failure cannot wedge the chain.
+      await forwardResponse(target, tagForTarget(reg, sess, target, b.text),
+                            { filename: docFilename(sess.name) });
+      sess.interimSentUuids.push(...b.uuids);
+      if (sess.interimSentUuids.length > 400) sess.interimSentUuids = sess.interimSentUuids.slice(-200);
+      sess.interimLastText = b.text;
+      persistStates();  // restart mid-turn must not resend these blocks
+      appendHistory({ type: 'assistant_interim', session: sess.name, text: b.text.slice(0, 500) });
+      logger.info('Forwarded interim block', { session: sess.name, chars: b.text.length });
+    }
+  };
+  const chained = (sess.interimChain || Promise.resolve()).then(job, job);
+  sess.interimChain = chained.catch(err => logger.warn('Interim scan failed', { error: err.message }));
+  return sess.interimChain;
+}
+
+/**
  * Forward a complete assistant response to the IM and clear injection state.
  * Uses the reply target captured at injection time (injectedTarget) — NOT the
  * live "latest" target — so a newer incoming message can't redirect this reply
  * to the wrong conversation. Shared by every Claude/Codex forward path.
+ * opts.dedupeInterim: the caller pushed an INCOMPLETE text (idle cleanup) —
+ * that is really the last interim block, so skip the final forward when the
+ * flush (or an earlier scan) already delivered it. Decided AFTER the flush
+ * runs, because the flush itself may be the one that sends it.
  */
-function pushResponse(sess, responseText) {
+function pushResponse(sess, responseText, opts = {}) {
   const target = sess.injectedTarget || lastTarget;
   const messageId = sess.injectedMessageId;
+  // Snapshot the turn BEFORE clearing it: the end-of-turn interim flush below
+  // runs on the captured anchor after lastInjectedText is gone.
+  const flushAnchor   = sess.lastInjectedText;
+  const flushReadPath = sess.lastInjectedTranscript;
   // Final status-message edit: turn summary replaces the live progress line.
   finishTurnStatus(sess, `✅ 完成 · ${sess.turnToolCount} 个工具 · ${fmtDur(Date.now() - sess.turnStartedAt)}`);
   if (transport && target) transport.sendTyping(target, false).catch(() => {});
@@ -2632,16 +2712,29 @@ function pushResponse(sess, responseText) {
     logger.error('pushResponse: no reply target, dropping forward', { chars: responseText.length });
     return;
   }
-  // Private-chat / WeChat fallback: several sessions share one conversation, so
-  // tag the response with its origin. Topic-routed replies need no tag.
-  let out = responseText;
   const reg = readSessions();
-  const entry = reg.sessions[sess.name];
-  const viaTopic = !!(entry?.imTarget && entry.imTarget === target);
-  if (!viaTopic && Object.keys(reg.sessions).length > 1) {
-    out = `【${sess.name}】\n${responseText}`;
-  }
-  forwardResponse(target, out, { filename: docFilename(sess.name) });
+  const out = tagForTarget(reg, sess, target, responseText);
+  // Backstop: interim blocks the PreToolUse ticks missed go out BEFORE the
+  // final response. Chained on interimChain, so an in-flight scheduled scan
+  // finishes first, then this flush, then the final — never out of order.
+  const flush = (FORWARD_INTERIM && sessionKind(reg.sessions[sess.name]) === 'claude')
+    ? runInterimScan(sess, flushAnchor, flushReadPath, { live: false })
+    : Promise.resolve();
+  const finalJob = async () => {
+    // interimLastText is read AFTER the flush: it reflects everything delivered
+    // as interim, including a block the flush itself just sent. endsWith covers
+    // a merged multi-line block whose tail line is the pseudo-final text.
+    if (opts.dedupeInterim && sess.interimLastText
+        && (sess.interimLastText === responseText || sess.interimLastText.endsWith(responseText))) {
+      logger.info('Final text already delivered as interim, skipping forward', { session: sess.name, chars: responseText.length });
+      return;
+    }
+    await forwardResponse(target, out, { filename: docFilename(sess.name) });
+  };
+  // The final forward joins the chain too, so the NEXT turn's first interim
+  // scan (chained later) cannot land between this turn's response chunks.
+  sess.interimChain = flush.then(finalJob, finalJob)
+    .catch(err => logger.warn('Final forward failed', { error: err.message }));
 }
 
 /** Safe .md filename for a session's long response. */
@@ -2657,6 +2750,11 @@ function docFilename(name) {
  */
 function abandonTurn(sess, reason) {
   const target = sess.injectedTarget || lastTarget;
+  // The turn died — flush any captured interim text first; it is all the user
+  // will ever get from this turn.
+  if (FORWARD_INTERIM && sess.lastInjectedText) {
+    runInterimScan(sess, sess.lastInjectedText, sess.lastInjectedTranscript, { live: false });
+  }
   finishTurnStatus(sess, `⚠️ ${reason || '未捕获到回复'}`);
   if (transport && target) transport.sendTyping(target, false).catch(() => {});
   reactTo(target, sess.injectedMessageId, '💔');
@@ -3020,6 +3118,23 @@ function onPreToolUse(payload) {
   sess.busy = true;
   cancelPending(sess);
 
+  // Interim forwarding: check for meaningful mid-turn text at every tool-call
+  // gap. Deferred to a later tick so the synchronous approval reply below is
+  // never delayed; debounced so a rapid tool loop doesn't stack scans. Placed
+  // before the AUTO_APPROVE opt-out so the feature works either way.
+  if (FORWARD_INTERIM && kind === 'claude' && sess.lastInjectedText
+      && Date.now() - sess.interimLastScanAt >= INTERIM_SCAN_GAP_MS) {
+    sess.interimLastScanAt = Date.now();
+    const anchor = sess.lastInjectedText;
+    // Pane-routed payloads report their own transcript — trust it over the
+    // scanner's inject-time guess (same trust model as onStop). A wrong path
+    // is harmless either way: no anchor match → nothing sent.
+    const readPath = (route.via === 'pane' && payload.transcript_path)
+      ? payload.transcript_path
+      : (sess.lastInjectedTranscript || payload.transcript_path || null);
+    setTimeout(() => { runInterimScan(sess, anchor, readPath); }, 0);
+  }
+
   if (!AUTO_APPROVE) return undefined;
 
   const toolName  = payload.tool_name || '?';
@@ -3170,7 +3285,10 @@ async function onNotification(payload) {
         }
       }
       if (result?.text) {
-          pushResponse(sess, result.text);
+          // An incomplete result here is really the LAST interim text, not a
+          // final — let pushResponse skip the forward if interim delivery
+          // (including its own end-of-turn flush) already sent it.
+          pushResponse(sess, result.text, { dedupeInterim: !result.complete });
           logger.info('Pushed response via idle cleanup', { chars: result.text.length, complete: result.complete });
           scheduleInject(sess);
           return;
@@ -3597,6 +3715,8 @@ async function main() {
     sess.lastInjectedTranscript = turn.lastInjectedTranscript || null;
     sess.injectedTarget         = turn.injectedTarget || '';
     sess.injectedMessageId      = turn.injectedMessageId || '';
+    sess.interimSentUuids       = turn.interimSentUuids || [];
+    sess.interimLastText        = turn.interimLastText || null;
     sessionStates.set(key, sess);
     sidToState.set(sess.sid, sess);
     logger.warn('Startup: restored in-flight turn', { session: sess.name, text: turn.lastInjectedText.slice(0, 40) });

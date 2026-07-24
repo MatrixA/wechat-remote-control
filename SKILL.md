@@ -769,6 +769,12 @@ echo "launched PID=$! (SKILL_DIR=$SKILL_DIR transport=${TRANSPORT:-auto})"
 To force a transport when both accounts exist, run attach in a shell with
 `export WCC_TRANSPORT=telegram` (or `wechat`) set first.
 
+Other daemon env vars (inherited from this shell, read once at startup — restart the
+daemon to change them): `WRC_AUTO_APPROVE=0` opts out of tool auto-approve;
+`WRC_FORWARD_INTERIM=0` disables real-time forwarding of mid-turn assistant prose;
+`WRC_INTERIM_MIN_LEN` (default 200) sets the minimum length for a mid-turn block to
+be forwarded.
+
 Do NOT write `bridge.pid` here — the daemon writes its own PID once it wins the
 singleton. (A redundant launch self-exits without touching `bridge.pid`, so the file
 always points at the live daemon.)

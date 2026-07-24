@@ -43,6 +43,7 @@
 - **bridge daemon** (`src/index.js` → `dist/...`)：长轮询 ilink WeChat API，通过 `tmux send-keys` 把消息注入到 CC 所在面板
 - **hook 服务**：监听 Unix socket `/tmp/cc_wechat_hook.sock`，CC 的 PreToolUse / Stop / Notification hook 通过 `hook.py` 把事件发过来
 - **回执转发**：Stop / Notification 触发时读 CC transcript JSONL，找到「来自微信的消息」对应的回复，转回微信。终端发起的回复不会被广播
+- **中间长回复实时转发**：一个回合里工具调用之间的长段落（讲解、结论等，默认 ≥200 字符）在 PreToolUse 间隙就实时转出去，不用等回合结束；回合结束时兜底补漏，保证不重复、不乱序。`WRC_FORWARD_INTERIM=0` 关闭，`WRC_INTERIM_MIN_LEN` 调阈值（daemon 启动时读取，改动需重启 daemon）
 - **运行态集中在一个目录** —— `~/.wechat-remote-control/`：
   - `accounts/<accountId>.json` —— 微信凭据
   - `state.json` / `sessions.json` —— attach 目标和多 session 注册表

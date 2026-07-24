@@ -18,6 +18,20 @@ export declare function findResponseToInjected(entries: TranscriptEntry[], injec
     text: string;
     complete: boolean;
 } | null;
+/** One mid-turn assistant text block; `uuids` are the transcript-line dedup keys. */
+export interface InterimBlock {
+    uuids: string[];
+    text: string;
+}
+/**
+ * Interim assistant text blocks of the injected turn: entries after the
+ * injected-user anchor that carry text with stop_reason === 'tool_use' — i.e.
+ * prose emitted before a tool call, which findResponseToInjected drops. The
+ * strict comparison keeps the final response out (end_turn) and refuses
+ * still-streaming lines (null). Adjacent lines of the same API message
+ * (shared message.id) merge into one block.
+ */
+export declare function findInterimTexts(entries: TranscriptEntry[], injectedText: string | null): InterimBlock[];
 /**
  * Post-compaction fallback: the last complete (end_turn) assistant response in
  * the transcript. Used when the injected text was summarized away by compaction.

@@ -155,6 +155,14 @@ export interface SessionState {
     compactionGraceUntil: number;
     compactionGraceTranscript: string | null;
     lastPushedText: string | null;
+    /** uuids of interim blocks already forwarded this turn (dedup; capped). */
+    interimSentUuids: string[];
+    /** Debounce stamp for PreToolUse-triggered interim scans. */
+    interimLastScanAt: number;
+    /** Per-session serialization chain: scans / end-of-turn flush / final forward run in order. */
+    interimChain: Promise<void> | null;
+    /** Text of the last interim block forwarded (guards the idle-cleanup duplicate push). */
+    interimLastText: string | null;
 }
 /** Reset the sid counter (tests only). */
 export declare function resetSidCounter(): void;
@@ -203,6 +211,10 @@ export interface PersistedTurn {
     lastInjectedTranscript: string | null;
     injectedTarget: string;
     injectedMessageId: string;
+    /** Interim blocks already forwarded this turn — a restart must not resend them. */
+    interimSentUuids: string[];
+    /** Last interim text forwarded — the idle-cleanup dup guard must survive a restart too. */
+    interimLastText: string | null;
 }
 export declare function persistableState(s: SessionState): PersistedTurn;
 /**

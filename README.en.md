@@ -36,6 +36,7 @@ When you're away from your terminal but a Claude Code task is still running — 
 - **Bridge daemon** (`src/index.js` → `dist/...`): polls ilink WeChat API for messages and injects them into the user's tmux-hosted CC session via `tmux send-keys`.
 - **Hook server**: listens on Unix socket `/tmp/cc_wechat_hook.sock`. CC hooks (PreToolUse / Stop / Notification) send events here via `hook.py`.
 - **Response forwarding**: on Stop / Notification, reads the CC transcript JSONL, finds the response to the injected WeChat message, and forwards it to WeChat. Terminal-initiated responses are not forwarded.
+- **Real-time interim forwarding**: long prose emitted between tool calls within a turn (explanations, findings — ≥200 chars by default) is forwarded live at PreToolUse gaps instead of waiting for the turn to end; an end-of-turn flush backstops anything missed, with dedup and strict ordering. `WRC_FORWARD_INTERIM=0` disables, `WRC_INTERIM_MIN_LEN` tunes the threshold (read at daemon startup — restart the daemon to change).
 - **All state lives in one directory** — `~/.wechat-remote-control/`:
   - `accounts/<accountId>.json` — WeChat credentials
   - `state.json` / `sessions.json` — attach target & multi-session registry

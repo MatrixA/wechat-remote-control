@@ -213,6 +213,16 @@ export interface SessionState {
   compactionGraceUntil: number;
   compactionGraceTranscript: string | null;
   lastPushedText: string | null;
+
+  // Interim forwarding (mid-turn assistant text pushed at tool-call gaps).
+  /** uuids of interim blocks already forwarded this turn (dedup; capped). */
+  interimSentUuids: string[];
+  /** Debounce stamp for PreToolUse-triggered interim scans. */
+  interimLastScanAt: number;
+  /** Per-session serialization chain: scans / end-of-turn flush / final forward run in order. */
+  interimChain: Promise<void> | null;
+  /** Text of the last interim block forwarded (guards the idle-cleanup duplicate push). */
+  interimLastText: string | null;
 }
 
 let nextSid = 1;
@@ -248,6 +258,10 @@ export function newSessionState(key: string, name: string): SessionState {
     compactionGraceUntil: 0,
     compactionGraceTranscript: null,
     lastPushedText: null,
+    interimSentUuids: [],
+    interimLastScanAt: 0,
+    interimChain: null,
+    interimLastText: null,
   };
 }
 
@@ -380,6 +394,10 @@ export interface PersistedTurn {
   lastInjectedTranscript: string | null;
   injectedTarget: string;
   injectedMessageId: string;
+  /** Interim blocks already forwarded this turn — a restart must not resend them. */
+  interimSentUuids: string[];
+  /** Last interim text forwarded — the idle-cleanup dup guard must survive a restart too. */
+  interimLastText: string | null;
 }
 
 export function persistableState(s: SessionState): PersistedTurn {
@@ -389,6 +407,8 @@ export function persistableState(s: SessionState): PersistedTurn {
     lastInjectedTranscript: s.lastInjectedTranscript,
     injectedTarget: s.injectedTarget,
     injectedMessageId: s.injectedMessageId,
+    interimSentUuids: s.interimSentUuids,
+    interimLastText: s.interimLastText,
   };
 }
 
@@ -412,6 +432,8 @@ export function migrateLegacyIlink(
       lastInjectedTranscript: ilink.lastInjectedTranscript ?? null,
       injectedTarget: ilink.target || '',
       injectedMessageId: '',
+      interimSentUuids: [],
+      interimLastText: null,
     },
   };
 }
