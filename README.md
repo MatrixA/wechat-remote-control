@@ -155,7 +155,11 @@ npx skills add MatrixA/wechat-remote-control -a claude-code
 ### 方式二：手动 clone
 
 ```bash
+# 安装
 git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
+
+# 更新
+git -C "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control" pull
 ```
 
 ### Codex CLI 用户
@@ -163,7 +167,11 @@ git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_
 Codex 从 `~/.agents/skills/` 读取 skill（不是 `~/.claude/skills/`），所以装到那里：
 
 ```bash
+# 安装
 git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
+
+# 更新
+git -C ~/.agents/skills/wechat-remote-control pull
 ```
 
 `attach` 会自动识别当前 agent：Codex 的 hook 写进 `~/.codex/hooks.json`（事件
