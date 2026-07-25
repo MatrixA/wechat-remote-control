@@ -2788,6 +2788,30 @@ function onStopCodex(sess, payload, readPath) {
   // lastInjectedText set; our own turn's Stop will arrive later.
   if (latestUser !== null && latestUser !== injected) {
     logger.debug('Codex Stop for terminal-initiated turn, ignoring', { latestUser: latestUser.slice(0, 60) });
+    // The pane just went idle without our injected turn having run. Either Codex
+    // queued our composer text and auto-submits it now (rollout's latest user
+    // message becomes ours; the turn's own Stop — or this poll finding a COMPLETE
+    // answer — resolves it), or the user deleted the composer text and our turn
+    // will never exist: abandon at the deadline so the session un-wedges instead
+    // of refusing injections forever (Codex has no Notification/idle event to
+    // clean this up later). The probe deliberately (1) has NO
+    // payload.last_assistant_message fallback — that text belongs to the terminal
+    // turn that just stopped (wrong-reply hazard), and (2) requires complete ===
+    // true — our turn may be RUNNING right now, and pushing streamed partial text
+    // would clear the turn state and orphan the real final answer. Deduping vs
+    // the post-Stop poll below is lossless: that one is only armed after the
+    // payload fallback came up empty.
+    armOrphanPoll(
+      sess, injected,
+      () => {
+        const r = agent.responseToInjected(agent.parseRollout(readPath), injected);
+        return (r?.text && r.complete) ? r.text : null;
+      },
+      120_000, 5_000,
+      // busy first: UserPromptSubmit marks the auto-submitted turn before the
+      // rollout necessarily flushes our user_message (turn-start lag).
+      () => sess.busy || agent.latestUserMessage(agent.parseRollout(readPath)) === injected,
+    );
     return;
   }
 
@@ -2809,7 +2833,13 @@ function onStopCodex(sess, payload, readPath) {
   }
 
   // No response text yet — rollout may not be flushed. Defer with a bounded poll
-  // (Codex has no Notification event to act as a later safety net).
+  // (Codex has no Notification event to act as a later safety net). Supersede
+  // any strict terminal-ignore poll still holding the dedup slot: this Stop
+  // proves OUR turn is over, so accepting incomplete (flush-lag) text is now
+  // safe where the strict poll would only ever abandon. A briefly-overlapping
+  // stale chain is harmless — every exit re-checks lastInjectedText first and
+  // abandonTurn runs at most once behind that same guard.
+  sess.orphanPollText = null;
   armOrphanPoll(sess, injected, () => pickText(agent.parseRollout(readPath)), 60_000, 5_000);
   scheduleInject(sess);
 }
@@ -2835,12 +2865,18 @@ function transcriptHasInjectedUser(tpath, injectedText) {
  * `probe` returns the response text (or null) — the Claude default reads the
  * transcript via findResponseToInjected; Codex passes a rollout probe. Deduped
  * per session on orphanPollText so only one chain runs per injected message.
+ * Optional `stillInFlight` is consulted only at the deadline: while it returns
+ * true the deadline extends by another graceMs, so a genuinely running turn is
+ * not abandoned mid-flight.
  */
-function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, pollMs = 5_000) {
+const ORPHAN_MAX_EXTENSIONS = 10; // cap: worst-case wedge ≈ 10×grace, not forever
+
+function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, pollMs = 5_000, stillInFlight = null) {
   if (!savedInjectedText) return;
   if (sess.orphanPollText === savedInjectedText) return; // already polling this turn
   sess.orphanPollText = savedInjectedText;
-  const deadline = Date.now() + graceMs;
+  let deadline = Date.now() + graceMs;
+  let extensions = 0;
   const poll = () => {
     if (sess.lastInjectedText !== savedInjectedText) { sess.orphanPollText = null; return; } // resolved elsewhere
     const text = probe();
@@ -2852,6 +2888,18 @@ function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, 
       return;
     }
     if (Date.now() >= deadline) {
+      // The turn may genuinely still be running (e.g. Codex auto-submitted our
+      // queued composer text). Extend rather than abandon — but CAP extensions:
+      // latestUserMessage stays == injected forever after the turn ends, and
+      // busy can stick true on a missed Stop, so an uncapped extension would
+      // recreate the permanent wedge this poll exists to prevent.
+      if (stillInFlight && extensions < ORPHAN_MAX_EXTENSIONS && stillInFlight()) {
+        extensions++;
+        deadline = Date.now() + graceMs;
+        logger.info('Orphan poll extended, turn still in flight', { session: sess.name, extensions });
+        setTimeout(poll, pollMs);
+        return;
+      }
       logger.warn('Orphan poll grace expired, cleaning up', { session: sess.name, lastInjected: savedInjectedText.slice(0, 60) });
       sess.orphanPollText = null;
       if (sess.lastInjectedText === savedInjectedText) abandonTurn(sess, '未在时限内捕获到回复，请回终端查看');
@@ -3751,6 +3799,7 @@ async function main() {
   function reconcileRestoredTurn() {
     if (startupReconciled) return;       // ready may fire more than once
     startupReconciled = true;
+    const regNow = readSessions();
     for (const sess of sessionStates.values()) {
       if (!sess.lastInjectedText) continue;
       // injectedTarget may be missing on legacy restores — fall back to the last
@@ -3759,6 +3808,37 @@ async function main() {
       logger.info('Reconciling in-flight turn restored from previous run', {
         session: sess.name, lastInjected: sess.lastInjectedText.slice(0, 60), transcript: sess.lastInjectedTranscript?.slice(-40),
       });
+      // Probe with the parser matching the session's agent — the Claude parser
+      // never matches a Codex rollout, which used to mean restored Codex turns
+      // could only ever be abandoned at the deadline, never recovered. Registry
+      // entry can be missing right after restart (pruned/renamed before ready) —
+      // the rollout path prefix is then the kind signal; defaulting to claude
+      // would silently repeat that bug.
+      const entry = regNow.sessions[sess.name];
+      const kind = entry ? sessionKind(entry)
+        : (sess.lastInjectedTranscript?.startsWith(CODEX_SESSIONS) ? 'codex' : 'claude');
+      if (kind === 'codex') {
+        const agent = getAgent('codex');
+        const tpath = sess.lastInjectedTranscript;
+        const injected = sess.lastInjectedText;
+        const probe = () => {
+          if (!tpath) return null;
+          const r = agent.responseToInjected(agent.parseRollout(tpath), injected);
+          return (r?.text && r.complete) ? r.text : null;
+        };
+        const done = probe();
+        if (done) {
+          pushResponse(sess, done);
+          logger.info('Restored codex turn already complete; pushed on startup', { chars: done.length });
+          scheduleInject(sess);
+          continue;
+        }
+        // After restart sess.busy starts false and only PreToolUse re-sets it,
+        // so the latest === injected leg carries pure-text turns.
+        armOrphanPoll(sess, injected, probe, undefined, undefined,
+          () => sess.busy || (!!tpath && agent.latestUserMessage(agent.parseRollout(tpath)) === injected));
+        continue;
+      }
       if (sess.lastInjectedTranscript) {
         const r = findResponseToInjected(parseTranscript(sess.lastInjectedTranscript, TRANSCRIPT_TAIL_BYTES), sess.lastInjectedText);
         if (r?.text && r.complete) {
@@ -3770,8 +3850,7 @@ async function main() {
       }
       // Not yet complete (or no transcript): arm a bounded poll so the turn either
       // resolves when the agent finishes or is abandoned at the deadline — never
-      // wedging lastInjectedText forever. (Claude transcript matching; for Codex the
-      // deadline cleanup still un-wedges it.)
+      // wedging lastInjectedText forever.
       armOrphanPoll(sess, sess.lastInjectedText, claudeProbe(sess.lastInjectedTranscript, sess.lastInjectedText));
     }
   }

@@ -161,7 +161,11 @@ You can list / update / remove later with `npx skills list`, `npx skills update`
 ### Option B — manual clone
 
 ```bash
+# install
 git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
+
+# update
+git -C "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control" pull
 ```
 
 ### Option C — Codex CLI
@@ -169,7 +173,11 @@ git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_
 Codex loads skills from `~/.agents/skills/` (not `~/.claude/skills/`), so install there:
 
 ```bash
+# install
 git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
+
+# update
+git -C ~/.agents/skills/wechat-remote-control pull
 ```
 
 `attach` auto-detects the running agent: for Codex it writes hooks into
