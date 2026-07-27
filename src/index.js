@@ -193,12 +193,20 @@ const STATUS_DEBOUNCE_MS = 3_000;   // min gap between tool-triggered edits (TG 
 
 function fmtDur(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60 ? `${s % 60}s` : ''}`;
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  // Hours matter now that a wedged turn's age is user-facing: "133m13s" is a
+  // number you have to decode, "2h13m" is one you read.
+  if (m < 60) return `${m}m${s % 60 ? `${s % 60}s` : ''}`;
+  return `${Math.floor(m / 60)}h${m % 60 ? `${m % 60}m` : ''}`;
 }
 
 function statusBody(sess) {
   if (sess.interruptRequestedAt) {
-    return `⏹ 已请求中断 · ${fmtDur(Date.now() - sess.interruptRequestedAt)} · 等待回收（如未生效可发送 /esc）`;
+    // No "send /esc again if it didn't work" hint: that is what used to walk the
+    // pane into Codex's rewind overlay. /esc is still safe to send — it now
+    // inspects the pane first — but nothing should actively invite a repeat.
+    return `⏹ 已请求中断 · ${fmtDur(Date.now() - sess.interruptRequestedAt)} · 等待回收`;
   }
   const elapsed = fmtDur(Date.now() - sess.turnStartedAt);
   return sess.turnToolCount > 0
@@ -383,40 +391,216 @@ function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
 }
 
-/**
- * Extract CC's visible response from tmux pane after an injected message.
- * Fallback for when the transcript has no entry (CLI errors, unknown skills, etc.).
- */
-function sendKeys(target, text, bufKey = '') {
-  // Strip control chars but KEEP newlines (\x0a) — a multi-line WeChat message
-  // must reach the agent as one prompt, not be fragmented per line.
-  const safe = text.replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '');
-  if (safe.includes('\n')) {
-    // `send-keys -l` delivers each embedded newline as a literal Return, so the
-    // agent submits after the first line and the rest lands as separate prompts.
-    // Use a tmux paste buffer with bracketed paste (-p) instead: the CC/Codex TUI
-    // inserts the newlines verbatim, then a single Enter submits the whole message.
-    // (-p only brackets when the pane's app enabled bracketed-paste mode, which
-    // both agents do; -d deletes the temp buffer after pasting.)
-    // The buffer name is namespaced per session — two sessions injecting
-    // multi-line messages concurrently must not race one shared buffer.
-    const buf = `wrc-inject-${(bufKey || 'default').replace(/[^%\w.-]/g, '_')}`;
-    execFileSync('tmux', ['set-buffer', '-b', buf, safe]);
-    execFileSync('tmux', ['paste-buffer', '-d', '-p', '-b', buf, '-t', target]);
-    execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
-    return;
-  }
-  execFileSync('tmux', ['send-keys', '-l', '-t', target, safe]);
-  execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
+/** Block for `ms` without forking a `bash -c sleep` (same synchronous timing,
+ *  no fork/exec cost). Sync-only call sites. */
+function syncWait(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// ── Quiz (AskUserQuestion) helpers ───────────────────────────────────
 /**
- * Send a single tmux key (not literal text).
- * Use key names: 'Down', 'Up', 'Enter', 'Space', etc.
+ * Deliver one message to an agent pane and submit it.
+ *
+ * ALWAYS through a tmux paste buffer with bracketed paste (-p) — never
+ * `send-keys -l`, not even for single-line text. Verified against codex-cli
+ * 0.145.0 sources and reproduced in a live pane on 2026-07-27:
+ *
+ *   `send-keys -l` writes the whole string to the pty at once, so crossterm
+ *   emits the Char events ~0ms apart. That trips Codex's paste-burst detector
+ *   (PASTE_BURST_CHAR_INTERVAL = 8ms, paste_burst.rs:158), which opens a 120ms
+ *   "Enter inserts a newline instead of submitting" window
+ *   (PASTE_ENTER_SUPPRESS_WINDOW, paste_burst.rs:155). Our Enter lands inside
+ *   it, so chat_composer.rs:3457-3460 appends '\n' and returns
+ *   InputResult::None: the message sits UNSENT in the composer with a stray
+ *   blank line under it. No turn starts, so no Stop ever arrives and
+ *   lastInjectedText never clears — the session then reads busy forever and
+ *   scheduleInject refuses every later message.
+ *   A UI tick flushes the burst after ~9ms, so this was a RACE — it worked
+ *   whenever tmux client startup happened to outlast the window, which is
+ *   exactly why the symptom looked intermittent.
+ *
+ *   An explicit bracketed paste takes the other branch: handle_paste()
+ *   (chat_composer.rs:1082-1101) ends with an unconditional
+ *   clear_after_explicit_paste(), documented there as "so a real paste cannot
+ *   affect the next user Enter key". The suppression window does not merely get
+ *   wide enough to beat — it ceases to exist. Structural, not a tuned timeout,
+ *   and it removes a code path instead of adding one.
+ *
+ * `-p` only brackets when the pane's app has bracketed-paste mode on. Both
+ * TUIs do, but a pane sitting in some other modality may not, and then the
+ * paste degrades back into the raw-keystroke path above. That residual case is
+ * what the verification below is for. `-d` drops the temp buffer afterwards.
+ *
+ * Returns { submitted, retried, reason }:
+ *   true  — the composer provably no longer holds our text
+ *   false — our text provably still sits in the composer even after a second
+ *           Enter; the caller must NOT mark the turn in-flight
+ *   null  — undeterminable; the caller proceeds as if submitted and leaves it
+ *           to the existing orphan-poll safety net
  */
-function sendTmuxKey(target, key) {
-  execFileSync('tmux', ['send-keys', '-t', target, key]);
+const SUBMIT_VERIFY_WAIT_MS = 120;   // one TUI redraw + slack, per verify round
+const SUBMIT_VERIFY_ROUNDS  = 2;
+
+function sendKeys(target, text, bufKey = '', opts = {}) {
+  const { verify = true, kind = null } = opts;
+  // Strip control chars but KEEP newlines (\x0a) — a multi-line IM message must
+  // reach the agent as one prompt, not be fragmented per line.
+  const safe = text.replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '');
+  // Buffer name is namespaced per session: two sessions pasting concurrently
+  // must not race one shared buffer.
+  const buf = `wrc-inject-${(bufKey || 'default').replace(/[^%\w.-]/g, '_')}`;
+  // `--` before the payload, or tmux parses a message that happens to start with
+  // a dash as its own flags and exits 1: `set-buffer -b b '- 修复这个'` →
+  // "invalid flag -". Verified on tmux 3.7.
+  execFileSync('tmux', ['set-buffer', '-b', buf, '--', safe]);
+  execFileSync('tmux', ['paste-buffer', '-d', '-p', '-b', buf, '-t', target]);
+  execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
+  if (!verify) return { submitted: null, retried: false, reason: 'verify-off' };
+
+  let cls = verdict(target, safe, kind);
+  if (cls !== 'stuck') {
+    return { submitted: cls === 'submitted' ? true : null, retried: false, reason: cls };
+  }
+  // Provably unsent: bracketed paste did not apply and the Enter was swallowed
+  // as a newline. The burst window has long since lapsed, so one more Enter
+  // submits it (the stray '\n' rides along harmlessly at the end of the text).
+  logger.warn('Injected text still in composer after Enter, re-keying', { target, chars: safe.length });
+  execFileSync('tmux', ['send-keys', '-t', target, 'Enter']);
+  cls = verdict(target, safe, kind);
+  return { submitted: cls === 'stuck' ? false : (cls === 'submitted' ? true : null), retried: true, reason: cls };
+}
+
+/**
+ * 'stuck' only when the text is in the composer AND the pane is not mid-turn.
+ *
+ * The pane check is a VETO, never the primary signal — a pane can legitimately
+ * be working for reasons unrelated to us. As a veto it is right in every branch:
+ *   - genuinely stuck, pane idle          → 'stuck', we re-key. ✓
+ *   - submitted, turn now running         → the match was the transcript echo
+ *                                           mid-redraw; veto avoids a duplicate
+ *                                           send. ✓
+ *   - pane was ALREADY mid-turn when we injected → Codex parks our text in the
+ *     composer and auto-submits it when the turn ends. Re-keying or re-queueing
+ *     would double-send; the un-wedge poll in onStopCodex owns this case. ✓
+ */
+function verdict(target, injected, kind) {
+  const cls = awaitComposerSettled(target, injected, kind, SUBMIT_VERIFY_ROUNDS);
+  if (cls === 'stuck' && paneShowsWorking(target)) {
+    logger.info('Composer still holds text but pane is mid-turn, not re-keying', { target });
+    return 'working';
+  }
+  return cls;
+}
+
+/** Poll classifyComposer up to `rounds` times, `SUBMIT_VERIFY_WAIT_MS` apart.
+ *  Returns on the first non-'stuck' verdict — 'submitted' and 'unknown' both
+ *  mean "do not press Enter again", so there is nothing to gain by waiting. */
+function awaitComposerSettled(target, injected, kind, rounds) {
+  let cls = 'unknown';
+  for (let i = 0; i < rounds; i++) {
+    syncWait(SUBMIT_VERIFY_WAIT_MS);
+    cls = classifyComposer(capturePaneContent(target, 0), injected, kind);
+    if (cls !== 'stuck') return cls;
+  }
+  return cls;
+}
+
+// ── Composer inspection ──────────────────────────────────────────────
+/**
+ * First line of each TUI's input box. Verbatim captures, 2026-07-27, from
+ * codex-cli 0.145.0 and Claude Code v2.1.196:
+ *
+ *   codex                            Claude Code
+ *   ─────────────────────────        ──────────────────────────────
+ *   › line one alpha                 ──────────────────────────────
+ *     line two beta                  ❯ line one alpha
+ *                                    ──────────────────────────────
+ *     gpt-5.6-sol · /tmp/x             ⏸ plan mode on (shift+tab …)
+ *
+ * Continuation lines are plain 2-space indents in both, so the region is taken
+ * as "composer-start line through end of viewport" rather than by modelling
+ * each TUI's footer — that absorbs wrapping, status rows and hint lines for
+ * free.
+ *
+ * The LAST match is the composer, and that detail is the whole ballgame: after
+ * a successful submit codex echoes the user message into the transcript with
+ * the SAME `› ` prefix. Anchoring on the first match, or just scanning the
+ * bottom N lines, reports every successful send as stuck and re-keys a stray
+ * Enter into an idle pane.
+ *
+ * NOTE (CC): current builds draw the box with plain `────` rules, not the
+ * `╭─╮ │ ╰─╯` glyphs older code elsewhere in this file still matches on.
+ */
+/**
+ * `\s`, NOT `[ \t]`: an EMPTY Claude Code composer renders as `❯` + U+00A0
+ * (no-break space), while its transcript echo of a submitted message uses a
+ * plain U+0020. Matching only ASCII space therefore skipped the real composer
+ * and anchored on the echo instead — which reports every successful send as
+ * stuck. Verified by codepoint dump of a live pane, 2026-07-27.
+ */
+const COMPOSER_START = {
+  codex:  /^›(?:\s|$)/,   // ›
+  claude: /^❯(?:\s|$)/,   // ❯
+};
+
+/** Composer text as rendered, or null when no input box is on screen. */
+function composerRegion(paneText, kind) {
+  const lines = stripAnsi(paneText || '').split('\n');
+  const pats = (kind && COMPOSER_START[kind]) ? [COMPOSER_START[kind]] : Object.values(COMPOSER_START);
+  let start = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (pats.some(re => re.test(lines[i]))) { start = i; break; }
+  }
+  if (start < 0) return null;
+  // Stop at the first blank line or horizontal rule below the prompt. Both TUIs
+  // fence the composer off from their footer exactly that way — codex with a
+  // blank line before "  <model> · <cwd>", CC with a "────" rule before the mode
+  // hints — and the footer must NOT be part of the region: it carries the cwd and
+  // mode text, so a message merely MENTIONING its own working directory would
+  // match the footer, be declared stuck on an empty composer, and get re-sent.
+  // Cost of stopping early: a message containing a blank line has only its first
+  // paragraph in the region, so a genuine wedge may read 'submitted' instead —
+  // the harmless direction, and the orphan poll still covers it.
+  const end = lines.findIndex((l, i) => i > start && (l.trim() === '' || /^\s*─{20,}/.test(l)));
+  return lines.slice(start, end < 0 ? undefined : end).join('\n');
+}
+
+/** Shortest normalized needle we trust as a composer anchor. Below this a
+ *  message like "y" or "好" would match some incidental glyph in a status row
+ *  and re-key Enter into a pane we do not actually understand. */
+const MIN_COMPOSER_ANCHOR = 8;
+
+/**
+ * Did our injected text leave the composer? → 'submitted' | 'stuck' | 'unknown'.
+ *
+ * Deliberately biased toward under-detection: only 'stuck' causes us to press
+ * Enter again, and pressing Enter into an unrecognised modality is far worse
+ * than missing a wedge (the orphan poll still catches that). Every branch we
+ * cannot prove returns 'unknown', which the caller treats as "leave it alone".
+ */
+function classifyComposer(paneText, injectedText, kind) {
+  const region = composerRegion(paneText, kind);
+  if (region === null) return 'unknown';           // no input box on screen
+  // Large pastes never render verbatim — both TUIs collapse them to a
+  // placeholder the needle below could never match, so test it first:
+  //   codex : [Pasted Content 1234 chars]     (>1000 chars, chat_composer.rs:316)
+  //   CC    : [Pasted text #1 +5 lines]
+  // Trade-off: text the user themselves had pending in the composer reads as
+  // ours. Harmless — our paste appended to it, so both submit together.
+  if (/\[pasted\s+(content|text)/i.test(region)) return 'stuck';
+  const needle = quizNorm(injectedText || '').slice(0, 40);
+  if (needle.length < MIN_COMPOSER_ANCHOR) return 'unknown';
+  // Known blind spot, observed live: while a turn is running with messages
+  // queued behind it, Claude Code replaces the composer body with
+  // "Press up to edit queued messages", hiding whatever text is in there. Our
+  // needle cannot match, so this falls through to 'submitted'. That is the right
+  // answer in the common case (CC accepted and queued the message) and the safe
+  // answer in the rare one (Enter was swallowed) — the orphan poll still covers
+  // it. Recorded so nobody "fixes" it into a stuck verdict and re-sends
+  // everything a busy pane queues.
+  // quizNorm drops everything but letters+digits, absorbing the TUI's hard
+  // wrapping, indent and punctuation drift between what we sent and what is
+  // drawn.
+  return quizNorm(region).includes(needle) ? 'stuck' : 'submitted';
 }
 
 /**
@@ -426,10 +610,74 @@ function sendTmuxKey(target, key) {
  * (scrollback = 0) so a historical frame can never read as "still working".
  * Conservative failure mode: if a future TUI drops the string this returns
  * false, which at worst abandons a turn early — never wedges one.
+ *
+ * Known over-report: Codex also prints "esc to interrupt" on its MCP-server
+ * startup spinner, when no turn is running (observed 2026-07-27). Every caller
+ * treats a true here as "hands off", so an extra second of caution at startup
+ * is the harmless direction.
  */
 function paneShowsWorking(target) {
   if (!target || !paneExists(target)) return false;
   return stripAnsi(capturePaneContent(target, 0)).toLowerCase().includes('esc to interrupt');
+}
+
+/**
+ * What is this pane showing? → 'overlay' | 'primed' | 'working' | 'idle' | 'unknown'
+ *
+ * Exists because Escape is not idempotent. On an idle Codex pane the first Esc
+ * primes "edit previous message" and the SECOND opens a full-screen transcript
+ * overlay whose Enter forks the session. Our own UI used to invite exactly that
+ * ("如未生效可发送 /esc"), so the escape hatch could strand the pane in a
+ * modality where every pane-reading heuristic we have goes blind.
+ *
+ * Verbatim from a live codex-cli 0.145.0 pane, 2026-07-27:
+ *   idle    footer: "  gpt-5.6-sol high · /private/tmp/wrc-probe"
+ *   Esc ×1  footer: "  esc again to edit previous message"          (alternate_on=0)
+ *   Esc ×2  footer: " q to quit   esc/← to edit prev   → to edit next   enter to edit message"
+ *                                                                   (alternate_on=1)
+ *
+ * Deliberately NOT modelled: a Claude Code rewind dialog. Double-Esc on an idle
+ * CC v2.1.196 pane was verified to be a no-op, so there is nothing to detect and
+ * a speculative text matcher would be untestable. A future CC full-screen dialog
+ * still lands in the generic altScreenOn branch below, which refuses to inject
+ * and refuses to type — the safe default.
+ */
+function classifyModality(paneText, kind, altScreenOn) {
+  const norm = quizNorm(paneText || '');
+  // Alt-screen is checked FIRST and is the structural signal. Inside a pager the
+  // viewport is scrolled history, which can easily contain an older turn's
+  // "esc to interrupt" and would otherwise be misread as 'working'.
+  if (altScreenOn) {
+    // The agent's own transcript overlay — the one two Escs land you in — is the
+    // only alt-screen we know how to leave (q). Anything else the user opened
+    // themselves (less, vim, a man page) is 'unknown': hands off entirely,
+    // because there a bare `q` is just a letter typed into their buffer.
+    return (norm.includes('qtoquit') && norm.includes('toeditprev')) ? 'overlay' : 'unknown';
+  }
+  if (norm.includes('escagaintoeditpreviousmessage')) return 'primed';
+  if (norm.includes('esctointerrupt')) return 'working';
+  return 'idle';
+}
+
+/** classifyModality against a live pane. `#{alternate_on}` is a real tmux
+ *  format (3.x), so the primary signal is structural rather than scraped. */
+function paneModality(target, kind) {
+  if (!target || !paneExists(target)) return 'unknown';
+  let alt;
+  try {
+    alt = execFileSync('tmux', ['display-message', '-p', '-t', target, '#{alternate_on}'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() === '1';
+  } catch { return 'unknown'; }
+  return classifyModality(stripAnsi(capturePaneContent(target, 0)), kind, alt);
+}
+
+// ── Quiz (AskUserQuestion) helpers ───────────────────────────────────
+/**
+ * Send a single tmux key (not literal text).
+ * Use key names: 'Down', 'Up', 'Enter', 'Space', etc.
+ */
+function sendTmuxKey(target, key) {
+  execFileSync('tmux', ['send-keys', '-t', target, key]);
 }
 
 /**
@@ -563,11 +811,15 @@ function injectQuizAnswer(target, question, input) {
   for (let i = 0; i < options.length; i++) sendTmuxKey(target, 'Down');
   sendTmuxKey(target, 'Enter');
   // Brief wait for the text input field to appear after "Other" is selected.
-  // Atomics.wait blocks for 500ms WITHOUT forking a `bash -c sleep` subprocess
-  // (same synchronous timing, no fork/exec cost). This path is sync-only.
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-  execFileSync('tmux', ['send-keys', '-l', '-t', target, trimmed]);
-  sendTmuxKey(target, 'Enter');
+  syncWait(500);
+  // Via sendKeys for its bracketed paste, which is what stops Codex's
+  // paste-burst detector from turning our Enter into a newline (see sendKeys).
+  // Verification is off here on purpose: the free-text row is a quiz widget,
+  // not the normal composer, so a 'stuck' verdict would be guesswork — and a
+  // stray Enter inside a select list confirms a selection. A quiz answer that
+  // fails to submit does not set lastInjectedText, so it cannot wedge the
+  // session the way an injected message can; it just doesn't land.
+  sendKeys(target, trimmed, target, { verify: false });
   return `Other: "${trimmed}"`;
 }
 
@@ -1612,10 +1864,22 @@ async function injectSlashAndCaptureInner(sess, target, command, send) {
   const beforeContent = capturePaneContent(target);
   const beforeLineCount = beforeContent.trimEnd().split('\n').length;
 
+  let res;
   try {
-    sendKeys(target, command, sess.key);
+    // Slash commands go through the same bracketed paste as everything else.
+    // Verified in a live codex pane (2026-07-27): pasting `/status` still opens
+    // the command popup and Enter still dispatches the command — identical to
+    // the old literal-keystroke path, minus the swallowed-Enter race.
+    const slashEntry = readSessions().sessions[sess.name];
+    res = sendKeys(target, command, sess.key, { kind: slashEntry ? sessionKind(slashEntry) : null });
   } catch (err) {
     await send(`❌ 注入失败: ${err.message}`);
+    return;
+  }
+  if (res.submitted === false) {
+    // Provably still sitting in the composer — waiting 2.5s to scrape output
+    // that cannot exist would just report a confusing empty result.
+    await send(`❌ 命令未能提交到终端（文本仍留在输入框），请回终端查看`);
     return;
   }
 
@@ -1789,6 +2053,32 @@ function tmuxGroups(reg) {
 // Shared by /ls and the bare /fc menu: one line per tmux session, members
 // inline. Focus markers only exist in topics mode; WeChat / unbound chats get
 // a plain numbered list.
+// A turn that has been in flight this long is far more likely wedged than slow.
+// 10 min is 2× armOrphanPoll's default 5-minute grace, so an ordinary long turn
+// plus one extension never trips it; 30 min is past any plausible extension.
+const STUCK_WARN_MS  = 10 * 60 * 1000;
+const STUCK_ALARM_MS = 30 * 60 * 1000;
+
+/**
+ * Suffix for the "（N 忙碌）" tag once a busy session looks stuck rather than
+ * slow. Returns '' while things look healthy — a normal list stays quiet.
+ *
+ * This exists because "（1 忙碌）" is indistinguishable between "working hard"
+ * and "wedged since yesterday", which is exactly how a stuck session used to go
+ * unnoticed for days.
+ */
+function stuckSuffix(busyStates, now = Date.now()) {
+  const waiting = busyStates.filter(s => s && s.lastInjectedText);
+  if (waiting.length === 0) return '';   // busy via a terminal-initiated turn — not ours to age
+  // A turn restored from a state file written before injectedAt existed has no
+  // age to report, yet it is precisely the shape of the classic wedge. Say so
+  // rather than render it as an ordinary busy session.
+  if (waiting.some(s => !s.injectedAt)) return ' · ⚠️ 已挂起，时长未知，可 /reset';
+  const age = now - Math.min(...waiting.map(s => s.injectedAt));
+  if (age < STUCK_WARN_MS) return '';
+  return `${age >= STUCK_ALARM_MS ? ' · 🔴' : ' · ⚠️'} 已等 ${fmtDur(age)} 无回应，可 /reset`;
+}
+
 function formatTmuxList(reg) {
   const groups = tmuxGroups(reg);
   if (groups.size === 0) return '暂无发现活跃的会话（等待自动扫描，约30秒）';
@@ -1798,14 +2088,14 @@ function formatTmuxList(reg) {
   let i = 0;
   for (const [g, members] of groups) {
     i++;
-    const busyCount = members.filter(n => {
-      const st = sessionStates.get(sessionKeyFor(reg.sessions[n]));
-      return st && (st.busy || st.lastInjectedText);
-    }).length;
+    const busy = members
+      .map(n => sessionStates.get(sessionKeyFor(reg.sessions[n])))
+      .filter(st => st && (st.busy || st.lastInjectedText));
     // sendButtons never splits the message — cap the inline member list.
     const shown = members.length > 6 ? [...members.slice(0, 5), `…+${members.length - 5}`] : members;
     const mark = topics ? (g === focus ? '🎯 ' : '○ ') : '';
-    lines.push(`${mark}${i}. ${g} — ${shown.join(', ')}${busyCount ? `（${busyCount} 忙碌）` : ''}`);
+    const busyTag = busy.length ? `（${busy.length} 忙碌${stuckSuffix(busy)}）` : '';
+    lines.push(`${mark}${i}. ${g} — ${shown.join(', ')}${busyTag}`);
   }
   lines.push('', `默认路由: ${reg.active || '无'}` + (focus ? ` · 🎯 聚焦: ${focus}` : ''));
   return lines.join('\n');
@@ -2092,6 +2382,107 @@ async function handleTopicRename(inbound) {
   if (raw !== newName) syncSessionTopics().catch(() => {});
 }
 
+/**
+ * The single place that decides whether to send Escape to a pane.
+ *
+ * Escape is not idempotent — see classifyModality. The rule is simple because
+ * both agents gate their rewind/backtrack UI on "no turn is running": if the
+ * pane IS working, Escape is safe and does what the user asked; if it is NOT
+ * working, Escape does nothing useful and can only make things worse. So the
+ * screen decides, not a counter.
+ *
+ * This replaces the old approach on both callers: #esc had NO gate at all
+ * ("the explicit, repeatable escape hatch"), and the ⏹ button gated on the
+ * bookkeeping flag interruptRequestedAt — which knows whether we asked, not
+ * what the terminal is actually showing.
+ *
+ * Returns { modality, message } for the caller to deliver; every tmux op here
+ * is synchronous.
+ */
+function requestEscape(sess, reg = null) {
+  const target = tmuxTargetFor(sess);
+  const entry = (reg || readSessions()).sessions[sess.name];
+  const kind = entry ? sessionKind(entry) : null;
+  const mod = paneModality(target, kind);
+  logger.info('Escape requested', { session: sess.name, modality: mod });
+
+  if (mod === 'working') {
+    sendTmuxKey(target, 'Escape');
+    onInterruptRequested(sess);
+    return { modality: mod, message: `⏹ 已向 ${sess.name} 发送中断${sess.lastInjectedText ? '，正在等待回收当前回合…' : ''}` };
+  }
+
+  if (mod === 'overlay') {
+    // NEVER Escape here (it pages further back) and NEVER Enter (that confirms
+    // the rewind and forks the session). `q` quits — verified to leave the
+    // composer untouched, no stray character.
+    for (let i = 0; i < 2; i++) {
+      sendTmuxKey(target, 'q');
+      syncWait(500);
+      if (paneModality(target, kind) !== 'overlay') {
+        return { modality: mod, message: `🪟 ${sess.name} 的终端卡在历史浏览界面（多按了一次 Esc 进入的），已退出。请重新发送你的消息。` };
+      }
+    }
+    return { modality: mod, message: `🪟 ${sess.name} 的终端卡在历史浏览界面，自动退出失败。请回终端按 q 退出。` };
+  }
+
+  if (mod === 'primed' || mod === 'idle') {
+    let note = '';
+    if (mod === 'primed') {
+      // One Esc already landed. A second would open the overlay above — the exact
+      // trap our own "如未生效可发送 /esc" hint used to walk users into. Any
+      // non-Esc key cancels the primed state; Left is the only one that leaves the
+      // composer byte-identical (Space+BSpace nets out but pollutes it in between,
+      // and would eat a real leading space if one were pasted mid-race).
+      sendTmuxKey(target, 'Left');
+      note = '（上一次 Esc 已生效；再按会打开历史回退界面，已为你拦下）';
+    }
+    // The pane is idle, so there is nothing to interrupt — but /esc has always
+    // doubled as a recovery nudge, and dropping that would be a regression. This
+    // arms the short poll WITHOUT claiming an interrupt happened: an unresolved
+    // turn on an idle pane either yields its partial text now or is abandoned,
+    // and a stuck `busy` from a terminal turn gets cleared. No-op when the
+    // session is healthy.
+    const recovering = !!(sess.lastInjectedText || sess.busy);
+    if (recovering) onInterruptRequested(sess, { markRequested: false });
+    return {
+      modality: mod,
+      message: `ℹ️ ${sess.name} 的终端当前空闲，没有正在运行的回合可以中断${note}。`
+        + (recovering ? '\n🔄 但仍有未收尾的回合，已启动回收；若约 20 秒后依旧不动，发送 /reset。' : ''),
+    };
+  }
+
+  return { modality: mod, message: `❌ 读不到 ${sess.name} 的终端状态（tmux 可能已关闭，或终端停在其它全屏程序里），未发送任何按键。` };
+}
+
+/**
+ * Human-readable account of what a reset actually did. Detailed on purpose:
+ * a silent "✅ 已重置" leaves the user unsure whether anything was wrong, and
+ * the pane line makes /reset double as a diagnostic.
+ */
+function resetReceipt(sess, had, reg) {
+  const lines = [`🧹 已重置会话 ${sess.name}`];
+  lines.push(`  忙碌标记: ${had.busy ? '已清除' : '本来就没有'}`);
+  if (had.injected) {
+    const age = had.injectedAt ? `已挂起 ${fmtDur(Date.now() - had.injectedAt)}` : '挂起时长未知';
+    const preview = had.injected.length > 30 ? `${had.injected.slice(0, 30)}…` : had.injected;
+    lines.push(`  等待回收的消息: 「${preview}」（${age}）`);
+  } else {
+    lines.push('  等待回收的消息: 无');
+  }
+  lines.push(had.queued
+    ? `  队列中的消息: ${had.queued} 条（已保留，正在重新注入）`
+    : '  队列中的消息: 无');
+  if (had.quiz) lines.push('  待答问卷: 已取消');
+  const entry = reg.sessions[sess.name];
+  const target = entry ? (entry.paneId || entry.tmux) : null;
+  const kind = entry ? sessionKind(entry) : '?';
+  const pane = !target || !paneExists(target) ? '❌ pane 已不存在'
+    : paneShowsWorking(target) ? '正在运行一个回合' : '空闲';
+  lines.push(`  终端状态: ${kind} · ${pane}`);
+  return lines.join('\n');
+}
+
 // `viaTopic` — whether ctxSess was routed through its own forum topic (vs the
 // General/private-chat active fallback); only #rnt's context resolution cares.
 async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false) {
@@ -2114,20 +2505,31 @@ async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false)
     return;
   }
 
-  // #esc — interrupt the context session's current turn (tmux Escape).
-  // Deliberately NO stale-turn or repeat gate here (unlike the intr: button):
-  // /esc is the explicit, repeatable escape hatch for whatever is running.
+  // #esc — interrupt the context session's current turn, if there is one.
+  // Repeat-safe by inspection rather than by counter: requestEscape reads the
+  // pane and only sends Escape when a turn is actually running, so hammering
+  // /esc can no longer walk the pane into Codex's rewind overlay.
   if (cmd === '#esc' || cmd === '#stop') {
     if (!ctxSess) { await send('当前没有会话'); return; }
-    const target = tmuxTargetFor(ctxSess);
-    if (!target || !paneExists(target)) { await send('❌ tmux 不可用'); return; }
     try {
-      sendTmuxKey(target, 'Escape');
-      await send(`⏹ 已向 ${ctxSess.name} 发送中断${ctxSess.lastInjectedText ? '，正在等待回收当前回合…' : ''}`);
-      onInterruptRequested(ctxSess);
+      await send(requestEscape(ctxSess).message);
     } catch (err) {
       await send(`❌ 中断失败: ${err.message}`);
     }
+    return;
+  }
+
+  // #reset [all] — un-wedge a session that reads busy but will never resolve.
+  // No confirmation prompt on purpose: this is what someone reaches for when
+  // they are already stuck, and it cannot lose anything (queued messages are
+  // kept, the registry and credentials are untouched).
+  if (cmd === '#reset' || cmd === '#unstick') {
+    const all = (parts[1] || '').toLowerCase() === 'all';
+    const targets = all ? [...sessionStates.values()] : (ctxSess ? [ctxSess] : []);
+    if (targets.length === 0) { await send(all ? '暂无会话可重置' : '当前没有会话'); return; }
+    const reg = readSessions();
+    const blocks = targets.map(s => resetReceipt(s, resetSessionState(s, all ? 'im-reset-all' : 'im-reset'), reg));
+    await send(blocks.join('\n\n'));
     return;
   }
 
@@ -2332,7 +2734,7 @@ async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false)
     return;
   }
 
-  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 tmux 会话\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号> — 聚焦 tmux 会话（其余话题收起，切回重建）\n  /rename <新名字> — 重命名\n  /rnt <新名> — 重命名 tmux 会话（组）\n  /model — 切换模型\n  /esc — 中断当前回合\n  /bind — 在话题群里绑定`);
+  await send(`未知指令: ${text}\n可用:\n  /ls — 列出 tmux 会话\n  /sw <名字/序号> — 切换默认路由\n  /fc <名字/序号> — 聚焦 tmux 会话（其余话题收起，切回重建）\n  /rename <新名字> — 重命名\n  /rnt <新名> — 重命名 tmux 会话（组）\n  /model — 切换模型\n  /esc — 中断当前回合\n  /reset — 卡在忙碌时重置回合状态（/reset all 全部）\n  /bind — 在话题群里绑定`);
 }
 
 /**
@@ -2358,21 +2760,15 @@ async function handleCallback(inbound) {
   // ── intr:<sid> — interrupt button on the live status message ──
   if (verb === 'intr') {
     if (!sess) { ack('该会话已不存在'); return; }
-    // Stale tap: the turn this button belonged to is over. Escape on an idle CC
-    // pane is hazardous (a second Esc opens the rewind dialog) and interrupting
-    // an unrelated terminal turn from a leftover button would be surprising —
+    // Stale tap: the turn this button belonged to is over. Interrupting an
+    // unrelated terminal turn from a leftover button would be surprising —
     // /esc is the explicit command for that.
     if (!sess.lastInjectedText) { ack('该回合已结束'); return; }
-    // One Escape per turn via the button (this gate, not the button-removal
-    // edit, is the real double-Esc protection — edits can fail silently).
-    if (sess.interruptRequestedAt) { ack('已请求中断，正在等待回收（可发送 /esc 再次中断）'); return; }
-    const tmux = tmuxTargetFor(sess);
-    if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); return; }
+    // No interruptRequestedAt gate any more: requestEscape reads the pane, so a
+    // repeat tap on a no-longer-working pane simply reports that instead of
+    // firing a second Escape. The screen is a better guard than our bookkeeping.
     try {
-      sendTmuxKey(tmux, 'Escape');
-      ack(`已向 ${sess.name} 发送中断`);
-      logger.info('Interrupt sent via status button', { session: sess.name });
-      onInterruptRequested(sess);
+      ack(requestEscape(sess).message);
     } catch (err) {
       ack('中断失败');
       logger.error('Interrupt failed', { error: err.message });
@@ -2537,7 +2933,12 @@ function cancelPending(sess) {
   if (sess.injectTimer) { clearTimeout(sess.injectTimer); sess.injectTimer = null; }
 }
 
-function scheduleInject(sess) {
+// A paste the pane provably did not accept is retried with a backoff rather
+// than reported as in-flight — see the submitted===false branch below.
+const INJECT_RETRY_DELAY = 3_000;
+const INJECT_MAX_FAILS   = 3;
+
+function scheduleInject(sess, delayMs = INJECT_DELAY) {
   cancelPending(sess);
   // One turn at a time PER SESSION: never inject while this session's previous
   // message is still awaiting its response (lastInjectedText set). The Stop
@@ -2555,13 +2956,67 @@ function scheduleInject(sess) {
       logger.warn('Cannot inject: tmux target unavailable', { session: sess.name, target });
       return;
     }
+    const kind = sessionKind(entry);
+    // Do not paste into a full-screen overlay. In Codex's rewind overlay the
+    // keystrokes are navigation, not text — and Enter there forks the session.
+    // 'primed' and 'working' deliberately DO pass: priming is harmless to an
+    // injection (the first pasted character cancels it, and a non-empty composer
+    // disables backtrack outright) and a working pane simply queues our text.
+    // Only Escape cares about 'primed'; only injection cares about 'overlay'.
+    const mod = paneModality(target, kind);
+    if (mod === 'overlay' || mod === 'unknown') {
+      sess.injectFailCount = (sess.injectFailCount || 0) + 1;
+      logger.warn('Deferring inject: pane is not accepting text', {
+        session: sess.name, modality: mod, attempt: sess.injectFailCount,
+      });
+      if (sess.injectFailCount < INJECT_MAX_FAILS) { scheduleInject(sess, INJECT_RETRY_DELAY); return; }
+      sess.injectFailCount = 0;
+      const notify = sess.pendingQueue[0]?.target || lastTarget;
+      if (notify && transport) {
+        transport.sendText(notify, mod === 'overlay'
+          ? `🪟 「${sess.name}」的终端停在历史浏览界面，消息暂时发不进去（已保留在队列）。发送 /esc 可自动退出该界面。`
+          : `❓ 读不到「${sess.name}」的终端状态，消息暂时发不进去（已保留在队列）。请回终端看一眼。`).catch(() => {});
+      }
+      return;
+    }
     const item = sess.pendingQueue.shift();
+    let res;
     try {
-      sendKeys(target, item.text, sess.key);
+      res = sendKeys(target, item.text, sess.key, { kind });
+    } catch (err) {
+      // Re-queue at the head so the message is not lost on a transient tmux error.
+      sess.pendingQueue.unshift(item);
+      logger.error('tmux inject failed', { session: sess.name, error: err.message });
+      return;
+    }
+    if (res.submitted === false) {
+      // The text is provably still sitting in the composer. Marking the turn
+      // in-flight here is EXACTLY how a session used to wedge into permanent
+      // "busy": no turn means no Stop, and lastInjectedText then blocks every
+      // later message forever. So re-queue at the head and back off instead —
+      // the session never enters a state it cannot leave.
+      sess.pendingQueue.unshift(item);
+      sess.injectFailCount = (sess.injectFailCount || 0) + 1;
+      logger.error('Inject not submitted, text stayed in composer', {
+        session: sess.name, attempt: sess.injectFailCount, chars: item.text.length,
+      });
+      if (sess.injectFailCount < INJECT_MAX_FAILS) { scheduleInject(sess, INJECT_RETRY_DELAY); return; }
+      sess.injectFailCount = 0;   // a later drain (Stop, /reset) gets a fresh budget
+      const notify = item.target || sess.injectedTarget || lastTarget;
+      if (notify && transport) {
+        transport.sendText(notify,
+          `❌ 消息无法提交到「${sess.name}」的终端输入框（已重试 ${INJECT_MAX_FAILS} 次）。\n`
+          + `消息仍在队列中未丢失。请回终端看一眼输入框，或发送 /reset 重置该会话。`).catch(() => {});
+      }
+      return;
+    }
+    try {
+      sess.injectFailCount        = 0;
       sess.lastInjectedText       = item.text;
       sess.lastInjectedTranscript = entry.transcriptPath || null;
       sess.injectedTarget         = item.target;
       sess.injectedMessageId      = item.messageId || '';
+      sess.injectedAt             = Date.now();
       sess.interimLastScanAt      = 0;
       // Reset interim dedup state ON the chain, not synchronously: a previous
       // turn's still-queued scan or end-of-turn flush must keep seeing its own
@@ -2575,11 +3030,59 @@ function scheduleInject(sess) {
       startTurnStatus(sess);  // live status / progress pings until this turn resolves
       logger.info('Injected message', { session: sess.name, chars: item.text.length, queued: sess.pendingQueue.length, transcript: sess.lastInjectedTranscript?.slice(-40) });
     } catch (err) {
-      // Re-queue at the head so the message is not lost on a transient tmux error.
-      sess.pendingQueue.unshift(item);
-      logger.error('tmux inject failed', { session: sess.name, error: err.message });
+      // The text is already in the agent by this point, so re-queuing would
+      // double-send it. Bookkeeping (history, reactions, status message) is
+      // best-effort: log and let the turn run.
+      logger.error('Post-inject bookkeeping failed', { session: sess.name, error: err.message });
     }
-  }, INJECT_DELAY);
+  }, delayMs);
+}
+
+/**
+ * Clear one session's in-flight turn state so a wedged session takes messages
+ * again. Runtime turn state ONLY: the registry, IM credentials, bound topics and
+ * the daemon itself are untouched, which makes this idempotent and lossless —
+ * safe to run on a healthy session.
+ *
+ * pendingQueue is deliberately KEPT and re-drained. The point of a reset is to
+ * get stuck messages moving, not to discard them.
+ *
+ * persistStates() at the end is what makes this stick: lastInjectedText is
+ * persisted, so before this existed a wedged turn survived even `wrc restart`
+ * and there was no way at all to clear it from the IM side.
+ *
+ * Returns what was cleared, for the receipt.
+ */
+function resetSessionState(sess, reason = 'manual') {
+  const had = {
+    injected:   sess.lastInjectedText,
+    injectedAt: sess.injectedAt,
+    busy:       sess.busy,
+    queued:     sess.pendingQueue.length,
+    quiz:       !!sess.pendingQuiz,
+  };
+  cancelQuiz(sess, '（会话已重置）');
+  cancelPending(sess);
+  stopTurnStatus(sess);
+  sess.lastInjectedText       = null;
+  sess.lastInjectedTranscript = null;
+  sess.injectedTarget         = '';
+  sess.injectedMessageId      = '';
+  sess.injectedAt             = 0;
+  sess.busy                   = false;
+  // Frees the per-turn dedup slot; any orphan-poll chain still running sees
+  // lastInjectedText change and retires itself on its next tick.
+  sess.orphanPollText         = null;
+  sess.interruptRequestedAt   = 0;
+  sess.injectFailCount        = 0;
+  sess.pendingSelect          = null;
+  persistStates();
+  logger.warn('Session turn state reset', {
+    session: sess.name, reason, busy: had.busy, queued: had.queued,
+    injected: had.injected?.slice(0, 60) || null,
+  });
+  scheduleInject(sess);   // drain anything that was queued behind the wedge
+  return had;
 }
 
 // ── Send with retry ──────────────────────────────────────────────────
@@ -2740,6 +3243,7 @@ function pushResponse(sess, responseText, opts = {}) {
   sess.lastInjectedTranscript = null;
   sess.injectedTarget         = '';
   sess.injectedMessageId      = '';
+  sess.injectedAt             = 0;
   // Deliberately NOT clearing sess.busy here: orphan polls / deferred retries /
   // restart reconciliation can reach this long after our turn ended, while a
   // NEW terminal-initiated turn legitimately holds busy — clearing would let
@@ -2804,6 +3308,7 @@ function abandonTurn(sess, reason) {
   sess.lastInjectedTranscript = null;
   sess.injectedTarget         = '';
   sess.injectedMessageId      = '';
+  sess.injectedAt             = 0;
   // Abandoning = we have declared the agent idle (deadline + pane-idle / idle
   // notification). A busy flag outliving the turn it belongs to recreates the
   // wedge: the inbound busy-gate would queue every later message with nothing
@@ -2987,14 +3492,21 @@ const INTERRUPT_GRACE_MS = 20_000;
  * and the inbound busy-gate queues every later message with nothing to drain
  * it. Recovery here depends only on the transcript + pane content — no hooks.
  */
-function onInterruptRequested(sess) {
+// `markRequested: false` — no Escape was actually sent (the pane was already
+// idle) and we want only the recovery half: arm the short poll so a turn whose
+// Stop never arrived resolves from partial text or is abandoned. Marking would
+// stamp "⏹ 已请求中断" onto a status message for an interrupt that never
+// happened, and would cancel a quiz that nothing dismissed.
+function onInterruptRequested(sess, { markRequested = true } = {}) {
   const tmux = tmuxTargetFor(sess);
   if (sess.lastInjectedText) {
-    // The Esc lands on an open AskUserQuestion dialog first — the quiz is gone
-    // either way, and clearing it also unblocks editStatus's pendingQuiz skip.
-    if (sess.pendingQuiz) cancelQuiz(sess, '（已中断）');
-    sess.interruptRequestedAt = Date.now();
-    editStatus(sess);  // immediate re-render: interrupt body, ⏹ removed
+    if (markRequested) {
+      // The Esc lands on an open AskUserQuestion dialog first — the quiz is gone
+      // either way, and clearing it also unblocks editStatus's pendingQuiz skip.
+      if (sess.pendingQuiz) cancelQuiz(sess, '（已中断）');
+      sess.interruptRequestedAt = Date.now();
+      editStatus(sess);  // immediate re-render: interrupt body, ⏹ removed
+    }
     const injected = sess.lastInjectedText;
     const entry = readSessions().sessions[sess.name];
     const kind = entry ? sessionKind(entry) : 'claude';
@@ -3667,7 +4179,8 @@ function buildWelcome({ reconnect = false, activeName = '', kind = '' } = {}) {
     '  /rename <新名字> — 重命名会话（TG 里直接改话题名也会同步）\n' +
     '  /rnt <新名> — 重命名 tmux 会话（组）' + (transport?.caps.topics ? '，/ls 菜单里也可点 ✏️' : '') + '\n' +
     '  /model — 切换模型（文字菜单，无需终端交互）\n' +
-    '  /esc — 中断当前回合\n\n' +
+    '  /esc — 中断当前回合\n' +
+    '  /reset — 会话卡在「忙碌」不动时，清掉回合状态（消息不丢；/reset all 全部）\n\n' +
     '直接发消息即注入对应 session，回复将自动转发；各会话互不阻塞。';
 }
 
@@ -3807,6 +4320,18 @@ function onInboundMessage(inbound) {
   else if (/^\/model(\s|$)/i.test(cmdText)) cmdText = '#model' + cmdText.slice(6);
   else if (/^\/bind\b/i.test(cmdText)) cmdText = '#bind';
   else if (/^\/esc\b/i.test(cmdText)) cmdText = '#esc';
+  // /reset MUST be intercepted here. `reset` is a live, remotable Claude Code
+  // builtin that clears the conversation, so falling through would wipe the
+  // history of the very session we are trying to un-wedge. Deliberately shadows
+  // it: someone typing /reset from the IM wants the session un-stuck, and the
+  // receipt says plainly what it did. The agent's own /reset stays available in
+  // the terminal.
+  //
+  // `\b` not `(\s|$)`, matching /ls and /esc: Telegram group members send
+  // `/reset@botname`, which `(\s|$)` rejected — straight into the fall-through
+  // above. `all` is then read from anywhere in the text so the @suffix cannot
+  // land in the argument.
+  else if (/^\/(reset|unstick)\b/i.test(cmdText)) cmdText = /\ball\b/i.test(cmdText) ? '#reset all' : '#reset';
   else if (/^\/start\b/i.test(cmdText)) {
     // Telegram /start (BotFather flow) → welcome/usage text. /help stays a
     // remotable CC builtin (inject + capture), as before.
@@ -3882,6 +4407,7 @@ const MENU_COMMANDS = [
   { command: 'rename', description: '重命名当前会话' },
   { command: 'rnt',    description: '重命名 tmux 会话（组）' },
   { command: 'esc',    description: '中断当前回合' },
+  { command: 'reset',  description: '会话卡在忙碌不动时，重置回合状态（消息不丢）' },
   { command: 'bind',   description: '在话题群里绑定（每会话一个话题）' },
   { command: 'start',  description: '使用说明' },
 ];
@@ -3909,6 +4435,9 @@ async function main() {
     sess.lastInjectedTranscript = turn.lastInjectedTranscript || null;
     sess.injectedTarget         = turn.injectedTarget || '';
     sess.injectedMessageId      = turn.injectedMessageId || '';
+    // 0 for state files written before injectedAt existed — /ls then reports the
+    // age as unknown rather than pretending the turn started in 1970.
+    sess.injectedAt             = turn.injectedAt || 0;
     sess.interimSentUuids       = turn.interimSentUuids || [];
     sess.interimLastText        = turn.interimLastText || null;
     sessionStates.set(key, sess);
@@ -3941,13 +4470,35 @@ async function main() {
     }
   } catch {}
 
-  let startupReconciled = false;
-  function reconcileRestoredTurn() {
-    if (startupReconciled) return;       // ready may fire more than once
-    startupReconciled = true;
+  /**
+   * 'none' → 'armed' (timeouts armed, pushes deferred) → 'full' (pushes allowed).
+   *
+   * Splitting these fixes a specific permanent ghost. This used to run ONLY from
+   * the transport 'ready' branch, so when the transport never became ready
+   * (expired credentials, a Telegram 409, no network) a restored
+   * lastInjectedText was never reconciled, NO orphan poll was ever armed, and
+   * persistStates kept writing it back to disk. That session then read busy
+   * forever — across days and across restarts — with nothing able to clear it.
+   *
+   * Arming a timeout needs no transport at all; only pushing a reply does. So
+   * the armed pass runs unconditionally and guarantees every restored turn
+   * eventually resolves or is abandoned, while the full pass still takes the
+   * fast path when the transport does come up.
+   */
+  let reconciledStage = 'none';
+  function reconcileRestoredTurn({ canPush = true } = {}) {
+    if (reconciledStage === 'full') return;                // ready may fire more than once
+    if (reconciledStage === 'armed' && !canPush) return;   // already armed; nothing new
+    const upgrading = reconciledStage === 'armed';
+    reconciledStage = canPush ? 'full' : 'armed';
+    logger.info('Reconciling restored turns', { canPush, upgrading });
     const regNow = readSessions();
     for (const sess of sessionStates.values()) {
       if (!sess.lastInjectedText) continue;
+      // The armed pass already claimed this turn's dedup slot; release it so the
+      // full pass can re-arm and take the push fast path. Same idiom as
+      // onStopCodex / onInterruptRequested superseding a live poll.
+      if (upgrading) sess.orphanPollText = null;
       // injectedTarget may be missing on legacy restores — fall back to the last
       // known reply target so a recovered response still reaches the user.
       if (!sess.injectedTarget) sess.injectedTarget = lastTarget || '';
@@ -3972,7 +4523,11 @@ async function main() {
           const r = agent.responseToInjected(agent.parseRollout(tpath), injected);
           return (r?.text && r.complete) ? r.text : null;
         };
-        const done = probe();
+        // canPush gates only the fast path. Without a live transport the send
+        // would fail its retries and the reply would be lost, so leave the turn
+        // to the poll below: it re-probes every 5s and pushes the moment the
+        // transport is usable, and abandons the turn if it never is.
+        const done = canPush ? probe() : null;
         if (done) {
           pushResponse(sess, done);
           logger.info('Restored codex turn already complete; pushed on startup', { chars: done.length });
@@ -3985,7 +4540,7 @@ async function main() {
           () => sess.busy || (!!tpath && agent.latestUserMessage(agent.parseRollout(tpath)) === injected));
         continue;
       }
-      if (sess.lastInjectedTranscript) {
+      if (canPush && sess.lastInjectedTranscript) {
         const r = findResponseToInjected(parseTranscript(sess.lastInjectedTranscript, TRANSCRIPT_TAIL_BYTES), sess.lastInjectedText);
         if (r?.text && r.complete) {
           pushResponse(sess, r.text);
@@ -4029,12 +4584,11 @@ async function main() {
         logger.info('Sent startup welcome', { target: welcomeTarget });
       }
 
-      // Reconcile any in-flight turn restored from a previous run. Run here (not
-      // earlier) because the transport's sender/api is only initialised by now, so
-      // pushResponse can actually deliver. Without this, a daemon that died mid-turn
-      // would restore lastInjectedText, never receive the (already-fired) Stop, and
-      // wedge — scheduleInject() no-ops forever and every future message is dropped.
-      reconcileRestoredTurn();
+      // Reconcile any in-flight turn restored from a previous run. The fast path
+      // lives here because the transport's sender/api is only initialised by now,
+      // so pushResponse can actually deliver. The armed fallback below covers the
+      // case where this branch never runs at all.
+      reconcileRestoredTurn({ canPush: true });
       return;
     }
     if (ev.type === 'session_expired') {
@@ -4059,8 +4613,20 @@ async function main() {
           ], { stdio: 'ignore' });
         }
       } catch {}
+      // 'ready' is never coming, so stop waiting for it: arm the recovery
+      // timeouts now rather than leaving restored turns wedged until someone
+      // re-logs in.
+      reconcileRestoredTurn({ canPush: false });
     }
   }
+
+  // Last-resort arming. If 'ready' has not fired a full minute after startup,
+  // something is wrong with the transport (bad credentials, a 409, no network)
+  // and it may never fire — but restored turns must still resolve or expire.
+  // The delay is deliberate: firing immediately would beat a healthy transport's
+  // 1-2s handshake and needlessly downgrade a reply we could have pushed at once.
+  const RECONCILE_FALLBACK_MS = 60_000;
+  setTimeout(() => reconcileRestoredTurn({ canPush: false }), RECONCILE_FALLBACK_MS).unref?.();
 
   function shutdown() {
     logger.info('Shutting down');
