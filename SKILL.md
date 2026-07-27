@@ -756,7 +756,26 @@ For validating a code change to the bridge itself (not a user-facing sub-command
 4. Send a long-running prompt in topic A, then immediately a prompt in topic B: both
    inject (independent queues), two status messages update independently, 👀 → 👍
    reactions land on each user message, each reply returns to its own topic.
-5. Tap ⏹ on a running turn's status message → the pane receives Escape.
+5. Tap ⏹ on a running turn's status message → the pane receives Escape, the status
+   message flips to「⏹ 已请求中断…」with the button removed, and within ~20s either
+   the partial text arrives (deduped against interim blocks) or the turn is abandoned
+   with ⚠️ + 💔. A NEW message sent right after then injects immediately (no busy
+   wedge). Variants worth one pass each:
+   - Queue a message BEFORE tapping ⏹ → it injects as soon as the turn is reaped.
+   - Tap the (stale) ⏹ again after the turn resolved → ack「该回合已结束」, no Escape
+     reaches the pane (no rewind dialog pops up).
+   - Tap ⏹ twice fast → second tap acks「已请求中断…」, exactly one Escape lands.
+   - `/esc` on a TERMINAL-initiated tool turn → log shows `cleared stuck busy flag`
+     within ~30s and queued IM messages inject. Also press Esc directly in the
+     terminal mid-turn (no `/esc`): the 60s idle Notification clears busy instead.
+   - ⏹ while an AskUserQuestion quiz is pending → quiz buttons are withdrawn with
+     「（已中断）」and recovery proceeds normally.
+   - Codex empirical check: interrupt an IM-initiated codex turn at the terminal and
+     watch the log — if no `Stop hook received` appears, the 20s interrupt poll is the
+     only recovery path (expected); if Stop does fire, both paths coexist harmlessly.
+   - `tmux capture-pane -p` on a running pane must contain "esc to interrupt"
+     (case-insensitive) — the string paneShowsWorking keys on; if a CC/codex upgrade
+     drops it, interrupts abandon at the first 20s deadline instead of extending.
 6. `/rename` inside a topic → tmux window, registry and the topic itself are renamed.
    Rename a topic in the Telegram UI (long-press → Edit) → the tmux window follows, a ✅
    notice appears in the topic, and the 30s rescan does NOT revert it (no rename ping-pong
