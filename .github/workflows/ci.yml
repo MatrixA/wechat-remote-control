@@ -29,11 +29,22 @@ jobs:
       - name: Verify committed dist is up to date
         run: git diff --exit-code dist/ || (echo "::error::dist/ is stale — run 'npm run build' and commit" && exit 1)
 
-      # src/index.js and src/agents.js are plain JS, excluded from tsc — a syntax /
-      # early-reference error in them would otherwise ship green and only fail at the
-      # user's `node src/index.js` launch. node --check parses without running.
-      - name: Syntax-check plain-JS entrypoints
-        run: node --check src/index.js && node --check src/agents.js
+      # src/index.js, src/agents.js and everything under bin/ are plain JS/bash, excluded
+      # from tsc and from `npm test` — a syntax / early-reference error in them would
+      # otherwise ship green and only fail on the user's box, at `node src/index.js` or
+      # `wrc start`. node --check / bash -n parse without running.
+      - name: Syntax-check plain-JS entrypoints and the ops scripts
+        run: |
+          node --check src/index.js
+          node --check src/agents.js
+          node --check bin/hooks.mjs
+          node --check bin/login.mjs
+          bash -n bin/wrc
+
+      # bin/wrc is documented as `bash bin/wrc …` but is also meant to be executable
+      # directly; a lost mode bit turns the PATH wrapper into a confusing failure.
+      - name: Verify bin/wrc is committed executable
+        run: git ls-files -s bin/wrc | grep -q '^100755 ' || (echo "::error::bin/wrc must be mode 100755 — run 'chmod +x bin/wrc'" && exit 1)
 
       - name: Test
         run: npm test

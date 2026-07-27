@@ -41,6 +41,16 @@ a Telegram account exist, set `WCC_TRANSPORT` explicitly so the right one starts
 **Key principle:** When any step encounters a problem, fix it directly by running commands.
 Never ask the user to copy-paste and run commands themselves — handle everything here.
 
+**Who owns what.** `bin/wrc` is the single implementation of everything that does not need
+agent context: the daemon lifecycle (`start` / `stop` / `restart` / `status` / `logs`), hook
+and status-line installation (`hooks install|uninstall`, backed by the unit-tested
+`mergeWrcHooks` / `stripWrcHooks`), and terminal login. Steps below **call it**; never
+re-inline a `nohup`, a `kill`, or a hooks-merging heredoc here — that is how the two copies
+this consolidated came to exist. This runbook owns what genuinely needs the agent: locating
+the pane the agent itself lives in (attach, via `detect.py`'s process-ancestry walk),
+choosing the active session, `sync`, and the chat-driven login loops. A user at a plain
+terminal can do everything except attach — see the README's *更新与从终端运行* section.
+
 ---
 
 ## Architecture overview (for Claude's reference)
@@ -134,6 +144,13 @@ outside `$HOME` are still found.
 Use this for the **WeChat** transport. For **Telegram**, skip to *login (Telegram)* below.
 
 Run this once before first use, or whenever the bridge reports session expiry.
+
+> The steps below drive the login from a chat: the QR has to appear **while** the wait is
+> still running, and a bash call cannot both block on the scan and render to the user
+> mid-flight — hence the detached process and the two polled files. A human at a terminal
+> has no such problem and should just run `bash <skill-dir>/bin/wrc login --wechat`, which
+> awaits inline. Both paths call the same `startQrLogin` / `waitForQrScan`; only the
+> interaction loop differs.
 
 ### Step 1: Check if already logged in
 
@@ -312,6 +329,10 @@ the first chat to message the bot is captured and **locked** as the only authori
 
 > **Security:** the bot token grants control of the terminal. Treat it as a secret. The bridge
 > only ever accepts messages from the single locked chat; anyone else who finds the bot is ignored.
+
+> At a terminal, `bash <skill-dir>/bin/wrc login --telegram` does all of this in one
+> interactive pass (and keeps the token off the chat transcript). The steps below are the
+> chat-driven equivalent, for when login is requested from inside an agent session.
 
 ### Step 1: Resolve the skill dir and ensure Node (same as WeChat login Step 2)
 
@@ -594,7 +615,7 @@ print(f'OK: target={target} active={matched} ccPid={info["cc_pid"]}')
 PY
 ```
 
-### Step 4: Configure agent hooks (merge-safe)
+### Step 4: Configure agent hooks + status line (merge-safe)
 
 The hook config file and event set depend on the detected agent:
 
@@ -603,7 +624,7 @@ The hook config file and event set depend on the detected agent:
 - **codex** → `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`), events
   `PreToolUse` / `Stop` / `UserPromptSubmit` (Codex has no `Notification` event).
 
-Both files use the same nested `hooks` schema. The writer below **merges** — it never
+Both files use the same nested `hooks` schema. The writer **merges** — it never
 overwrites other settings or other tools' hook blocks. Two properties matter:
 
 - **The command is guarded so it can NEVER block a prompt.** It is written as
@@ -619,57 +640,19 @@ overwrites other settings or other tools' hook blocks. Two properties matter:
   command. This makes re-running attach **self-heal** an already-broken `hooks.json` /
   `settings.json`, and is idempotent (re-runs yield a byte-identical file).
 
-The install dir comes from `detect.py`'s emitted `skill_dir` (its own location, agent-correct
-by construction), with fallbacks. The agent kind is read from the Step-3 detect blob.
+For Claude this same command also installs the status line (`statusLine` → `status.sh`);
+Codex has no status-line mechanism and silently gets hooks only. The agent kind comes from
+the Step-3 detect blob. `wrc` resolves its own install dir from `$0`, so the hook paths it
+writes always point at the copy that is actually running — no `find` guess involved.
 
-> NOTE: This heredoc is the source of truth for the guarded command and per-agent event set.
-> `src/hookcmd.ts` mirrors it for tests — keep the two byte-identical.
+> The merge lives in `mergeWrcHooks` (`src/hookcmd.ts`) and is unit-tested; `bin/hooks.mjs`
+> is the only caller. Do not re-inline it here — one implementation, two callers.
 
 ```bash
-python3 - <<'PY'
-import json, os, shlex
-info = json.load(open('/tmp/wrc_detect.json'))
-kind = info.get('agent', 'claude')
-
-# Authoritative install dir: detect.py's own dir (matches the running agent); fall back
-# to the SKILL_DIR exported by Step 1, then to the agent-aware default location.
-skill_dir = info.get('skill_dir') or os.environ.get('SKILL_DIR')
-if not skill_dir:
-    sub = '.agents/skills' if kind == 'codex' else '.claude/skills'
-    skill_dir = os.path.expanduser(f'~/{sub}/wechat-remote-control')
-cmd_base = os.path.join(skill_dir, 'hook.py')
-
-if kind == 'codex':
-    cfg_dir = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
-    path = os.path.join(cfg_dir, 'hooks.json')
-    events = {'PreToolUse': 'pretooluse', 'Stop': 'stop', 'UserPromptSubmit': 'userpromptsubmit'}
-else:
-    cfg_dir = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
-    path = os.path.join(cfg_dir, 'settings.json')
-    events = {'PreToolUse': 'pretooluse', 'Stop': 'stop', 'Notification': 'notification'}
-
-os.makedirs(cfg_dir, exist_ok=True)
-cfg = json.load(open(path)) if os.path.exists(path) else {}
-hooks = cfg.setdefault('hooks', {})
-
-# Guarded command (stderr-only redirect; forced exit 0 so a missing/erroring hook.py
-# never blocks a prompt). shlex.quote handles install paths containing spaces.
-qbase = shlex.quote(cmd_base)
-MARK = 'wechat-remote-control/hook.py'
-for event, arg in events.items():
-    command = f'[ -f {qbase} ] && python3 {qbase} {arg} 2>/dev/null; exit 0'
-    groups = hooks.setdefault(event, [])
-    # Migrate, don't skip: strip any prior wrc handler, drop emptied groups, append one
-    # fresh entry. Idempotent and self-healing for already-broken configs.
-    for g in groups:
-        g['hooks'] = [h for h in g.get('hooks', []) if MARK not in (h.get('command') or '')]
-    hooks[event] = [g for g in groups if g.get('hooks')]
-    hooks[event].append({'matcher': '', 'hooks': [{'type': 'command', 'command': command}]})
-
-with open(path, 'w') as f:
-    json.dump(cfg, f, indent=2)
-print(f'OK kind={kind} file={path} skill_dir={skill_dir}')
-PY
+AGENT=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('agent','claude'))" 2>/dev/null || echo claude)
+SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
+[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name hook.py 2>/dev/null | grep "wechat-remote-control/hook.py" | head -1 | sed 's|/hook.py||')
+bash "$SKILL_DIR/bin/wrc" hooks install --agent "$AGENT"
 ```
 
 **Codex hot-reload caveat.** Codex reads `hooks.json` ONCE at process startup — it does
@@ -677,7 +660,7 @@ not hot-reload. If `agent=codex` and the wrc hooks were not already present befo
 attach (check first: `grep -c 'wechat-remote-control/hook.py' "$CODEX_HOME/hooks.json"`
 → `0` means first install; default `CODEX_HOME` is `~/.codex`), the running codex will
 never fire them: its turns complete but no Stop reaches the bridge, so responses are
-never forwarded (the IM shows endless "typing"). After Step 6, tell the user to restart
+never forwarded (the IM shows endless "typing"). After Step 5, tell the user to restart
 codex inside the same tmux pane — `/quit`, then `codex resume --last` to keep the
 conversation context. No re-attach is needed; the state files already point at the pane.
 
@@ -686,114 +669,43 @@ log) only registers sessions in `sessions.json` — it never installs hooks. Att
 run at least once per agent kind (claude / codex) or that agent's responses are silently
 dropped.
 
-### Step 5: Configure status line (Claude only)
+### Step 5: Ensure bridge daemon is running (service model)
 
-Codex has no status-line hook mechanism, so **skip this step entirely when `agent=codex`.**
-For Claude, check if `statusLine` is already configured; if not (or if the command points
-elsewhere), merge it into `$CLAUDE_CONFIG_DIR/settings.json` without overwriting other
-settings:
-
-```bash
-# Run only when agent=claude.
-# Re-resolve the install dir (separate bash call → shell state not preserved); read the
-# authoritative skill_dir Step 3 persisted, with a find fallback.
-SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
-[ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name status.sh 2>/dev/null | grep "wechat-remote-control/status.sh" | head -1 | sed 's|/status.sh||')
-SKILL_DIR="$SKILL_DIR" python3 -c "
-import json, os
-path = os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude'), 'settings.json')
-settings = json.load(open(path)) if os.path.exists(path) else {}
-skill_dir = os.environ.get('SKILL_DIR') or os.path.expanduser('~/.claude/skills/wechat-remote-control')
-desired = {'type': 'command', 'command': 'bash ' + os.path.join(skill_dir, 'status.sh')}
-if settings.get('statusLine') == desired:
-    print('ALREADY_SET')
-else:
-    settings['statusLine'] = desired
-    with open(path, 'w') as f:
-        json.dump(settings, f, indent=2)
-    print('OK')
-"
-```
-
-If `ALREADY_SET`, skip silently.
-
-### Step 6: Ensure bridge daemon is running (service model)
-
-The bridge is a singleton service. Check if it's already running via PID file before starting.
-Never kill a healthy bridge just because attach was called again.
+The bridge is a singleton service. Never kill a healthy bridge just because attach was
+called again — `wrc start` is a no-op when one is already up.
 
 The daemon **self-enforces** singleton at the OS level by binding the hook socket
 `/tmp/cc_wechat_hook.sock`: if a live daemon already owns it (even one launched from a
 different install dir, e.g. `~/.agents/skills` for Codex vs `~/.claude/skills` for Claude
-Code), a second `node src/index.js` detects it and exits immediately. The PID check below
-is just an optimization to avoid spawning a doomed process. The daemon writes its own PID
-to `bridge.pid` once it successfully binds, so that file always points at the real singleton.
+Code), a second `node src/index.js` detects it and exits immediately. The daemon writes its
+own PID to `bridge.pid` once it successfully binds, so that file always points at the real
+singleton — which is why `wrc start` polls that file rather than trusting the pid `nohup`
+hands back.
 
-**Check existing daemon:**
-
-```bash
-PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
-BRIDGE_RUNNING=0
-if [ -f "$PID_FILE" ]; then
-    STORED_PID=$(cat "$PID_FILE")
-    if kill -0 "$STORED_PID" 2>/dev/null; then
-        echo "already running PID=$STORED_PID"
-        BRIDGE_RUNNING=1
-    else
-        echo "stale PID file, cleaning up"
-        rm -f "$PID_FILE"
-    fi
-fi
-echo "BRIDGE_RUNNING=$BRIDGE_RUNNING"
-```
-
-**Only if BRIDGE_RUNNING=0 — start daemon** (separate bash call):
+`wrc start` handles the whole sequence: it skips out when a live daemon is already there,
+resolves the transport via the daemon's own `resolveTransportName`, launches detached, and
+then polls `bridge.pid` until the daemon has actually claimed the socket (up to 8s). It
+prints `already running PID=…` or `started PID=…`, so its output is the verification.
 
 ```bash
-# Re-resolve the install dir (separate bash call); read the skill_dir Step 3 persisted,
-# with a find fallback. For Codex the daemon lives under ~/.agents/skills, not ~/.claude.
 SKILL_DIR=$(python3 -c "import json;print(json.load(open('/tmp/wrc_detect.json')).get('skill_dir',''))" 2>/dev/null)
 [ -z "$SKILL_DIR" ] && SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name index.js 2>/dev/null | grep "wechat-remote-control/src/index.js" | head -1 | sed 's|/src/index.js||')
-# Transport: explicit WCC_TRANSPORT env wins; else auto-detect (Telegram only when a
-# Telegram account exists AND no WeChat account does). An empty value is a safe no-op —
-# the daemon applies the same heuristic internally.
-TRANSPORT="${WCC_TRANSPORT:-}"
-if [ -z "$TRANSPORT" ] && [ -f "$HOME/.wechat-remote-control/telegram/account.json" ] \
-   && ! ls "$HOME/.wechat-remote-control/accounts/"*.json >/dev/null 2>&1; then
-  TRANSPORT=telegram
-fi
-WCC_TRANSPORT="$TRANSPORT" NODE_USE_ENV_PROXY=1 nohup node "$SKILL_DIR/src/index.js" >> /tmp/cc_wechat_bridge.log 2>&1 &
-echo "launched PID=$! (SKILL_DIR=$SKILL_DIR transport=${TRANSPORT:-auto})"
+bash "$SKILL_DIR/bin/wrc" start && bash "$SKILL_DIR/bin/wrc" status
 ```
+
+If it reports a failure it already printed the tail of the log; diagnose from there
+(full logs: `bash "$SKILL_DIR/bin/wrc" logs`).
 
 To force a transport when both accounts exist, run attach in a shell with
 `export WCC_TRANSPORT=telegram` (or `wechat`) set first.
 
 Other daemon env vars (inherited from this shell, read once at startup — restart the
-daemon to change them): `WRC_AUTO_APPROVE=0` opts out of tool auto-approve;
-`WRC_FORWARD_INTERIM=0` disables real-time forwarding of mid-turn assistant prose;
-`WRC_INTERIM_MIN_LEN` (default 200) sets the minimum length for a mid-turn block to
+daemon with `wrc restart` to change them): `WRC_AUTO_APPROVE=0` opts out of tool
+auto-approve; `WRC_FORWARD_INTERIM=0` disables real-time forwarding of mid-turn assistant
+prose; `WRC_INTERIM_MIN_LEN` (default 200) sets the minimum length for a mid-turn block to
 be forwarded.
 
-Do NOT write `bridge.pid` here — the daemon writes its own PID once it wins the
-singleton. (A redundant launch self-exits without touching `bridge.pid`, so the file
-always points at the live daemon.)
-
-**Verify** (after ~3 seconds) — check the live daemon, not the launched PID, since a
-redundant launch self-exiting is a *success*, not a failure:
-
-```bash
-PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
-if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "running PID=$(cat "$PID_FILE")"
-else
-    echo "FAILED"
-fi
-```
-
-If FAILED: read the last 30 lines of `/tmp/cc_wechat_bridge.log` and diagnose.
-
-### Step 7: Report success
+### Step 6: Report success
 
 ```
 Remote Control activated
@@ -849,9 +761,8 @@ For validating a code change to the bridge itself (not a user-facing sub-command
    Rename a topic in the Telegram UI (long-press → Edit) → the tmux window follows, a ✅
    notice appears in the topic, and the 30s rescan does NOT revert it (no rename ping-pong
    in the log). Renaming to an existing session's name snaps the topic back with a ⚠️.
-7. `kill $(cat ~/.wechat-remote-control/bridge.pid)` mid-turn, relaunch the daemon →
-   the in-flight turn is recovered from sessions_state.json (reply arrives or the turn
-   is abandoned with ⚠️ after the grace window).
+7. `bin/wrc restart` mid-turn → the in-flight turn is recovered from sessions_state.json
+   (reply arrives or the turn is abandoned with ⚠️ after the grace window).
 8. Delete a topic in Telegram → next send recreates it automatically.
 9. Close one pane → its topic is closed within ~60s; reopen a session with the same
    name → the old topic is reopened, not duplicated.
@@ -920,96 +831,33 @@ to either file over time. Only entries whose command contains `wechat-remote-con
 are removed; all other hooks and settings are preserved. The Claude status line is removed
 only when it still points at this skill's `status.sh`.
 
-> NOTE: The hook-stripping logic below is mirrored in `src/hookuninstall.ts` for tests
-> (`stripWrcHooks` / `stripWrcStatusLine`) — keep the two behaviourally identical.
+> The strip lives in `stripWrcHooks` / `stripWrcStatusLine` (`src/hookuninstall.ts`) and is
+> unit-tested; `bin/hooks.mjs` is the only caller. Do not re-inline it here.
 
 ```bash
-python3 - <<'PY'
-import json, os
-
-HOOK_MARK = 'wechat-remote-control/hook.py'
-STATUS_MARK = 'wechat-remote-control/status.sh'
-
-def strip_hooks(cfg):
-    hooks = cfg.get('hooks')
-    if not isinstance(hooks, dict):
-        return cfg
-    for event in list(hooks.keys()):
-        groups = hooks[event] if isinstance(hooks[event], list) else []
-        kept = []
-        for g in groups:
-            inner = g.get('hooks', []) if isinstance(g, dict) else []
-            filtered = [h for h in inner if HOOK_MARK not in (h.get('command') or '')]
-            if filtered:                      # drop groups emptied by filtering
-                g['hooks'] = filtered
-                kept.append(g)
-        if kept:
-            hooks[event] = kept
-        else:
-            del hooks[event]
-    if not hooks:
-        del cfg['hooks']
-    return cfg
-
-def strip_statusline(cfg):
-    sl = cfg.get('statusLine')
-    cmd = sl.get('command', '') if isinstance(sl, dict) else ''
-    if STATUS_MARK in cmd:                     # only remove a statusLine that is ours
-        del cfg['statusLine']
-    return cfg
-
-# Resolve both agents' config files, honouring CLAUDE_CONFIG_DIR / CODEX_HOME.
-claude_dir = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
-codex_dir  = os.environ.get('CODEX_HOME')        or os.path.expanduser('~/.codex')
-claude_path = os.path.join(claude_dir, 'settings.json')
-codex_path  = os.path.join(codex_dir,  'hooks.json')
-
-for path, is_claude in ((claude_path, True), (codex_path, False)):
-    if not os.path.exists(path):
-        print(f'SKIP (absent): {path}'); continue
-    try:
-        cfg = json.load(open(path))
-    except Exception as e:
-        print(f'SKIP (unreadable {e}): {path}'); continue
-    strip_hooks(cfg)
-    if is_claude:
-        strip_statusline(cfg)
-    with open(path, 'w') as f:
-        json.dump(cfg, f, indent=2)
-    print(f'CLEANED: {path}')
-PY
+SKILL_DIR=$(find "$HOME" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} ${CODEX_HOME:+"$CODEX_HOME"} -maxdepth 7 -type f -name hook.py 2>/dev/null | grep "wechat-remote-control/hook.py" | head -1 | sed 's|/hook.py||')
+bash "$SKILL_DIR/bin/wrc" hooks uninstall --agent both
 ```
 
 ### Step 2: Stop the bridge daemon
 
-**Run this in its own bash call.** Do NOT combine it with any `pgrep -f`/`grep` over the
-bridge path — Claude Code wraps commands in `bash -c "..."`, so such a pattern matches the
-shell itself and would kill the wrong process. The `bridge.pid` file is the safe handle.
+**Run this in its own bash call.** Do NOT reach for `pgrep -f`/`grep` over the bridge path
+— Claude Code wraps commands in `bash -c "..."`, so such a pattern matches the shell itself
+and would kill the wrong process. `wrc stop` uses the `bridge.pid` file, which is the safe
+handle, and waits for the process to actually exit before returning.
 
 ```bash
-PID_FILE="$HOME/.wechat-remote-control/bridge.pid"
-if [ -f "$PID_FILE" ]; then
-    PID=$(cat "$PID_FILE" 2>/dev/null)
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-        kill "$PID" 2>/dev/null && echo "stopped daemon PID=$PID"
-    else
-        echo "daemon not running (stale PID)"
-    fi
-else
-    echo "no bridge.pid — daemon not running"
-fi
+bash "$SKILL_DIR/bin/wrc" stop
 ```
 
-### Step 3: Remove socket and runtime state (separate bash call)
+### Step 3: Remove runtime state (separate bash call)
 
-Give the daemon a moment to exit, then remove the socket it owned plus the per-session
-runtime files. Credentials, history and logs are intentionally left in place.
+`wrc stop` already released the socket and the PID file. What is left is the per-session
+runtime state. Credentials, history and logs are intentionally kept.
 
 ```bash
-sleep 1
 D="$HOME/.wechat-remote-control"
-rm -f /tmp/cc_wechat_hook.sock \
-      "$D/bridge.pid" "$D/cc_pid" "$D/bridge.json" \
+rm -f "$D/cc_pid" "$D/bridge.json" \
       "$D/state.json" "$D/sessions.json" "$D/sessions_state.json"
 echo "runtime state cleared (accounts/ and history.jsonl kept)"
 ```

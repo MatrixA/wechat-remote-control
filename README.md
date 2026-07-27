@@ -201,6 +201,87 @@ git -C ~/.agents/skills/wechat-remote-control pull
 
 ---
 
+## 更新与从终端运行（ssh / headless）
+
+bridge daemon 是常驻单例进程，**不随 `git pull` 自动重启**——拉完新代码，旧进程还在跑旧代码。
+`WCC_TRANSPORT` / `WRC_AUTO_APPROVE` / `WRC_FORWARD_INTERIM` / `WRC_INTERIM_MIN_LEN` 也都只在
+启动时读一次，改完必须重启才生效。
+
+skill 目录里带一个不依赖 agent 的运维脚本 `bin/wrc`，在任何普通终端里都能跑，不用先开
+Claude Code / Codex：
+
+```bash
+SKILL="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
+# Codex 用户：SKILL=~/.agents/skills/wechat-remote-control
+
+bash "$SKILL/bin/wrc" status    # 在不在跑、PID、启动时间、transport、已注册会话
+bash "$SKILL/bin/wrc" start     # 没在跑就起；已在跑原样返回，不会起第二个
+bash "$SKILL/bin/wrc" stop      # SIGTERM，等进程真的退出再返回
+bash "$SKILL/bin/wrc" restart   # stop → 等 socket 释放 → start
+bash "$SKILL/bin/wrc" logs -f   # tail ~/.wechat-remote-control/logs/bridge-*.log
+```
+
+挂到 PATH 上更顺手。用 wrapper 而不是软链，这样 clone / 拷贝丢了可执行位也不影响：
+
+```bash
+mkdir -p ~/.local/bin
+printf '#!/bin/sh\nexec bash "%s/bin/wrc" "$@"\n' "$SKILL" > ~/.local/bin/wrc
+chmod +x ~/.local/bin/wrc
+wrc status
+```
+
+### 更新后重启
+
+```bash
+git -C "$SKILL" pull
+wrc restart
+wrc status            # PID 变了、启动时间是刚才，就是生效了
+```
+
+`dist/` 是提交进仓库的，`git pull` 会一并带下来，**正常不需要** `npm run build`——只有你自己
+改过 `src/*.ts` 才要 `npm install && npm run build`。
+
+重启是安全的，**不需要重跑 `attach`**：
+
+- daemon 退出时同步删掉 socket，重启后从 `sessions_state.json` 恢复进行中的轮次
+- tmux 会话由 daemon 每 30s 的自动扫描重新发现，`sessions.json` 会自己重建
+- agent hook 写在 `~/.claude/settings.json` / `~/.codex/hooks.json` 里，是一次性配置，重启 daemon 不影响
+
+> IM 那边行为看着「过时」（新功能没有、老 bug 还在）？先怀疑 daemon 没重启：拿 `wrc status`
+> 的启动时间比一下 `git -C "$SKILL" log -1 --format=%cd`，启动时间更早就 `wrc restart`。
+
+如果手上这台还没更新到带 `bin/wrc` 的版本，等价的裸命令是：
+
+```bash
+PID_FILE=$HOME/.wechat-remote-control/bridge.pid
+[ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null; sleep 1
+WCC_TRANSPORT=telegram NODE_USE_ENV_PROXY=1 \
+  nohup node "$SKILL/src/index.js" >> /tmp/wrc-bridge.log 2>&1 &
+sleep 3 && cat "$PID_FILE"      # 看 PID 文件，不是看 nohup 返回的那个
+```
+
+两个坑：**必须先 kill 再起**——socket 单例锁会让新进程在旧进程还活着时立刻自杀，而 `nohup` 那行
+照样打印一个 PID，看着像成功了；**别用 `pkill -f .../src/index.js`**——agent 把命令包在
+`bash -c "..."` 里，这个 pattern 会匹配到包裹的 shell 自己。PID 文件是唯一安全句柄。
+
+### 一台新的无头机器怎么跑起来
+
+`bin/wrc` 管 daemon、登录和 hook。只有 `attach` 必须在 agent 自己的 tmux pane 里跑（它靠进程
+父链定位 pane），普通终端做不到——这是有意的分工，不是缺失。
+
+```bash
+git clone https://github.com/MatrixA/wechat-remote-control.git "$SKILL"
+wrc login --telegram              # 或 --wechat：二维码直接画在终端里，ssh 上也能扫
+wrc hooks install --agent both    # 写 hook + Claude 状态栏，两种 agent 一次装好
+wrc start
+```
+
+然后在 tmux 里正常启动 Claude Code 或 Codex 就行，daemon 每 30s 扫一次，会自动发现并注册它们。
+只有想指定「默认路由到哪个会话」时才需要在 agent 里跑一次 `/wechat-remote-control attach`——
+或者干脆在 IM 里用 `/ls`、`/fc` 切。
+
+---
+
 ## 四个子命令
 
 ### `login`
@@ -248,6 +329,7 @@ wechat-remote-control/
 ├── tsconfig.json
 ├── src/                  # TS 源码：bridge、tmux 注入、ilink client、命令路由
 ├── dist/                 # 预构建产物，SKILL.md 中的运行步骤直接引用 dist/ 路径
+├── bin/wrc               # 终端运维入口：daemon 生命周期 / login / hooks，不依赖 agent
 ├── detect.py             # /proc + ps 双栈的 CC-in-tmux 检测器
 ├── hook.py               # agent hook 入口：Claude(PreToolUse/Stop/Notification) 与 Codex(PreToolUse/Stop/UserPromptSubmit) 都转给 bridge
 ├── format_history.py     # 把 history.jsonl 渲染成可读文本

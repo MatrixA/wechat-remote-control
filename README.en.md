@@ -209,6 +209,92 @@ If you just type `/wechat-remote-control` with no arg, it defaults to **attach**
 
 ---
 
+## Updating & running from a terminal / 更新与从终端运行
+
+The bridge daemon is a long-lived singleton and **does not restart when you `git pull`** —
+pull new code and the old process keeps running the old code. `WCC_TRANSPORT` /
+`WRC_AUTO_APPROVE` / `WRC_FORWARD_INTERIM` / `WRC_INTERIM_MIN_LEN` are likewise read once at
+startup; changing one needs a restart.
+
+The skill ships `bin/wrc`, an ops script that needs no agent at all — run it from any plain
+terminal, no Claude Code / Codex session required:
+
+```bash
+SKILL="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
+# Codex users: SKILL=~/.agents/skills/wechat-remote-control
+
+bash "$SKILL/bin/wrc" status    # up or not, PID, start time, transport, registered sessions
+bash "$SKILL/bin/wrc" start     # starts one if none is up; no-op if there already is
+bash "$SKILL/bin/wrc" stop      # SIGTERM, waits for the process to actually exit
+bash "$SKILL/bin/wrc" restart   # stop → wait for the socket → start
+bash "$SKILL/bin/wrc" logs -f   # tail ~/.wechat-remote-control/logs/bridge-*.log
+```
+
+Put it on your PATH. Use a wrapper rather than a symlink, so a clone or copy that loses the
+executable bit still works:
+
+```bash
+mkdir -p ~/.local/bin
+printf '#!/bin/sh\nexec bash "%s/bin/wrc" "$@"\n' "$SKILL" > ~/.local/bin/wrc
+chmod +x ~/.local/bin/wrc
+wrc status
+```
+
+### Restart after an update
+
+```bash
+git -C "$SKILL" pull
+wrc restart
+wrc status            # new PID and a start time of just now = it took
+```
+
+`dist/` is committed and comes down with the pull, so `npm run build` is **normally not
+needed** — only if you edited `src/*.ts` yourself (`npm install && npm run build`).
+
+Restarting is safe and **does not require re-running `attach`**:
+
+- the daemon unlinks its socket synchronously on exit, and recovers in-flight turns from `sessions_state.json`
+- tmux sessions are rediscovered by the daemon's own 30s scan; `sessions.json` rebuilds itself
+- agent hooks live in `~/.claude/settings.json` / `~/.codex/hooks.json` as one-time config, untouched by a daemon restart
+
+> IM behaviour looking stale (new features missing, old bugs still there)? Suspect an
+> un-restarted daemon first: compare `wrc status`'s start time against
+> `git -C "$SKILL" log -1 --format=%cd`. Earlier than the commit → `wrc restart`.
+
+If the box in front of you predates `bin/wrc`, the equivalent raw commands are:
+
+```bash
+PID_FILE=$HOME/.wechat-remote-control/bridge.pid
+[ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null; sleep 1
+WCC_TRANSPORT=telegram NODE_USE_ENV_PROXY=1 \
+  nohup node "$SKILL/src/index.js" >> /tmp/wrc-bridge.log 2>&1 &
+sleep 3 && cat "$PID_FILE"      # trust the PID file, not what nohup handed back
+```
+
+Two traps: **kill before you start** — the socket singleton makes the new process exit
+immediately while the old one lives, yet `nohup` still prints a PID that looks like success;
+and **never `pkill -f .../src/index.js`** — agents wrap commands in `bash -c "..."`, so that
+pattern matches the wrapping shell itself. The PID file is the only safe handle.
+
+### Bootstrapping a headless box
+
+`bin/wrc` covers the daemon, login and hooks. Only `attach` must run inside the agent's own
+tmux pane (it locates that pane by walking the process ancestry), which a plain terminal
+cannot do — a deliberate split, not a gap.
+
+```bash
+git clone https://github.com/MatrixA/wechat-remote-control.git "$SKILL"
+wrc login --telegram              # or --wechat: the QR renders in the terminal, scannable over ssh
+wrc hooks install --agent both    # hooks + Claude status line, both agents in one go
+wrc start
+```
+
+Then start Claude Code or Codex in tmux as usual — the daemon's 30s scan finds and registers
+them. You only need `/wechat-remote-control attach` inside an agent if you want to pin which
+session is the default route — or just switch with `/ls` and `/fc` from the IM.
+
+---
+
 ## Four sub-commands / 四个子命令
 
 ### `login`
@@ -250,6 +336,7 @@ wechat-remote-control/
 ├── tsconfig.json
 ├── src/                  # TypeScript: bridge, tmux injection, ilink client, command router
 ├── dist/                 # Pre-built JS — SKILL.md references these paths directly
+├── bin/wrc               # Terminal ops entry: daemon lifecycle / login / hooks, no agent needed
 ├── detect.py             # /proc + ps cross-platform CC-in-tmux detector
 ├── hook.py               # agent hook entry — Claude: PreToolUse/Stop/Notification; Codex: PreToolUse/Stop/UserPromptSubmit
 ├── format_history.py     # Render history.jsonl into human-readable text
