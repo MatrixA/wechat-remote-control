@@ -113,6 +113,7 @@ export function newSessionState(key, name) {
         injectedMessageId: '',
         busy: false,
         slashCaptureBusy: false,
+        interruptRequestedAt: 0,
         statusMsgId: null,
         turnStartedAt: 0,
         turnToolCount: 0,

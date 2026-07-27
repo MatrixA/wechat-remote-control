@@ -196,6 +196,14 @@ export interface SessionState {
 
   busy: boolean;
   slashCaptureBusy: boolean;
+  /**
+   * When an IM-side interrupt (⏹ / #esc) was sent for the in-flight turn, else
+   * 0. Freezes the status message into its "已请求中断" form and gates a repeat
+   * Escape from the button (a second Esc on an already-idle pane opens CC's
+   * rewind dialog). Not persisted: a daemon restart re-arms turn recovery via
+   * reconcileRestoredTurn anyway.
+   */
+  interruptRequestedAt: number;
 
   // Live turn-status message (edit-capable transports) / heartbeat (others).
   statusMsgId: string | null;
@@ -245,6 +253,7 @@ export function newSessionState(key: string, name: string): SessionState {
     injectedMessageId: '',
     busy: false,
     slashCaptureBusy: false,
+    interruptRequestedAt: 0,
     statusMsgId: null,
     turnStartedAt: 0,
     turnToolCount: 0,

@@ -197,6 +197,9 @@ function fmtDur(ms) {
 }
 
 function statusBody(sess) {
+  if (sess.interruptRequestedAt) {
+    return `⏹ 已请求中断 · ${fmtDur(Date.now() - sess.interruptRequestedAt)} · 等待回收（如未生效可发送 /esc）`;
+  }
   const elapsed = fmtDur(Date.now() - sess.turnStartedAt);
   return sess.turnToolCount > 0
     ? `⏳ ${elapsed} · 已调用 ${sess.turnToolCount} 个工具${sess.turnLastTool ? ` · 最近 ${sess.turnLastTool}` : ''}`
@@ -212,16 +215,21 @@ function editStatus(sess) {
   if (!transport || !target || !sess.lastInjectedText) return;
   if (sess.pendingQuiz || sess.pendingSelect) return;  // user is being asked something — don't nag
   if (!sess.statusMsgId) return;
-  transport.editText(target, sess.statusMsgId, statusBody(sess), statusButtons(sess)).catch(() => {});
+  // Once an interrupt was requested the ⏹ button comes off (undefined buttons →
+  // keyboard removed). The interruptRequestedAt gate in the intr: handler is the
+  // real double-Esc protection — this edit can fail silently.
+  const buttons = sess.interruptRequestedAt ? undefined : statusButtons(sess);
+  transport.editText(target, sess.statusMsgId, statusBody(sess), buttons).catch(() => {});
 }
 
 function startTurnStatus(sess) {
   stopTurnStatus(sess);
-  sess.turnStartedAt     = Date.now();
-  sess.turnToolCount     = 0;
-  sess.turnLastTool      = '';
-  sess.statusMsgId       = null;
-  sess.heartbeatSentOnce = false;
+  sess.turnStartedAt        = Date.now();
+  sess.turnToolCount        = 0;
+  sess.turnLastTool         = '';
+  sess.statusMsgId          = null;
+  sess.heartbeatSentOnce    = false;
+  sess.interruptRequestedAt = 0;
   if (transport?.caps.editMessages && transport.caps.inlineKeyboards) {
     transport.sendButtons(sess.injectedTarget || lastTarget, statusBody(sess), statusButtons(sess))
       .then(s => { sess.statusMsgId = s?.messageId ?? null; })
@@ -264,6 +272,9 @@ function finishTurnStatus(sess, summary) {
     transport.editText(target, sess.statusMsgId, summary).catch(() => {});
   }
   sess.statusMsgId = null;
+  // Single clearing point for the interrupt-requested freeze: every turn ending
+  // (pushResponse / abandonTurn / stopTurnStatus / destroyState) funnels here.
+  sess.interruptRequestedAt = 0;
 }
 
 function stopTurnStatus(sess) {
@@ -406,6 +417,19 @@ function sendKeys(target, text, bufKey = '') {
  */
 function sendTmuxKey(target, key) {
   execFileSync('tmux', ['send-keys', '-t', target, key]);
+}
+
+/**
+ * Is the agent in this pane visibly mid-turn? Both TUIs render "esc to
+ * interrupt" in their status row ONLY while a turn is running (Claude:
+ * "(esc to interrupt · …)", Codex: "Esc to interrupt"). Visible viewport only
+ * (scrollback = 0) so a historical frame can never read as "still working".
+ * Conservative failure mode: if a future TUI drops the string this returns
+ * false, which at worst abandons a turn early — never wedges one.
+ */
+function paneShowsWorking(target) {
+  if (!target || !paneExists(target)) return false;
+  return stripAnsi(capturePaneContent(target, 0)).toLowerCase().includes('esc to interrupt');
 }
 
 /**
@@ -2091,13 +2115,16 @@ async function handleBridgeCommand(text, replyTarget, ctxSess, viaTopic = false)
   }
 
   // #esc — interrupt the context session's current turn (tmux Escape).
+  // Deliberately NO stale-turn or repeat gate here (unlike the intr: button):
+  // /esc is the explicit, repeatable escape hatch for whatever is running.
   if (cmd === '#esc' || cmd === '#stop') {
     if (!ctxSess) { await send('当前没有会话'); return; }
     const target = tmuxTargetFor(ctxSess);
     if (!target || !paneExists(target)) { await send('❌ tmux 不可用'); return; }
     try {
       sendTmuxKey(target, 'Escape');
-      await send(`⏹ 已向 ${ctxSess.name} 发送中断`);
+      await send(`⏹ 已向 ${ctxSess.name} 发送中断${ctxSess.lastInjectedText ? '，正在等待回收当前回合…' : ''}`);
+      onInterruptRequested(ctxSess);
     } catch (err) {
       await send(`❌ 中断失败: ${err.message}`);
     }
@@ -2331,12 +2358,21 @@ async function handleCallback(inbound) {
   // ── intr:<sid> — interrupt button on the live status message ──
   if (verb === 'intr') {
     if (!sess) { ack('该会话已不存在'); return; }
+    // Stale tap: the turn this button belonged to is over. Escape on an idle CC
+    // pane is hazardous (a second Esc opens the rewind dialog) and interrupting
+    // an unrelated terminal turn from a leftover button would be surprising —
+    // /esc is the explicit command for that.
+    if (!sess.lastInjectedText) { ack('该回合已结束'); return; }
+    // One Escape per turn via the button (this gate, not the button-removal
+    // edit, is the real double-Esc protection — edits can fail silently).
+    if (sess.interruptRequestedAt) { ack('已请求中断，正在等待回收（可发送 /esc 再次中断）'); return; }
     const tmux = tmuxTargetFor(sess);
     if (!tmux || !paneExists(tmux)) { ack('tmux 不可用'); return; }
     try {
       sendTmuxKey(tmux, 'Escape');
       ack(`已向 ${sess.name} 发送中断`);
       logger.info('Interrupt sent via status button', { session: sess.name });
+      onInterruptRequested(sess);
     } catch (err) {
       ack('中断失败');
       logger.error('Interrupt failed', { error: err.message });
@@ -2704,6 +2740,12 @@ function pushResponse(sess, responseText, opts = {}) {
   sess.lastInjectedTranscript = null;
   sess.injectedTarget         = '';
   sess.injectedMessageId      = '';
+  // Deliberately NOT clearing sess.busy here: orphan polls / deferred retries /
+  // restart reconciliation can reach this long after our turn ended, while a
+  // NEW terminal-initiated turn legitimately holds busy — clearing would let
+  // the inbound gate inject mid-turn. busy ownership: set by PreToolUse /
+  // UserPromptSubmit; cleared by Stop, abandonTurn, the pane-routed idle
+  // Notification, and the interrupt busy-clear poll.
   persistStates();
   appendHistory({ type: 'assistant', session: sess.name, text: responseText.slice(0, 500) });
   // target is always set in the normal flow (every queued message carries one),
@@ -2762,6 +2804,14 @@ function abandonTurn(sess, reason) {
   sess.lastInjectedTranscript = null;
   sess.injectedTarget         = '';
   sess.injectedMessageId      = '';
+  // Abandoning = we have declared the agent idle (deadline + pane-idle / idle
+  // notification). A busy flag outliving the turn it belongs to recreates the
+  // wedge: the inbound busy-gate would queue every later message with nothing
+  // left to drain it (an interrupted turn fires no Stop to clear busy).
+  // Accepted tradeoff: if the extension cap expired while a turn genuinely
+  // still runs, the next message lands in the agent's composer — a degradation,
+  // versus today's permanent wedge.
+  sess.busy = false;
   persistStates();
   scheduleInject(sess);
 }
@@ -2871,7 +2921,8 @@ function transcriptHasInjectedUser(tpath, injectedText) {
  */
 const ORPHAN_MAX_EXTENSIONS = 10; // cap: worst-case wedge ≈ 10×grace, not forever
 
-function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, pollMs = 5_000, stillInFlight = null) {
+function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, pollMs = 5_000, stillInFlight = null,
+                       abandonReason = '未在时限内捕获到回复，请回终端查看') {
   if (!savedInjectedText) return;
   if (sess.orphanPollText === savedInjectedText) return; // already polling this turn
   sess.orphanPollText = savedInjectedText;
@@ -2879,10 +2930,14 @@ function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, 
   let extensions = 0;
   const poll = () => {
     if (sess.lastInjectedText !== savedInjectedText) { sess.orphanPollText = null; return; } // resolved elsewhere
-    const text = probe();
-    if (text) {
+    // A probe may return a plain string, or { text, opts } when the forward
+    // needs pushResponse options (the interrupt probe passes dedupeInterim so
+    // partial text already delivered as interim isn't re-sent).
+    const hit = probe();
+    if (hit) {
+      const { text, opts } = typeof hit === 'string' ? { text: hit, opts: undefined } : hit;
       sess.orphanPollText = null;
-      pushResponse(sess, text);
+      pushResponse(sess, text, opts);
       logger.info('Pushed response via orphan poll', { session: sess.name, chars: text.length });
       scheduleInject(sess);
       return;
@@ -2902,7 +2957,7 @@ function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, 
       }
       logger.warn('Orphan poll grace expired, cleaning up', { session: sess.name, lastInjected: savedInjectedText.slice(0, 60) });
       sess.orphanPollText = null;
-      if (sess.lastInjectedText === savedInjectedText) abandonTurn(sess, '未在时限内捕获到回复，请回终端查看');
+      if (sess.lastInjectedText === savedInjectedText) abandonTurn(sess, abandonReason);
       return;
     }
     setTimeout(poll, pollMs);
@@ -2917,6 +2972,83 @@ function claudeProbe(readPath, injectedText) {
     const r = findResponseToInjected(parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES), injectedText);
     return (r?.text && r.complete) ? r.text : null;
   };
+}
+
+// Short: the deadline only matters when the interrupted turn produced NO text
+// at all (the probe accepts partial text as soon as the pane goes idle), and
+// stillInFlight extends it when the Escape didn't actually take.
+const INTERRUPT_GRACE_MS = 20_000;
+
+/**
+ * Recovery after an Escape was sent on this session's pane. Claude fires NO
+ * Stop hook on user interrupt (its idle-Notification net takes 60s+ and never
+ * clears `busy`); Codex may fire nothing at all. Without this, an interrupted
+ * IM turn wedges the session: lastInjectedText and/or busy stay set forever
+ * and the inbound busy-gate queues every later message with nothing to drain
+ * it. Recovery here depends only on the transcript + pane content — no hooks.
+ */
+function onInterruptRequested(sess) {
+  const tmux = tmuxTargetFor(sess);
+  if (sess.lastInjectedText) {
+    // The Esc lands on an open AskUserQuestion dialog first — the quiz is gone
+    // either way, and clearing it also unblocks editStatus's pendingQuiz skip.
+    if (sess.pendingQuiz) cancelQuiz(sess, '（已中断）');
+    sess.interruptRequestedAt = Date.now();
+    editStatus(sess);  // immediate re-render: interrupt body, ⏹ removed
+    const injected = sess.lastInjectedText;
+    const entry = readSessions().sessions[sess.name];
+    const kind = entry ? sessionKind(entry) : 'claude';
+    const readPath = sess.lastInjectedTranscript || entry?.transcriptPath || null;
+    const probe = () => {
+      if (!readPath) return null;
+      const r = kind === 'codex'
+        ? getAgent('codex').responseToInjected(getAgent('codex').parseRollout(readPath), injected)
+        : findResponseToInjected(parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES), injected);
+      if (r?.text && r.complete) return r.text;             // finished before the Esc landed
+      // An interrupted turn never reaches end_turn: once the pane is visibly
+      // idle, the partial text is all this turn will ever produce — deliver it
+      // (deduped against already-sent interim blocks) instead of waiting out
+      // the deadline and dropping it (parity with the Notification idle path).
+      if (r?.text && !paneShowsWorking(tmux)) return { text: r.text, opts: { dedupeInterim: true } };
+      return null;
+    };
+    // Supersede any longer-grace poll holding the dedup slot (e.g. the 5-min
+    // Path C poll or Codex's strict 120s terminal-ignore poll) — interrupt
+    // wants the short deadline. Overlap is harmless: every chain exit re-checks
+    // lastInjectedText, and abandonTurn runs at most once behind that guard.
+    sess.orphanPollText = null;
+    armOrphanPoll(sess, injected, probe, INTERRUPT_GRACE_MS, 5_000,
+      // Esc didn't take (turn still visibly running) → extend, don't kill a
+      // live turn. NOT `() => sess.busy`: busy is exactly the flag that sticks.
+      () => paneShowsWorking(tmux),
+      '已中断，未捕获到最终回复');
+    return;
+  }
+  // Terminal-initiated turn interrupted remotely (/esc): there is no IM turn to
+  // recover, but `busy` may now be stuck true — Codex fires no idle event ever,
+  // Claude's takes 60s — gating the inbound queue. Bounded pane check clears it.
+  if (sess.busy) armBusyClearAfterInterrupt(sess, tmux);
+}
+
+/**
+ * Clear a stuck busy flag once the pane visibly stops working. Bounded (≤6
+ * checks × 5s). Idempotent — a Stop/Notification landing first makes every
+ * tick a no-op, and a new IM turn (lastInjectedText set) aborts it.
+ */
+function armBusyClearAfterInterrupt(sess, tmux) {
+  let checks = 0;
+  const tick = () => {
+    if (!sess.busy || sess.lastInjectedText) return;   // resolved elsewhere
+    if (paneShowsWorking(tmux)) {
+      if (++checks < 6) { setTimeout(tick, 5_000); return; }
+      logger.info('Interrupt busy-clear: pane still working at give-up, leaving busy to hooks', { session: sess.name });
+      return;
+    }
+    sess.busy = false;
+    logger.info('Interrupt: pane idle, cleared stuck busy flag', { session: sess.name });
+    scheduleInject(sess);
+  };
+  setTimeout(tick, 5_000);
 }
 
 async function onStop(payload) {
@@ -3292,6 +3424,17 @@ async function onNotification(payload) {
       logger.info('Auto-confirmed compaction via Notification', { session: sess.name });
       return;
     }
+    // idle_prompt is the pane's own "I'm idle" statement. Pane-routed events are
+    // authoritative for THIS session: whatever turn was running (IM or terminal,
+    // interrupted or missed-Stop) is over — the busy interlock must not outlive
+    // it, or the inbound busy-gate queues messages forever. Fallback-routed
+    // events may belong to a same-cwd sibling whose idle says nothing about OUR
+    // pane; clearing busy on those could unblock injection into a genuinely
+    // mid-turn pane, so leave them alone.
+    if (route.via === 'pane' && sess.busy) {
+      logger.info('Notification: pane idle, clearing busy flag', { session: sess.name });
+      sess.busy = false;
+    }
     if (sess.lastInjectedText) {
       // Fallback-routed Notification from a DIFFERENT transcript than the one we
       // injected into says nothing about our in-flight turn — reaping here would
@@ -3348,6 +3491,9 @@ async function onNotification(payload) {
       abandonTurn(sess, '会话已空闲但未捕获到回复，请回终端查看');
     } else {
       logger.info('Notification (logged, not pushed): ' + msg);
+      // Drain messages queued behind a now-cleared busy interlock (a terminal-
+      // side interrupt fires no Stop; this idle event is the only signal left).
+      if (!sess.busy) scheduleInject(sess);
     }
     return;
   }
