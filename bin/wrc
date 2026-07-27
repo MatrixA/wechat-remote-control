@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# wrc — operate the WeChat Remote Control bridge from a plain terminal.
+#
+# Everything here is machine-global: it needs no agent session, no tmux pane, and no
+# Claude Code / Codex process to be running. That is the point — ssh into a headless
+# box and you can still start, restart, inspect and log the daemon.
+#
+# This file is the ONLY implementation of the daemon lifecycle, hook installation and
+# login. SKILL.md's runbook shells out to it; do not inline a nohup/kill there again.
+# What SKILL.md still owns is the part that genuinely needs agent context: attach
+# (locating the pane the agent itself lives in, via detect.py's process-ancestry walk)
+# and sync.
+#
+#   wrc start|stop|restart|status|logs
+#   wrc login [--telegram|--wechat]
+#   wrc hooks install|uninstall [--agent claude|codex|both]
+
+set -uo pipefail
+
+# Resolve our own install dir, following symlinks (macOS has no `readlink -f`). This
+# replaces the `find $HOME -maxdepth 7 ... | head -1` guess the runbook used to make,
+# which silently picked an arbitrary clone when more than one existed on the box.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case "$link" in
+        /*) self="$link" ;;
+        *)  self="$(dirname "$self")/$link" ;;
+    esac
+done
+SKILL_DIR=$(cd "$(dirname "$self")/.." && pwd)
+
+DATA_DIR="${WCC_DATA_DIR:-$HOME/.wechat-remote-control}"
+PID_FILE="$DATA_DIR/bridge.pid"
+# Same literal as HOOK_SOCKET in src/index.js — the daemon's singleton token.
+SOCK=/tmp/cc_wechat_hook.sock
+# logger.ts pins its directory to $HOME (it does not honour WCC_DATA_DIR), so follow it
+# rather than invent a second location the daemon would never write to.
+LOG_DIR="$HOME/.wechat-remote-control/logs"
+# Where the daemon's raw stdout/stderr goes. Deliberately NOT bridge-*.log: that pattern
+# is the daemon's own structured log, which we glob for elsewhere, and it is also what
+# logger.ts's rotation regex prunes — a bridge-stdout.log would sit in both and grow
+# forever while shadowing the real newest log.
+STDOUT_LOG="$LOG_DIR/wrc-stdout.log"
+
+STOP_TIMEOUT=50   # ×0.1s — how long to wait for a graceful exit before SIGKILL
+START_TIMEOUT=40  # ×0.2s — how long to wait for the daemon to claim the socket
+
+die() { echo "wrc: $*" >&2; exit 1; }
+
+# dist/ is committed, so a missing one means a broken/partial clone, not a missing build.
+require_dist() {
+    [ -f "$SKILL_DIR/src/index.js" ] || die "no src/index.js under $SKILL_DIR — broken install?"
+    [ -d "$SKILL_DIR/dist" ] || die "no dist/ under $SKILL_DIR — it is committed, so re-clone or run 'npm install && npm run build'"
+}
+
+# Echo the pid of the live daemon, or return 1. The pid file is the only safe handle:
+# `pgrep -f` on the bridge path matches the `bash -c` wrapper an agent runs commands
+# in, so it kills the caller instead of the daemon.
+live_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s' "$pid"
+}
+
+# Ask the daemon's own resolver rather than re-deriving the heuristic in shell, so the
+# CLI and the bridge can never disagree about which transport is in play.
+resolve_transport() {
+    if [ -n "${WCC_TRANSPORT:-}" ]; then printf '%s' "$WCC_TRANSPORT"; return; fi
+    WRC_SKILL_DIR="$SKILL_DIR" node --input-type=module -e '
+        const { resolveTransportName } = await import(process.env.WRC_SKILL_DIR + "/dist/transport/index.js");
+        process.stdout.write(resolveTransportName([]));
+    ' 2>/dev/null
+}
+
+# The transport a RUNNING daemon actually settled on.
+#
+# On Linux the daemon's own environment is exact, so read that. macOS is not a fallback
+# worth having — `ps -E` stopped exposing other processes' environments, so the probe
+# status.sh uses there silently yields nothing. The daemon logs its resolved transport
+# once per start, which is both cross-platform and closer to the truth anyway: it reports
+# what the daemon *chose*, not merely what it was asked for.
+running_transport() {
+    local pid=$1 found
+    if [ -r "/proc/$pid/environ" ]; then
+        found=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^WCC_TRANSPORT=//p' | head -1)
+    fi
+    if [ -z "${found:-}" ]; then
+        local latest
+        latest=$(ls -t "$LOG_DIR"/bridge-*.log 2>/dev/null | head -1)
+        [ -n "$latest" ] && found=$(sed -n 's/.*Bridge started.*"transport":"\([^"]*\)".*/\1/p' "$latest" | tail -1)
+    fi
+    printf '%s' "${found:-unknown}"
+}
+
+cmd_start() {
+    require_dist
+    local pid
+    if pid=$(live_pid); then
+        echo "already running  PID=$pid"
+        return 0
+    fi
+    rm -f "$PID_FILE"   # stale: names a dead process
+
+    local transport
+    transport=$(resolve_transport)
+    mkdir -p "$LOG_DIR" "$DATA_DIR"
+
+    WCC_TRANSPORT="$transport" NODE_USE_ENV_PROXY=1 \
+        nohup node "$SKILL_DIR/src/index.js" >> "$STDOUT_LOG" 2>&1 &
+
+    # Deliberately NOT $!. The daemon writes bridge.pid itself, inside the socket's
+    # onListen callback — so a live pid file is the only proof it won the singleton and
+    # is actually serving. A redundant launch self-exits, which is a success, not a
+    # failure, and $! would happily report that corpse's pid.
+    local i
+    for ((i = 0; i < START_TIMEOUT; i++)); do
+        sleep 0.2
+        if pid=$(live_pid); then
+            echo "started  PID=$pid  transport=${transport:-auto}  dir=$SKILL_DIR"
+            return 0
+        fi
+    done
+
+    echo "wrc: daemon did not come up within $((START_TIMEOUT / 5))s — last log lines:" >&2
+    tail -n 20 "$STDOUT_LOG" "$LOG_DIR/bridge-$(date +%F).log" 2>/dev/null >&2
+    return 1
+}
+
+cmd_stop() {
+    local pid
+    if ! pid=$(live_pid); then
+        rm -f "$PID_FILE"
+        echo "not running"
+        return 0
+    fi
+
+    kill -TERM "$pid" 2>/dev/null
+    # shutdown() unlinks the socket synchronously before exiting, so once the process
+    # is gone the socket is already released — waiting on the process is sufficient.
+    local i
+    for ((i = 0; i < STOP_TIMEOUT; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "wrc: PID=$pid ignored SIGTERM for $((STOP_TIMEOUT / 10))s, sending SIGKILL" >&2
+        kill -KILL "$pid" 2>/dev/null
+        sleep 0.2
+        rm -f "$SOCK"   # killed mid-flight: no chance to clean up after itself
+    fi
+
+    rm -f "$PID_FILE"
+    echo "stopped  PID=$pid"
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 0.3
+    cmd_start
+}
+
+cmd_status() {
+    local pid
+    if ! pid=$(live_pid); then
+        echo "bridge:    not running"
+        echo "dir:       $SKILL_DIR"
+        return 3
+    fi
+
+    echo "bridge:    running  PID=$pid"
+    # Start time vs. the commit date of your checkout is how you tell whether the
+    # daemon is still executing pre-`git pull` code — it does not restart on its own.
+    echo "started:   $(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
+    echo "transport: $(running_transport "$pid")"
+    echo "socket:    $([ -S "$SOCK" ] && echo "$SOCK" || echo 'MISSING')"
+    echo "dir:       $SKILL_DIR"
+    echo "logs:      $LOG_DIR"
+
+    WRC_SESSIONS="$DATA_DIR/sessions.json" python3 - <<'PY' 2>/dev/null
+import json, os
+path = os.environ['WRC_SESSIONS']
+try:
+    reg = json.load(open(path))
+except Exception:
+    print('sessions:  (none registered yet)')
+    raise SystemExit
+sessions = reg.get('sessions') or {}
+if not sessions:
+    print('sessions:  (none registered yet)')
+    raise SystemExit
+active = reg.get('active')
+print('sessions:')
+for name, s in sessions.items():
+    mark = '*' if name == active else ' '
+    print(f"  {mark} {name}  {s.get('kind', 'claude')}  {s.get('tmux', '?')}  {s.get('cwd', '')}")
+PY
+}
+
+cmd_logs() {
+    local follow="" lines=50
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f) follow=1; shift ;;
+            -n) [ $# -ge 2 ] || die "logs: -n needs a line count"; lines="$2"; shift 2 ;;
+            *) die "logs: unknown argument '$1'" ;;
+        esac
+    done
+
+    local latest
+    latest=$(ls -t "$LOG_DIR"/bridge-*.log 2>/dev/null | head -1)
+    [ -n "$latest" ] || die "no logs yet under $LOG_DIR"
+    echo "== $latest" >&2
+    if [ -n "$follow" ]; then tail -n "$lines" -f "$latest"; else tail -n "$lines" "$latest"; fi
+}
+
+cmd_hooks() {
+    require_dist
+    local action="${1:-}"; shift || true
+    case "$action" in
+        install|uninstall) ;;
+        *) die "hooks: expected 'install' or 'uninstall'" ;;
+    esac
+    node "$SKILL_DIR/bin/hooks.mjs" "$action" --skill-dir "$SKILL_DIR" "$@"
+}
+
+usage() {
+    cat <<EOF
+wrc — operate the WeChat Remote Control bridge from a terminal (no agent needed)
+
+  wrc start                 start the daemon if it is not already up
+  wrc stop                  graceful SIGTERM, waits for the process to actually go
+  wrc restart               stop, wait for the socket, start — use this after git pull
+  wrc status                pid, start time, transport, socket, registered sessions
+  wrc logs [-n N] [-f]      tail the newest daemon log
+  wrc login [--telegram|--wechat]
+                            interactive login; no flag = infer from stored credentials
+  wrc hooks install [--agent claude|codex|both]
+  wrc hooks uninstall [--agent claude|codex|both]
+                            write/remove agent hooks (+ Claude's status line)
+
+Env: WCC_TRANSPORT=telegram|wechat forces the transport (otherwise auto-detected from
+     stored credentials). WCC_DATA_DIR relocates ~/.wechat-remote-control.
+     The daemon reads its env once at startup — change one and restart.
+
+Install dir: $SKILL_DIR
+EOF
+}
+
+case "${1:-}" in
+    start)   shift; cmd_start "$@" ;;
+    stop)    shift; cmd_stop "$@" ;;
+    restart) shift; cmd_restart "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    logs)    shift; cmd_logs "$@" ;;
+    hooks)   shift; cmd_hooks "$@" ;;
+    login)   shift; require_dist; NODE_USE_ENV_PROXY=1 node "$SKILL_DIR/bin/login.mjs" "$@" ;;
+    help|-h|--help) usage ;;
+    *)       usage >&2; exit 2 ;;
+esac

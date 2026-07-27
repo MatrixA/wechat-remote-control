@@ -1,10 +1,11 @@
 /**
- * Source-of-truth MIRROR of the SKILL.md "uninstall" hooks/statusLine remover.
+ * THE hooks/statusLine remover — the exact inverse of `mergeWrcHooks` in hookcmd.ts.
+ * `bin/hooks.mjs` (driven by `bin/wrc hooks uninstall`) is the only caller; SKILL.md's
+ * uninstall Step 1 shells out to it rather than re-implementing the strip inline. This
+ * module used to be a test-only mirror of a Python heredoc in SKILL.md — the two are
+ * now one, so these unit tests cover the real thing.
  *
- * `uninstall` reverses what attach Step 4/5 wrote. The canonical implementation
- * is the inline Python heredoc in SKILL.md; this module reproduces the two
- * load-bearing invariants so they can be unit-tested. Keep the two byte-identical
- * in behaviour (same filter, same emptiness pruning, same statusLine guard).
+ * Two load-bearing invariants:
  *
  *   1. MERGE-SAFE strip — only wrc's own entries are removed. Any hook entry whose
  *      command contains HOOK_MARK ('wechat-remote-control/hook.py') is dropped;
@@ -18,13 +19,16 @@
  * no-op, and they tolerate missing keys / empty objects.
  */
 import { join } from 'node:path';
-import { HOOK_MARK } from './hookcmd.js';
+import { isWrcHookCommand } from './hookcmd.js';
 
 /**
  * Return a copy of `cfg` with every wrc hook entry removed and all resulting empty
  * containers pruned. Other hooks and settings are preserved. Idempotent.
+ *
+ * Pass `skillDir` so entries installed from a directory not named `wechat-remote-control`
+ * are recognised too — without it they survive an uninstall that reports success.
  */
-export function stripWrcHooks(cfg: any): any {
+export function stripWrcHooks(cfg: any, skillDir?: string): any {
   if (!cfg || typeof cfg !== 'object') return cfg;
   const hooks = cfg.hooks;
   if (!hooks || typeof hooks !== 'object') return cfg;
@@ -34,7 +38,7 @@ export function stripWrcHooks(cfg: any): any {
     const kept = [];
     for (const g of groups) {
       const inner = Array.isArray(g?.hooks) ? g.hooks : [];
-      const filtered = inner.filter((h: any) => !String(h?.command ?? '').includes(HOOK_MARK));
+      const filtered = inner.filter((h: any) => !isWrcHookCommand(h?.command, skillDir));
       // Drop groups left empty after filtering (mirrors attach's own group pruning).
       if (filtered.length > 0) kept.push({ ...g, hooks: filtered });
     }
