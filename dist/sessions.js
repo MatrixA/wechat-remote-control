@@ -111,6 +111,8 @@ export function newSessionState(key, name) {
         lastInjectedTranscript: null,
         injectedTarget: '',
         injectedMessageId: '',
+        injectedAt: 0,
+        injectFailCount: 0,
         busy: false,
         slashCaptureBusy: false,
         interruptRequestedAt: 0,
@@ -228,6 +230,7 @@ export function persistableState(s) {
         lastInjectedTranscript: s.lastInjectedTranscript,
         injectedTarget: s.injectedTarget,
         injectedMessageId: s.injectedMessageId,
+        injectedAt: s.injectedAt,
         interimSentUuids: s.interimSentUuids,
         interimLastText: s.interimLastText,
     };

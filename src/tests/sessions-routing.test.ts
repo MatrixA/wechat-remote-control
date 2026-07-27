@@ -100,7 +100,7 @@ test('inbound routing: topic target hits its session, others hit active', () => 
 test('persistableState round-trips the crash-recovery fields', () => {
   const st = state('alpha', {
     lastInjectedText: 'do it', lastInjectedTranscript: '/t/p-alpha/a.jsonl',
-    injectedTarget: '42', injectedMessageId: '10',
+    injectedTarget: '42', injectedMessageId: '10', injectedAt: 1_700_000_000_000,
   });
   assert.deepStrictEqual(persistableState(st), {
     name: 'alpha',
@@ -108,6 +108,7 @@ test('persistableState round-trips the crash-recovery fields', () => {
     lastInjectedTranscript: '/t/p-alpha/a.jsonl',
     injectedTarget: '42',
     injectedMessageId: '10',
+    injectedAt: 1_700_000_000_000,
     interimSentUuids: [],
     interimLastText: null,
   });

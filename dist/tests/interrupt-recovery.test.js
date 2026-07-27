@@ -65,7 +65,12 @@ test('statusBody switches to the interrupt-requested form and back', () => {
     sess.interruptRequestedAt = Date.now() - 2000;
     const body = statusBody(sess);
     assert.match(body, /已请求中断/);
-    assert.match(body, /\/esc/); // tells the user how to re-interrupt
+    assert.match(body, /等待回收/);
+    // Deliberately does NOT invite a repeat Esc any more: a second Escape on a
+    // pane that has already gone idle opens Codex's rewind overlay. /esc is still
+    // safe to send (requestEscape inspects the pane first), but nothing prompts
+    // the user toward a second press.
+    assert.doesNotMatch(body, /\/esc/);
     assert.doesNotMatch(body, /已调用/);
 });
 function makePoll() {

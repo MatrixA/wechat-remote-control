@@ -193,6 +193,18 @@ export interface SessionState {
   injectedTarget: string;
   /** IM message id of the in-flight turn's user message (for reactions). */
   injectedMessageId: string;
+  /**
+   * Date.now() when the in-flight turn was injected, else 0. Persisted, so a
+   * turn's true age survives a restart — that is what lets /ls flag a wedged
+   * session instead of silently rendering it as busy forever.
+   */
+  injectedAt: number;
+  /**
+   * Consecutive injections the pane refused to submit (text stayed in the
+   * composer). Bounds the retry backoff. Not persisted: a restart re-reads the
+   * pane anyway, and a stale count would eat a fresh session's retry budget.
+   */
+  injectFailCount: number;
 
   busy: boolean;
   slashCaptureBusy: boolean;
@@ -251,6 +263,8 @@ export function newSessionState(key: string, name: string): SessionState {
     lastInjectedTranscript: null,
     injectedTarget: '',
     injectedMessageId: '',
+    injectedAt: 0,
+    injectFailCount: 0,
     busy: false,
     slashCaptureBusy: false,
     interruptRequestedAt: 0,
@@ -403,6 +417,11 @@ export interface PersistedTurn {
   lastInjectedTranscript: string | null;
   injectedTarget: string;
   injectedMessageId: string;
+  /**
+   * Injection timestamp, so turn age survives a restart. Optional: state files
+   * written before this field existed simply have no age to report.
+   */
+  injectedAt?: number;
   /** Interim blocks already forwarded this turn — a restart must not resend them. */
   interimSentUuids: string[];
   /** Last interim text forwarded — the idle-cleanup dup guard must survive a restart too. */
@@ -416,6 +435,7 @@ export function persistableState(s: SessionState): PersistedTurn {
     lastInjectedTranscript: s.lastInjectedTranscript,
     injectedTarget: s.injectedTarget,
     injectedMessageId: s.injectedMessageId,
+    injectedAt: s.injectedAt,
     interimSentUuids: s.interimSentUuids,
     interimLastText: s.interimLastText,
   };
