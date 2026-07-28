@@ -3035,6 +3035,9 @@ function scheduleInject(sess, delayMs = INJECT_DELAY) {
       // best-effort: log and let the turn run.
       logger.error('Post-inject bookkeeping failed', { session: sess.name, error: err.message });
     }
+    // Outside the try: bookkeeping is best-effort, but the safety net is not.
+    // A turn whose Stop never arrives has no other way out.
+    armTurnWatchdog(sess, entry, item.text);
   }, delayMs);
 }
 
@@ -3342,7 +3345,9 @@ function onStopCodex(sess, payload, readPath) {
   // message exists and isn't ours, this Stop belongs to a terminal turn — leave
   // lastInjectedText set; our own turn's Stop will arrive later.
   if (latestUser !== null && latestUser !== injected) {
-    logger.debug('Codex Stop for terminal-initiated turn, ignoring', { latestUser: latestUser.slice(0, 60) });
+    // info, not debug: this is gated behind an in-flight IM turn, so it is rare
+    // and it is one of the few visible clues that our own Stop went missing.
+    logger.info('Codex Stop for terminal-initiated turn, ignoring', { session: sess.name, latestUser: latestUser.slice(0, 60) });
     // The pane just went idle without our injected turn having run. Either Codex
     // queued our composer text and auto-submits it now (rollout's latest user
     // message becomes ours; the turn's own Stop — or this poll finding a COMPLETE
@@ -3356,6 +3361,12 @@ function onStopCodex(sess, payload, readPath) {
     // would clear the turn state and orphan the real final answer. Deduping vs
     // the post-Stop poll below is lossless: that one is only armed after the
     // payload fallback came up empty.
+    // Supersede the inject-time watchdog holding the dedup slot. Both probes are
+    // complete-only, so the two are near-equivalent — but this one knows the pane
+    // just went idle WITHOUT our turn having run, which is what justifies its much
+    // shorter deadline. Without the clear, armOrphanPoll would no-op here and the
+    // wedge would only resolve on the watchdog's far longer schedule.
+    sess.orphanPollText = null;
     armOrphanPoll(
       sess, injected,
       () => {
@@ -3423,11 +3434,18 @@ function transcriptHasInjectedUser(tpath, injectedText) {
  * Optional `stillInFlight` is consulted only at the deadline: while it returns
  * true the deadline extends by another graceMs, so a genuinely running turn is
  * not abandoned mid-flight.
+ *
+ * `opts.maxExtensions` raises the extension cap. The default is deliberately
+ * tight because the usual predicates (`busy`, latestUserMessage) STICK after a
+ * turn ends, so an uncapped extension would recreate the wedge this exists to
+ * prevent. A caller whose predicate self-clears — anything reading the live
+ * pane — can safely ask for a bigger budget.
  */
 const ORPHAN_MAX_EXTENSIONS = 10; // cap: worst-case wedge ≈ 10×grace, not forever
 
 function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, pollMs = 5_000, stillInFlight = null,
-                       abandonReason = '未在时限内捕获到回复，请回终端查看') {
+                       abandonReason = '未在时限内捕获到回复，请回终端查看',
+                       { maxExtensions = ORPHAN_MAX_EXTENSIONS } = {}) {
   if (!savedInjectedText) return;
   if (sess.orphanPollText === savedInjectedText) return; // already polling this turn
   sess.orphanPollText = savedInjectedText;
@@ -3453,7 +3471,7 @@ function armOrphanPoll(sess, savedInjectedText, probe, graceMs = 5 * 60 * 1000, 
       // latestUserMessage stays == injected forever after the turn ends, and
       // busy can stick true on a missed Stop, so an uncapped extension would
       // recreate the permanent wedge this poll exists to prevent.
-      if (stillInFlight && extensions < ORPHAN_MAX_EXTENSIONS && stillInFlight()) {
+      if (stillInFlight && extensions < maxExtensions && stillInFlight()) {
         extensions++;
         deadline = Date.now() + graceMs;
         logger.info('Orphan poll extended, turn still in flight', { session: sess.name, extensions });
@@ -3477,6 +3495,108 @@ function claudeProbe(readPath, injectedText) {
     const r = findResponseToInjected(parseTranscript(readPath, TRANSCRIPT_TAIL_BYTES), injectedText);
     return (r?.text && r.complete) ? r.text : null;
   };
+}
+
+/**
+ * Hook-free completion probe for either agent: the response to `injected`, but
+ * only once the agent itself marked it final.
+ *
+ * Two deliberate differences from the interrupt probe (onInterruptRequested):
+ *
+ *  1. It NEVER accepts partial text. An interrupted turn never reaches a final
+ *     marker, so there the partial text is all it will ever produce; here the
+ *     turn is expected to finish normally. Codex drops "esc to interrupt" while
+ *     a tool-approval prompt is up, so a pane can read idle mid-turn — taking
+ *     partial text on that signal would forward half an answer as the final one.
+ *  2. It cheap-gates on the pane before touching the transcript. parseRollout
+ *     reads the WHOLE rollout (no tail bound, unlike parseTranscript), and this
+ *     probe runs on every turn, so parsing a multi-MB rollout every tick of a
+ *     long turn would be a real cost. A working pane means "not done yet"; skip.
+ */
+function completionProbe(kind, readPath, injected, tmux) {
+  return () => {
+    if (!readPath) return null;
+    if (paneShowsWorking(tmux)) return null;
+    if (kind === 'codex') {
+      const agent = getAgent('codex');
+      const r = agent.responseToInjected(agent.parseRollout(readPath), injected);
+      return (r?.text && r.complete) ? r.text : null;
+    }
+    return claudeProbe(readPath, injected)();
+  };
+}
+
+// ── Inject-time turn watchdog ────────────────────────────────────────
+//
+// Before this existed, NOTHING was armed when a message was injected: the only
+// exits from an in-flight turn were a Stop hook, a manual interrupt, or a daemon
+// restart. So any lost Stop hung the turn forever — the IM showed 👀 and then
+// silence, while the answer sat finished in the pane. Codex is the exposed case
+// (Claude at least has an idle Notification as a second net) and every way its
+// Stop can be lost is silent:
+//   - codex reads hooks.json ONCE at startup, so a hook installed or changed
+//     afterwards never reaches the running process;
+//   - the registered command is `[ -f hook.py ] && python3 hook.py stop
+//     2>/dev/null; exit 0`, which swallows a broken interpreter or a moved
+//     clone and still exits 0;
+//   - a reboot reassigns tmux pane ids while the registry still holds the old
+//     ones, so a stale entry can win the pane-id route and the Stop lands on a
+//     session with no in-flight turn.
+// The bridge already knew how to finish a turn without hooks — that is exactly
+// what the interrupt path does — it just never armed it unless the user asked.
+//
+// Grace is generous because the pane predicate below self-clears: the deadline
+// only bites once the pane is idle AND the answer never reads as final, which
+// is the pathological case worth surfacing.
+const WATCHDOG_GRACE_MS       = 10 * 60 * 1000;
+const WATCHDOG_MAX_EXTENSIONS = 100;  // ≈16h of continuous work, still bounded
+
+/**
+ * Tell the user ONCE per session that their hook layer is not delivering.
+ * Without this the watchdog silently papers over a broken install forever —
+ * replies keep arriving, so nobody ever fixes the cause.
+ */
+function warnHookSilentOnce(sess, target) {
+  if (sess.hookWarnSent) return;
+  sess.hookWarnSent = true;
+  if (!transport || !target) return;
+  transport.sendText(target,
+    `⚠️ 这条回复是兜底轮询捞回来的 —— 「${sess.name}」的 agent hook 没把回合结束事件发给桥接。\n`
+    + `功能仍可用（回复会慢几秒），但建议修一下：\n`
+    + `1. 终端跑 wrc hooks install --agent both\n`
+    + `2. Codex 只在启动时读 hooks.json —— 装完要重启它（/quit，再 codex resume --last 保上下文）`,
+  ).catch(() => {});
+}
+
+/**
+ * Arm the hook-free safety net for the turn just injected. Idempotent per turn
+ * (armOrphanPoll dedupes on orphanPollText), and every later arm — the Codex
+ * Stop paths and the interrupt path — clears that slot first, so a more
+ * specific poll always supersedes this one.
+ */
+function armTurnWatchdog(sess, entry, injected) {
+  if (sess.lastInjectedText !== injected) return;   // turn already resolved
+  const tmux = tmuxTargetFor(sess);
+  const kind = sessionKind(entry);
+  const readPath = sess.lastInjectedTranscript || entry?.transcriptPath || null;
+  const base = completionProbe(kind, readPath, injected, tmux);
+  const probe = () => {
+    const hit = base();
+    // Warn from the probe rather than from armOrphanPoll: a truthy probe always
+    // leads straight to the push, and injectedTarget is still set here (
+    // pushResponse clears it), so the notice has somewhere to go.
+    if (hit) {
+      logger.warn('Turn completed via watchdog, no Stop hook arrived', { session: sess.name, kind });
+      warnHookSilentOnce(sess, sess.injectedTarget || lastTarget);
+    }
+    return hit;
+  };
+  armOrphanPoll(sess, injected, probe, WATCHDOG_GRACE_MS, 5_000,
+    // Pane-based on purpose: unlike `busy` or latestUserMessage this flips back
+    // to false when the turn ends, which is what makes the big cap below safe.
+    () => paneShowsWorking(tmux),
+    '未捕获到回复（agent hook 可能没送达），请回终端查看',
+    { maxExtensions: WATCHDOG_MAX_EXTENSIONS });
 }
 
 // Short: the deadline only matters when the interrupted turn produced NO text
@@ -3574,8 +3694,18 @@ async function onStop(payload) {
   const sess = getStateFor(route.name, entry);
   backfillPaneId(reg, route.name, payload);
   const kind = sessionKind(entry);
-  const tpath = payload.transcript_path || entry.transcriptPath;
-  if (!tpath) { sess.busy = false; scheduleInject(sess); return; }
+  // `sess.lastInjectedTranscript` last: a Codex Stop payload carries
+  // last_assistant_message but NO transcript_path, so this line used to rest
+  // entirely on the registry entry — and a Stop routed to an entry the scanner
+  // had not (or could no longer) stamp was dropped here without a single log
+  // line, wedging the turn. The injection-time snapshot is the same path the
+  // interrupt path reads, which is why interrupting could still recover a turn
+  // that Stop had already thrown away.
+  const tpath = payload.transcript_path || entry.transcriptPath || sess.lastInjectedTranscript;
+  if (!tpath) {
+    logger.warn('Stop with no transcript path anywhere, ignoring', { session: sess.name, kind, via: route.via });
+    sess.busy = false; scheduleInject(sess); return;
+  }
 
   if (route.via === 'pane') {
     // Authoritative routing: the agent in this very pane reported its own
@@ -3619,7 +3749,10 @@ async function onStop(payload) {
         logger.info('Stop from same project, accepting transcript switch', { tpath: tpath.slice(-40), was: (sess.lastInjectedTranscript || entry.transcriptPath)?.slice(-40) });
         sess.lastInjectedTranscript = tpath;
       } else {
-        logger.debug('Stop transcript mismatch, ignoring', { session: sess.name, tpath: tpath.slice(-60), injected: sess.lastInjectedTranscript?.slice(-40), entry: entry.transcriptPath?.slice(-40) });
+        // warn, not debug: for codex both acceptance branches above are
+        // Claude-only, so this is a hard drop of a real reply — the kind of
+        // thing that must not need WRC_DEBUG to be visible after the fact.
+        logger.warn('Stop transcript mismatch, ignoring', { session: sess.name, kind, tpath: tpath.slice(-60), injected: sess.lastInjectedTranscript?.slice(-40), entry: entry.transcriptPath?.slice(-40) });
         // Do NOT clear busy here: a mismatched Stop must not unblock a
         // terminal-initiated turn genuinely in flight (where lastInjectedText is
         // null and busy is the only interlock). Only drain if nothing is busy.

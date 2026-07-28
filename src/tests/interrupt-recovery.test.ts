@@ -184,6 +184,23 @@ test('armOrphanPoll extends while stillInFlight, then caps and abandons', (t) =>
   assert.deepStrictEqual(calls.abandoned, ['已中断，未捕获到最终回复']);
 });
 
+// The inject-time watchdog polls on a pane predicate, which — unlike `busy` or
+// latestUserMessage — flips back to false when the turn ends. That is what makes
+// a far bigger extension budget safe there, so the cap has to be overridable.
+test('armOrphanPoll honours an opts.maxExtensions budget above the default', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { calls, sess, armOrphanPoll, ORPHAN_MAX_EXTENSIONS } = makePoll();
+  armOrphanPoll(sess, 'MSG', () => null, 10_000, 5_000, () => true, 'reason',
+    { maxExtensions: ORPHAN_MAX_EXTENSIONS + 5 });
+  const step = (upToMs: number) => { while (Date.now() < upToMs) t.mock.timers.tick(5_000); };
+  // Where the DEFAULT cap would have abandoned (t = 10s × (1+10) = 110s), the
+  // raised budget is still extending.
+  step(10_000 * (1 + ORPHAN_MAX_EXTENSIONS) + 10_000);
+  assert.deepStrictEqual(calls.abandoned, []);
+  step(10_000 * (1 + ORPHAN_MAX_EXTENSIONS + 5) + 10_000);
+  assert.deepStrictEqual(calls.abandoned, ['reason']);
+});
+
 test('armOrphanPoll stops extending as soon as stillInFlight turns false', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const { calls, sess, armOrphanPoll } = makePoll();
