@@ -1,8 +1,8 @@
 # wechat-remote-control
 
-> Chat with Claude Code from WeChat — a Claude Code Skill that bridges your personal WeChat to a local Claude Code session running in tmux.
->
-> 用微信遥控你电脑里跑着的 Claude Code —— 走开了也能继续指挥 / 收回执。
+> Drive Claude Code and Codex — running in tmux on your own machine — from Telegram or WeChat. Walk away from the desk; the work keeps moving.
+
+English · [中文](./README.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](https://nodejs.org/)
@@ -10,365 +10,183 @@
 
 ---
 
-## What it does / 它做什么
+## What it solves
 
-When you're away from your terminal but a Claude Code task is still running — long refactor, batch analysis, slow tool calls — you can register the current CC session as a "WeChat remote target" and continue interacting from your phone:
+An agent is mid-task in your terminal — long refactor, batch analysis, slow tool calls — and you want to leave, yet still redirect it, check progress, or add a follow-up.
 
-- 微信对话框里发什么，就被 `tmux send-keys` 注入到本地 CC 所在的 pane
-- CC 的回复（带 tool call 摘要、报错、文件 diff）通过 hook 转发回微信
-- 终端那边的本地输入 **不会** 被反向广播到微信，避免泄漏交互
+- Messages you send in the IM are injected into the agent's pane via `tmux send-keys`
+- The agent's replies (tool summaries, errors, diffs) are forwarded back through hooks
+- What you type **at the terminal** is never broadcast outward
+
+IM: **Telegram** (recommended, full feature set) or **WeChat**. Agents: **Claude Code** and **Codex CLI**, auto-detected at `attach`.
 
 ---
 
-## Architecture / 架构
+## Install
 
-```
-+---------+       +-------------------+       +---------------+       +-------------+
-| WeChat  | <---> |  ilink long-poll  | <---> | bridge daemon | <---> | tmux + CC   |
-| (phone) |       |  (cloud)          |       | (this repo)   |  PTY  | (your Mac)  |
-+---------+       +-------------------+       +-------------------+   +-------------+
-                                                       ^
-                                                       | Unix socket
-                                                       |
-                                                CC hooks (hook.py)
+```bash
+npx skills add MatrixA/wechat-remote-control      # recommended
 ```
 
-- **Bridge daemon** (`src/index.js` → `dist/...`): polls ilink WeChat API for messages and injects them into the user's tmux-hosted CC session via `tmux send-keys`.
-- **Hook server**: listens on Unix socket `/tmp/cc_wechat_hook.sock`. CC hooks (PreToolUse / Stop / Notification) send events here via `hook.py`.
-- **Response forwarding**: on Stop / Notification, reads the CC transcript JSONL, finds the response to the injected WeChat message, and forwards it to WeChat. Terminal-initiated responses are not forwarded.
-- **Real-time interim forwarding**: long prose emitted between tool calls within a turn (explanations, findings — ≥200 chars by default) is forwarded live at PreToolUse gaps instead of waiting for the turn to end; an end-of-turn flush backstops anything missed, with dedup and strict ordering. `WRC_FORWARD_INTERIM=0` disables, `WRC_INTERIM_MIN_LEN` tunes the threshold (read at daemon startup — restart the daemon to change).
-- **All state lives in one directory** — `~/.wechat-remote-control/`:
-  - `accounts/<accountId>.json` — WeChat credentials
-  - `state.json` / `sessions.json` — attach target & multi-session registry
-  - `ilink_session.json` — long-poll cursor
-  - `bridge.json` / `bridge.pid` / `cc_pid` — daemon metadata
-  - `logs/bridge-YYYY-MM-DD.log` — rotated logs (30-day retention)
-  - `history.jsonl` — injected messages and forwarded responses
+Manual clone — Claude reads `~/.claude/skills/`, Codex reads `~/.agents/skills/`:
+
+```bash
+git clone https://github.com/MatrixA/wechat-remote-control.git \
+  "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
+# update: git -C <that path> pull
+```
+
+Then, inside a tmux-hosted agent session:
+
+```
+/wechat-remote-control login --telegram   # first-time login (drop the flag for WeChat QR)
+/wechat-remote-control attach             # register this session as the remote target (the default with no arg)
+/wechat-remote-control sync               # print the conversation since last attach, for context
+/wechat-remote-control uninstall          # remove hooks / status line / daemon, keep credentials
+```
+
+Two notes:
+
+- Driving both Claude and Codex? Run attach **once under each agent** — only attach installs hooks.
+- **Codex reads `hooks.json` only at startup** — restart it after the first hook install (`codex resume --last` keeps the conversation).
+
+---
+
+## Telegram (recommended)
+
+Create a bot via **@BotFather**, paste the token into `login --telegram`, then send the bot `/start`. **The first chat to message the bot is locked as the only authorized one** — the token grants terminal control, so keep it secret.
+
+**Forum Topics mode.** Create a supergroup with Topics enabled, add the bot as an admin with *Manage Topics*, and send `/bind`. From then on **every tmux session gets its own topic**, isolated like a Slack channel: messages typed in a topic go to that session, and replies, status and quizzes stay there. Session renames propagate to the topic — and **renaming a topic in the Telegram UI syncs back** (the pane's tmux window is renamed and pinned, so rescans keep it). A closed session's topic is archived and reused if the session returns. The General topic and the private chat remain the lobby.
+
+**Focus mode (`/fc`).** Once you have many panes the topic list explodes. `/fc` lists your tmux sessions (one ≈ one project) with tap-to-focus buttons; focusing keeps topics only for that session's panes and **deletes every other topic** — Telegram has no true per-topic hide (closing merely greys one out while it still takes up space), so focus deletes, and **topic history goes with it**. Focus is **sticky**: there is no "show all", and with several sessions and none focused the default route's session is auto-focused. Switching, or re-focusing the same session after manually deleting its topic, recreates topics and **replays the last few rounds** as context. Focus only filters visibility — the default route is untouched and in-flight turns keep running (a busy session's topic is deleted only after its turn ends; output for an already-deleted topic falls back to General, tagged with the session name).
+
+**Native capabilities** (WeChat falls back to numbered text menus):
+
+| | |
+|---|---|
+| Command menu | `/ls` `/sw` `/fc` `/model` `/rename` `/rnt` `/esc` `/reset` `/bind` `/start` |
+| Live turn status | One message edited in place: elapsed time, tool count, current tool, plus a **⏹ interrupt button** |
+| Reactions | 👀 injected · 👍 answered · 💔 abandoned |
+| Inline keyboards | `/ls` `/sw` `/fc` `/model`; `AskUserQuestion` renders as option buttons (multi-select supported) |
+| Long replies | Medium ones collapse into an expandable quote; over 8k chars arrives as a Markdown file |
+| Also | Per-topic typing indicator, markdown-rendered output, automatic `retry_after` backoff |
+
+> If a session is stuck on "busy" and stops accepting messages, send `/reset` — it clears only the in-flight turn state; **queued messages are kept** and redelivered.
+
+Credentials live in `~/.wechat-remote-control/telegram/account.json` (locked chat id + bound group id); WeChat files are untouched. WeChat stays functional in degraded mode: single active session, numbered text menus.
 
 ---
 
 ## Fully concurrent multi-session
 
-The bridge auto-discovers **every** tmux pane running claude / codex. Each session owns
-an independent message queue, in-flight turn and live status — you can drive session B
-while session A is mid-task, and every reply lands back in the conversation that asked
-for it. Hook events route authoritatively by tmux pane id (`TMUX_PANE`), so same-cwd
-sessions never cross-talk. `/sw` only moves the private-chat *default route* pointer and
-never interrupts any session's in-flight work.
+The bridge auto-discovers **every** tmux pane running claude / codex. Each session owns an independent message queue, in-flight turn and live status — drive session B while A is mid-task, and every reply lands in the conversation that asked for it. Hook events route authoritatively by tmux pane id (`TMUX_PANE`), so same-cwd sessions never cross-talk. `/sw` only moves the private chat's **default route** pointer; it never interrupts in-flight work.
 
 ---
 
-## Telegram support (recommended)
+## Architecture
 
-The same machinery (tmux injection, hook forwarding, multi-session, auto-approve) also
-works over a **Telegram bot** — the IM layer is abstracted behind a `Transport` interface
-(`src/transport/`), with WeChat and Telegram each implemented as an adapter.
+```
+Telegram / WeChat  ⇄  cloud long-poll  ⇄  bridge daemon  ⇄ tmux send-keys ⇄  tmux pane (agent)
+                                                ↑
+                                  Unix socket /tmp/cc_wechat_hook.sock
+                                                ↑
+                                        agent hooks (hook.py)
+```
 
-- **Login**: `/wechat-remote-control login --telegram` — create a bot via **@BotFather**,
-  paste the token, then send the bot `/start`. The first chat to message the bot is
-  **locked** as the only authorized chat (the token grants terminal control — keep it secret).
-- **Forum Topics mode (best experience)**: create a supergroup with Topics enabled, add
-  the bot as an admin with *Manage Topics*, and send `/bind` in the group — **every tmux
-  session automatically gets its own forum topic**, isolated like a Slack channel:
-  messages typed in a topic go to that session; replies, status updates and quizzes stay
-  there. Renames propagate to the topic — and **renaming a topic directly in the Telegram
-  UI syncs back** (the pane's tmux window is renamed and pinned, so rescans keep it).
-  A closed session's topic is archived and reused if the session comes back. The General
-  topic and the private chat remain the "lobby" (the compact `/ls` tmux-session list with
-  tap-to-focus buttons; the `/sw` menu with busy states and topic deep links; global
-  commands; the default-route destination).
-- **Focus mode (`/fc`)** for when the topic list explodes: `/fc` lists your tmux sessions
-  (one tmux session ≈ one project) with tap-to-focus buttons. Focusing keeps topics only
-  for panes of that tmux session and **deletes every other topic** (Telegram has no true
-  per-topic hide — closing merely greys a topic out — so focus deletes; **topic history is
-  deleted with it**). Focus is **sticky** — `/fc` only switches which session is focused
-  (there is no "show all"); with several tmux sessions and none focused, the default
-  route's session is auto-focused. Refocusing — `/fc <other>`, or `/fc` the same session
-  after manually deleting a topic — recreates topics with a replay of the last few
-  conversation rounds. Focus only filters topic visibility: the default
-  route (`/sw`) and in-flight turns are untouched (a busy session's topic is deleted only
-  after its turn ends; output for an already-deleted topic falls back to General, tagged
-  with the session name).
-- **Transport selection** at attach: `WCC_TRANSPORT` env > `--telegram`/`--wechat` > whichever
-  credentials exist on disk.
-- **Native Telegram capabilities**:
-  - command menu (`/ls` `/sw` `/fc` `/model` `/rename` `/esc` `/bind` `/start`)
-  - **live turn status**: one message per turn, edited in place with elapsed time, tool
-    count and the current tool, plus a **⏹ interrupt button** (sends Escape to the pane)
-  - **reactions** on your message: 👀 injected, 👍 answered, 💔 abandoned
-  - inline keyboards for `/ls`, `/sw`, `/fc` & `/model`; quiz option buttons (multi-select supported)
-  - **long replies don't wallpaper the chat**: medium ones collapse into an expandable
-    quote; anything over 8k chars arrives as a Markdown **file**
-  - per-topic typing indicator, markdown-rendered output, automatic `retry_after`
-    backoff on rate limits
-- Credentials live in `~/.wechat-remote-control/telegram/account.json` (locked chat id +
-  bound group id); WeChat files are untouched. WeChat stays functional in degraded mode:
-  single active session + numbered text menus, exactly as before.
+- **Bridge daemon** (`src/index.js`): long-polls the IM and injects messages into the agent's pane
+- **Hook server**: listens on the Unix socket; the agent's PreToolUse / Stop / Notification (Claude) / UserPromptSubmit (Codex) events arrive via `hook.py`
+- **Response forwarding**: on Stop, reads the transcript, finds the reply to the message that came *from the IM*, and forwards it. Terminal-initiated turns are not broadcast.
+- **Live interim forwarding**: long prose between tool calls within a turn (≥200 chars by default) goes out at PreToolUse gaps instead of waiting for the turn to end, with an end-of-turn flush as backstop — deduped and strictly ordered. `WRC_FORWARD_INTERIM=0` disables it; `WRC_INTERIM_MIN_LEN` tunes the threshold.
+
+All state lives in `~/.wechat-remote-control/`: `accounts/` and `telegram/` (credentials), `state.json` / `sessions.json` / `sessions_state.json` (attach target / session registry / in-flight turns), `bridge.pid`, `history.jsonl`, and `logs/bridge-YYYY-MM-DD.log` (30-day retention).
 
 ---
 
-## Requirements / 依赖
+## Operations: `bin/wrc`
 
-- **macOS or Linux** with `tmux` installed
-- **Node.js ≥ 18** (ESM imports are used throughout the bridge)
-- **Python 3** (used by `detect.py` for `/proc` / `ps` ancestry walk and by `hook.py`)
-- **A working WeChat account** that can scan QR codes (the QR rotates every ~60 s; the skill auto-refreshes)
-- **Claude Code** running inside a tmux pane
-
-> ❌ Cloud / remote Claude Code sessions (those with `CLAUDE_CODE_REMOTE=true`) are not supported — the bridge needs local tmux + Unix sockets.
-
----
-
-## Behind a proxy / 代理环境
-
-If your terminal can only reach the internet through a local proxy, export the proxy in
-the **same shell** you launch the skill from:
-
-```bash
-export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy
-export HTTP_PROXY=http://127.0.0.1:7890
-# export NO_PROXY=localhost,127.0.0.1       # optional: bypass intranet hosts
-```
-
-The login process and the bridge daemon launch with `NODE_USE_ENV_PROXY=1` by default, so
-Node's built-in `fetch` automatically routes through those variables — no code changes
-needed. Notes:
-
-- `fetch` support for this flag requires **Node ≥ 24** (or **≥ 22.21**); older Node silently ignores it, so the proxy won't take effect — upgrade Node first.
-- With no proxy vars set the flag is a harmless no-op; direct-connection users are unaffected.
-- The proxy must allow the WeChat hosts `ilinkai.weixin.qq.com` and `novac2c.cdn.weixin.qq.com`.
-
----
-
-## Install as a Claude Code Skill / 作为 Claude Code Skill 安装
-
-### Option A — `npx skills` (recommended / 推荐)
-
-[`npx skills`](https://github.com/vercel-labs/skills) is a community package manager for agent skills that uses GitHub as its registry. One command installs this skill into `~/.claude/skills/`:
-
-```bash
-npx skills add MatrixA/wechat-remote-control
-```
-
-To target a specific agent, pass `-a`:
-
-```bash
-npx skills add MatrixA/wechat-remote-control -a claude-code
-```
-
-You can list / update / remove later with `npx skills list`, `npx skills update`, `npx skills remove`.
-
-### Option B — manual clone
-
-```bash
-# install
-git clone https://github.com/MatrixA/wechat-remote-control.git "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-
-# update
-git -C "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control" pull
-```
-
-### Option C — Codex CLI
-
-Codex loads skills from `~/.agents/skills/` (not `~/.claude/skills/`), so install there:
-
-```bash
-# install
-git clone https://github.com/MatrixA/wechat-remote-control.git ~/.agents/skills/wechat-remote-control
-
-# update
-git -C ~/.agents/skills/wechat-remote-control pull
-```
-
-`attach` auto-detects the running agent: for Codex it writes hooks into
-`~/.codex/hooks.json` (events `PreToolUse` / `Stop` / `UserPromptSubmit`); for Claude it
-writes `~/.claude/settings.json` (`PreToolUse` / `Stop` / `Notification`). The registered
-hook command is guarded — if `hook.py` is missing it silently no-ops and never blocks a
-prompt.
-
-Two notes:
-
-- If you drive both Claude and Codex, run attach **once under each agent** (only attach installs hooks).
-- Codex reads `hooks.json` only at startup: restart it after the first hook install
-  (`codex resume --last` keeps the conversation context).
-
-### Then use it
-
-Inside a tmux-hosted Claude Code session:
-
-```
-/wechat-remote-control login      # one-time WeChat QR login
-/wechat-remote-control attach     # register this CC session as the WeChat remote target
-/wechat-remote-control sync       # show WeChat history since last attach (for context)
-/wechat-remote-control uninstall  # remove all traces (hooks / status line / daemon), keep credentials
-```
-
-If you just type `/wechat-remote-control` with no arg, it defaults to **attach**.
-
-> The skill itself is driven by `SKILL.md`. Read that file for the full operational runbook (environment checks, QR rotation handling, error recovery).
-
----
-
-## Updating & running from a terminal / 更新与从终端运行
-
-The bridge daemon is a long-lived singleton and **does not restart when you `git pull`** —
-pull new code and the old process keeps running the old code. `WCC_TRANSPORT` /
-`WRC_AUTO_APPROVE` / `WRC_FORWARD_INTERIM` / `WRC_INTERIM_MIN_LEN` are likewise read once at
-startup; changing one needs a restart.
-
-The skill ships `bin/wrc`, an ops script that needs no agent at all — run it from any plain
-terminal, no Claude Code / Codex session required:
+The daemon is a long-lived singleton and **does not restart on `git pull`**. `WCC_TRANSPORT` / `WRC_AUTO_APPROVE` / `WRC_FORWARD_INTERIM` / `WRC_INTERIM_MIN_LEN` are read once at startup, so changing one needs a restart. `bin/wrc` needs no agent — run it from any plain terminal:
 
 ```bash
 SKILL="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
 # Codex users: SKILL=~/.agents/skills/wechat-remote-control
 
-bash "$SKILL/bin/wrc" status    # up or not, PID, start time, transport, registered sessions
-bash "$SKILL/bin/wrc" start     # starts one if none is up; no-op if there already is
-bash "$SKILL/bin/wrc" stop      # SIGTERM, waits for the process to actually exit
-bash "$SKILL/bin/wrc" restart   # stop → wait for the socket → start
-bash "$SKILL/bin/wrc" logs -f   # tail ~/.wechat-remote-control/logs/bridge-*.log
+bash "$SKILL/bin/wrc" status                    # up or not, PID, start time, transport, registered sessions
+bash "$SKILL/bin/wrc" start | stop | restart
+bash "$SKILL/bin/wrc" logs -f                   # tail logs/bridge-*.log
+bash "$SKILL/bin/wrc" login --telegram          # QR / token both work over ssh
+bash "$SKILL/bin/wrc" hooks install --agent both
 ```
 
-Put it on your PATH. Use a wrapper rather than a symlink, so a clone or copy that loses the
-executable bit still works:
+Put it on your PATH — a wrapper rather than a symlink, so a clone that lost its executable bit still works:
 
 ```bash
 mkdir -p ~/.local/bin
 printf '#!/bin/sh\nexec bash "%s/bin/wrc" "$@"\n' "$SKILL" > ~/.local/bin/wrc
 chmod +x ~/.local/bin/wrc
-wrc status
 ```
 
-### Restart after an update
+**After an update**: `git -C "$SKILL" pull && wrc restart && wrc status`. `dist/` is committed and comes down with the pull, so `npm run build` is **normally not needed** — only if you edited `src/*.ts` yourself (`npm install && npm run build`).
 
-```bash
-git -C "$SKILL" pull
-wrc restart
-wrc status            # new PID and a start time of just now = it took
-```
+Restarting is safe and **does not require re-running `attach`**: the daemon unlinks its socket synchronously on exit, recovers in-flight turns from `sessions_state.json`, rediscovers tmux sessions on its 30s scan, and leaves the hooks (one-time config) alone.
 
-`dist/` is committed and comes down with the pull, so `npm run build` is **normally not
-needed** — only if you edited `src/*.ts` yourself (`npm install && npm run build`).
+> IM behaviour looking stale — new features missing, old bugs still there? Suspect an un-restarted daemon first: if `wrc status`'s start time predates `git -C "$SKILL" log -1 --format=%cd`, run `wrc restart`.
 
-Restarting is safe and **does not require re-running `attach`**:
+**Bootstrapping a headless box**: `wrc login` → `wrc hooks install --agent both` → `wrc start`, then start the agent in tmux as usual — the 30s scan finds and registers it. You only need `attach` inside an agent to pin which session is the default route (it locates the pane by walking process ancestry, which a plain terminal cannot do).
 
-- the daemon unlinks its socket synchronously on exit, and recovers in-flight turns from `sessions_state.json`
-- tmux sessions are rediscovered by the daemon's own 30s scan; `sessions.json` rebuilds itself
-- agent hooks live in `~/.claude/settings.json` / `~/.codex/hooks.json` as one-time config, untouched by a daemon restart
-
-> IM behaviour looking stale (new features missing, old bugs still there)? Suspect an
-> un-restarted daemon first: compare `wrc status`'s start time against
-> `git -C "$SKILL" log -1 --format=%cd`. Earlier than the commit → `wrc restart`.
-
-If the box in front of you predates `bin/wrc`, the equivalent raw commands are:
-
-```bash
-PID_FILE=$HOME/.wechat-remote-control/bridge.pid
-[ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null; sleep 1
-WCC_TRANSPORT=telegram NODE_USE_ENV_PROXY=1 \
-  nohup node "$SKILL/src/index.js" >> /tmp/wrc-bridge.log 2>&1 &
-sleep 3 && cat "$PID_FILE"      # trust the PID file, not what nohup handed back
-```
-
-Two traps: **kill before you start** — the socket singleton makes the new process exit
-immediately while the old one lives, yet `nohup` still prints a PID that looks like success;
-and **never `pkill -f .../src/index.js`** — agents wrap commands in `bash -c "..."`, so that
-pattern matches the wrapping shell itself. The PID file is the only safe handle.
-
-### Bootstrapping a headless box
-
-`bin/wrc` covers the daemon, login and hooks. Only `attach` must run inside the agent's own
-tmux pane (it locates that pane by walking the process ancestry), which a plain terminal
-cannot do — a deliberate split, not a gap.
-
-```bash
-git clone https://github.com/MatrixA/wechat-remote-control.git "$SKILL"
-wrc login --telegram              # or --wechat: the QR renders in the terminal, scannable over ssh
-wrc hooks install --agent both    # hooks + Claude status line, both agents in one go
-wrc start
-```
-
-Then start Claude Code or Codex in tmux as usual — the daemon's 30s scan finds and registers
-them. You only need `/wechat-remote-control attach` inside an agent if you want to pin which
-session is the default route — or just switch with `/ls` and `/fc` from the IM.
+> Starting the daemon by hand has two traps. **Kill before you start** — the socket singleton makes the new process exit immediately while the old one lives, yet `nohup` still prints a PID that looks like success. And **never `pkill -f .../src/index.js`** — agents wrap commands in `bash -c "..."`, so that pattern matches the wrapping shell itself. `bridge.pid` is the only safe handle.
 
 ---
 
-## Four sub-commands / 四个子命令
+## Sub-commands
 
-### `login`
+| | |
+|---|---|
+| `login` | Authenticate the IM. WeChat prints a QR (auto-refreshed about every 60s); Telegram takes a BotFather token. |
+| `attach` | Register this session as the remote target: `detect.py` walks the `/proc` (Linux) or `ps` (macOS) ancestry to the real agent process and verifies it lives in a tmux pane → writes the registry → starts the daemon in the background → sends a welcome message. Claude's status line then shows `💬 已连微信 (遥控中)` or `(#sw 可切入)`; under Telegram it reads "TG". |
+| `sync` | Render `history.jsonl` as a readable transcript so a fresh session can pick up the context. |
+| `uninstall` | Precisely removes wrc's hooks (matched by the `wechat-remote-control/hook.py` marker — other tools' hooks and unrelated settings survive), removes the status line (only if it still points at this skill), stops the daemon and deletes runtime state. **Keeps** credentials, `history.jsonl` and `logs/`. To drop credentials too: `rm -rf ~/.wechat-remote-control`. |
 
-Authenticate a WeChat account by scanning a QR code printed in the terminal. Run once before first use, or whenever the bridge reports session expiry. Credentials are saved to `~/.wechat-remote-control/accounts/<accountId>.json`. The QR auto-refreshes if you don't scan in time.
-
-### `attach`
-
-Registers the current Claude Code session as the WeChat remote target.
-
-1. `detect.py` walks the `/proc` parent chain (Linux) or `ps` ancestry (macOS) up from the bash subprocess, finds the actual `claude` process, and verifies it lives inside a `tmux list-panes -a` pane.
-2. Writes `state.json` / `bridge.json` / `sessions.json` so the daemon knows which pane to inject into.
-3. Starts the bridge daemon in the background (single-instance — re-attaching from another session moves the target).
-4. Sends a welcome message to the linked WeChat user so they know the channel is live.
-
-### `sync`
-
-Renders WeChat conversation history since last attach as a readable transcript, so a fresh CC session can pick up where the last one left off.
-
-### `uninstall`
-
-Reverses everything **attach** installed, so Claude Code / Codex return to their original behaviour:
-
-1. Precisely removes wrc's hooks from `~/.claude/settings.json` and `~/.codex/hooks.json` (matched by the `wechat-remote-control/hook.py` marker — other tools' hooks and unrelated settings are preserved).
-2. Removes the Claude status line (only when it still points at this skill's `status.sh`).
-3. Stops the bridge daemon and deletes the socket plus runtime state (`bridge.pid` / `cc_pid` / `bridge.json` / `state.json` / `sessions.json`).
-4. **Keeps** login credentials (`accounts/`, `telegram/`), `history.jsonl` and `logs/`, so a later `attach` needs no re-login.
-
-> When remote-control isn't running, the hooks attach registered already no-op (`hook.py` exits 0 immediately if the socket is absent), so normal usage is barely affected; `uninstall` removes them entirely so nothing fires at all. To delete credentials too, run `rm -rf ~/.wechat-remote-control` afterwards.
+> With remote control off, the hooks attach installed already no-op — `hook.py` exits 0 immediately when the socket is absent — so normal usage is barely affected.
 
 ---
 
-## Repository layout / 目录结构
+## Requirements
+
+macOS or Linux with `tmux`, **Node ≥ 18**, **Python 3** (`detect.py` for the ancestry walk, `hook.py` for hook events), and the agent running inside a tmux pane.
+
+> ❌ Cloud / remote Claude Code (`CLAUDE_CODE_REMOTE=true`) is not supported — the bridge needs local tmux + Unix sockets.
+
+**Behind a proxy**: export `HTTPS_PROXY` / `HTTP_PROXY` in the **same shell** you launch the skill from. The login process and the daemon both carry `NODE_USE_ENV_PROXY=1`, so Node's built-in `fetch` picks them up. Note that `fetch` support for that flag requires **Node ≥ 24 (or ≥ 22.21)** — older versions silently ignore it. For WeChat, the proxy must allow `ilinkai.weixin.qq.com` and `novac2c.cdn.weixin.qq.com`.
+
+---
+
+## Security
+
+- **Local-only state** — credentials and session data never leave `~/.wechat-remote-control/`; nothing is uploaded but IM API traffic
+- **Terminal isolation** — local input is never forwarded; only replies to messages that came from the IM go back
+- **Process safety** — Python `/proc` scanning instead of `pgrep -f`, which would match the `bash -c "..."` wrapper shell and could kill the wrong process
+- **Auto-approve scope** — when on, hooks approve tool calls inline. Convenient, but it means anyone with access to your IM can trigger actions on your machine. Treat this skill like SSH access.
+
+---
+
+## Repository layout
 
 ```
-wechat-remote-control/
-├── SKILL.md              # Claude Code skill entry — full runbook for login / attach / sync / uninstall
-├── package.json          # node deps + build scripts
-├── tsconfig.json
-├── src/                  # TypeScript: bridge, tmux injection, ilink client, command router
-├── dist/                 # Pre-built JS — SKILL.md references these paths directly
-├── bin/wrc               # Terminal ops entry: daemon lifecycle / login / hooks, no agent needed
-├── detect.py             # /proc + ps cross-platform CC-in-tmux detector
-├── hook.py               # agent hook entry — Claude: PreToolUse/Stop/Notification; Codex: PreToolUse/Stop/UserPromptSubmit
-├── format_history.py     # Render history.jsonl into human-readable text
-├── status.sh             # Quick status check (bridge / account / session)
-└── .gitignore
+SKILL.md            # skill entry: full runbook for login / attach / sync / uninstall
+src/  dist/         # TypeScript source / pre-built JS (dist is committed; SKILL.md references it)
+bin/wrc             # terminal ops entry: daemon lifecycle / login / hooks, no agent needed
+detect.py           # cross-platform /proc + ps agent-in-tmux detector
+hook.py             # agent hook entry — relays events to the bridge
+format_history.py   # history.jsonl → readable text
+status.sh           # one-shot bridge / account / session status
 ```
 
 ---
 
-## Security notes / 安全说明
-
-- **Local-only state.** All credentials and session data live in `~/.wechat-remote-control/` on your machine. Nothing is uploaded except WeChat API traffic.
-- **Terminal isolation.** Local terminal input is never forwarded to WeChat. Only responses to messages that originated from WeChat are sent back.
-- **Process safety.** The bridge uses Python `/proc` scanning instead of `pgrep -f` because Claude Code wraps commands in `bash -c "..."` — `pgrep -f` would match the wrapper shell and could kill the wrong process.
-- **Auto-approve scope.** When `state.json` has `autoApprove: true`, hook events approve tool calls inline. This is convenient but means anyone with access to your WeChat account can trigger actions in your local CC. Treat this skill like SSH access to your machine.
-
----
-
-## License / 许可证
+## License & contributing
 
 MIT — see [LICENSE](./LICENSE).
 
----
+Issues and PRs welcome. For bugs, please include `bash status.sh` output, the last 50 lines of `logs/bridge-*.log`, and your `tmux -V` / `node --version` / OS. For new features (image or voice forwarding, group chat support), open an issue first.
 
-## Contributing
-
-Issues and PRs welcome. If you hit a bug, please include:
-
-- Output of `bash status.sh`
-- Last 50 lines of `~/.wechat-remote-control/logs/bridge-*.log`
-- Your `tmux -V`, `node --version`, and OS
-
-如果你想加新功能（图片 / 语音转发、群聊支持等）欢迎先开 Issue 讨论。
-
-After changing `src/*.ts`, run `npm install && npm run build` and commit the regenerated `dist/` (CI verifies they match).
+After changing `src/*.ts`, run `npm install && npm run build` and commit the regenerated `dist/` — CI verifies the two match.
