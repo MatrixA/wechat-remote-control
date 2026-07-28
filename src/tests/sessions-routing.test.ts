@@ -39,6 +39,38 @@ test('hook routing: pane id match is authoritative', () => {
   assert.deepStrictEqual(r, { name: 'beta', via: 'pane' });
 });
 
+// A reboot restarts the tmux server, which reassigns %N from scratch while
+// sessions.json still holds the pre-reboot ids — so a stale entry can end up
+// claiming an id that now belongs to a different live pane. Insertion order puts
+// the stale entry first, so plain `find` routed the Stop there, it was ignored
+// for having no in-flight turn, and the session that owned the turn hung forever.
+function collidingReg(active: string): Registry {
+  return {
+    active,
+    sessions: {
+      stale: { tmux: 'old:9.0', paneId: '%2', cwd: '/home/u/gone', transcriptPath: '/t/p-gone/g.jsonl', kind: 'codex' },
+      beta:  { tmux: 'main:2.0', paneId: '%2', cwd: '/home/u/beta', transcriptPath: '/t/p-beta/b.jsonl', kind: 'codex' },
+    },
+  };
+}
+
+test('hook routing: pane-id collision prefers the entry holding an in-flight turn', () => {
+  const states = [state('stale'), state('beta', { lastInjectedText: 'from the IM' })];
+  const r = resolveSessionForHook(collidingReg('stale'), states, { _tmuxPane: '%2' });
+  assert.deepStrictEqual(r, { name: 'beta', via: 'pane' });
+});
+
+test('hook routing: pane-id collision falls back to the active entry when none is in flight', () => {
+  const r = resolveSessionForHook(collidingReg('beta'), [state('stale'), state('beta')], { _tmuxPane: '%2' });
+  assert.deepStrictEqual(r, { name: 'beta', via: 'pane' });
+});
+
+test('hook routing: an in-flight turn outranks the active pointer on collision', () => {
+  const states = [state('stale', { lastInjectedText: 'mine' }), state('beta')];
+  const r = resolveSessionForHook(collidingReg('beta'), states, { _tmuxPane: '%2' });
+  assert.deepStrictEqual(r, { name: 'stale', via: 'pane' });
+});
+
 test('hook routing: unmatched pane falls through to transcript match', () => {
   // A just-attached entry the scanner has not stamped yet.
   const r = resolveSessionForHook(reg(), [], { _tmuxPane: '%99', transcript_path: '/t/p-beta/b.jsonl' });

@@ -333,8 +333,20 @@ export function resolveSessionForHook(
   // 1. Pane id — reported by hook.py from the agent process's own env.
   const pane = (payload._tmuxPane || '').trim();
   if (pane) {
-    const hit = entries.find(([, s]) => s.paneId === pane);
-    if (hit) return { name: hit[0], via: 'pane' };
+    const byPane = entries.filter(([, s]) => s.paneId === pane);
+    if (byPane.length === 1) return { name: byPane[0][0], via: 'pane' };
+    if (byPane.length > 1) {
+      // Several entries claiming ONE live pane is the shape a reboot leaves
+      // behind: the tmux server reassigns %N from scratch while the registry
+      // still holds pre-reboot ids, and prune keeps a stale entry alive
+      // precisely because the id it holds now belongs to a real pane. Plain
+      // `find` returns insertion order — i.e. the stalest entry — so a Stop
+      // would land on a session with no in-flight turn, be ignored, and the
+      // entry that actually owns the turn would hang forever.
+      const inflight = byPane.find(([n]) => stateList.some((st) => st.name === n && st.lastInjectedText));
+      const active = byPane.find(([n]) => n === reg.active);
+      return { name: (inflight ?? active ?? byPane[0])[0], via: 'pane' };
+    }
     // No paneId match: either a foreign pane, or a just-attached entry the
     // scanner hasn't stamped yet — fall through to the transcript chain.
   }
