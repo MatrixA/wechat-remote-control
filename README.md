@@ -16,7 +16,7 @@
 
 - IM 里发的消息 → `tmux send-keys` 注入 agent 所在 pane
 - agent 的回复（工具摘要、报错、diff）→ 经 hook 转回 IM
-- 终端里手敲的内容**不会**反向外发
+- 终端里手敲的内容**不会**反向外发，只有「来自 IM 那条消息」的回执才回去
 
 IM 支持 **Telegram**（推荐，能力最全）和**微信**；agent 支持 **Claude Code** 与 **Codex CLI**，`attach` 时自动识别。
 
@@ -25,16 +25,29 @@ IM 支持 **Telegram**（推荐，能力最全）和**微信**；agent 支持 **
 ## 安装
 
 ```bash
-npx skills add MatrixA/wechat-remote-control      # 推荐
+npx skills@latest add MatrixA/wechat-remote-control -g -y
 ```
 
-手动 clone —— Claude 装 `~/.claude/skills/`，Codex 装 `~/.agents/skills/`：
+> `@latest` 别省：安装器 < 1.5.18 有个 bug（[#1603](https://github.com/vercel-labs/skills/issues/1603)）会把根目录放 `SKILL.md` 的 skill 误判成「单文件 skill」，**只装 `SKILL.md`**，`bin/` `dist/` `src/` 全丢 —— 症状是之后每条命令都报「找不到文件」。
+
+装完立刻自检，三个都在才算装全：
 
 ```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+ls -d "$WRC/bin/wrc" "$WRC/dist" "$WRC/src/index.js"
+```
+
+只有 `SKILL.md`、其余全是 `No such file`，就是命中了上面那个 bug —— 重跑一次带 `@latest` 的安装命令。**别去跑 `npm run build`**：文件根本没下来，编译救不了。
+
+也可以手动 clone —— Claude 读 `~/.claude/skills/`，Codex 读 `~/.agents/skills/`，装错目录 agent 根本看不到这个 skill：
+
+```bash
+# Codex 用户把目标换成 "$HOME/.agents/skills/wechat-remote-control"
 git clone https://github.com/MatrixA/wechat-remote-control.git \
   "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-# 更新：git -C <上面那个路径> pull
 ```
+
+手动 clone 的话，下面命令区每个块开头那行 `WRC=` 都换成你这个 clone 路径。
 
 然后在 tmux 里的 agent 会话中：
 
@@ -42,48 +55,158 @@ git clone https://github.com/MatrixA/wechat-remote-control.git \
 /wechat-remote-control login --telegram   # 首次登录（去掉 --telegram 则走微信扫码）
 /wechat-remote-control attach             # 注册当前会话为遥控目标（不带参数默认就是它）
 /wechat-remote-control sync               # 打印上次 attach 以来的对话，给新会话补上下文
-/wechat-remote-control uninstall          # 清除 hook / 状态栏 / daemon，保留登录凭据
 ```
 
 两个注意：
 
-- Claude 和 Codex 都用时，**每种 agent 各跑一次 attach**（hook 只由 attach 安装）
-- **Codex 只在启动时读 `hooks.json`** —— 首次装完 hook 要重启 Codex（`codex resume --last` 保上下文）
+- Claude 和 Codex 都用时，**每种 agent 各跑一次 `attach`** —— hook 只由 attach 安装。daemon 每 30s 扫一次 tmux，扫到的会话在 `status` 里看着一切正常、也收得到消息，但**没有 hook 就永远不会把回复发出来**，症状和网络故障一模一样。
+- **Codex 只在启动时读 `hooks.json`** —— 首次装完 hook 要重启 Codex：`/quit` 然后 `codex resume --last`（保上下文）。不重启的症状是 IM 那边一直「正在输入」、永远等不到回复，日志里也没有线索。
 
 ---
 
-## Telegram（推荐）
+## 命令
 
-在 **@BotFather** 建 bot、把 token 粘给 `login --telegram`，再给 bot 发 `/start`。**第一个跟 bot 说话的会话被锁定为唯一授权会话** —— token 等同终端控制权，请妥善保管。
+`bin/wrc` 不需要 agent，任何普通终端（含 ssh 进无头机器）都能跑；只有 `attach` 例外 —— 它靠走进程父链定位 pane，普通终端做不到。
 
-**话题模式**：建一个开启「话题」的超级群，把 bot 加为管理员（勾「管理话题」），群里发 `/bind`。之后**每个 tmux 会话自动获得专属话题**，像 Slack 频道一样隔离：在话题里发消息就发到对应会话，回复、状态、问卷都留在话题里。会话改名话题跟着改，**在 Telegram 里长按话题改名也会反向同步**（重命名并固定对应 tmux 窗口，扫描不会改回去）；会话关掉话题自动归档，同名会话回来自动复用。General 话题和私聊继续当「大厅」。
+**`wrc` 不会自动上 PATH。** 下面每个块都自带路径、互不依赖，复制进全新终端就能跑。开头那行 `WRC=` 是 `npx` 安装的规范位置（`~/.claude/skills/…` 只是指向它的符号链接）；手动 clone 到别处的，换成自己的 clone 路径即可。
 
-**聚焦（`/fc`）**：面板一多话题列表就爆炸。`/fc` 列出 tmux 会话（≈ 一个项目）点选聚焦，**只保留该会话下各面板的话题，其余直接删除** —— Telegram 没有真正的「隐藏话题」，关闭只会灰显仍占位，所以聚焦采用删除，**历史随话题一起没**。聚焦是**粘性**的，没有「全部显示」；多会话而未聚焦时自动聚焦默认路由所在的会话。切到别的会话、或手动删掉话题后重新 `/fc` 同一个，都会重建话题并**回放最近几轮**作上下文。聚焦只影响可见性：默认路由不动，进行中的回合照跑（忙碌会话的话题等回合结束才删，删后仍有输出会转投 General 并带【会话名】前缀）。
-
-**原生能力**（微信不支持的自动降级为文字菜单）：
-
-| | |
+| 操作 | 什么时候用 |
 |---|---|
-| 命令菜单 | `/ls` `/sw` `/fc` `/model` `/rename` `/rnt` `/esc` `/reset` `/bind` `/start` |
-| 实时回合状态 | 一条就地编辑的消息：耗时、已调用工具数、最近工具名，附 **⏹ 中断按钮** |
-| 消息回应 | 👀 已注入 · 👍 已回复 · 💔 已放弃 |
-| 内联键盘 | `/ls` `/sw` `/fc` `/model` 点选切换；`AskUserQuestion` 渲染成选项按钮（多选可勾选后「完成」） |
-| 长回复不刷屏 | 中长的折叠进「展开引用」，超 8000 字符直接发成 Markdown 文件 |
-| 其它 | 每话题独立打字状态、Markdown 渲染、限流按 `retry_after` 退避 |
+| [自检](#自检) | 装完、更新完，或任何命令报「找不到文件」时 |
+| [登录](#登录) | 首次使用，或换 bot / 换微信号 |
+| [attach](#attach) | 把某个 agent 会话设为默认路由目标 |
+| [状态](#状态) | 看 daemon 在不在跑、注册了哪些会话 |
+| [日志](#日志) | 消息没进去、回复没回来 |
+| [更新](#更新) | 拉新代码 —— **必须跟一次重启** |
+| [重启](#重启) | 改过环境变量，或 IM 行为看着「过时」 |
+| [卸载](#卸载) | 停掉遥控，保留登录凭据 |
+| [彻底清除](#彻底清除) | 连凭据一起删 |
 
-> 会话卡在「忙碌」不动、消息发不进去时，发 `/reset` —— 只清进行中回合的状态，**排队的消息不丢**，会重新投递。
+#### 自检
 
-凭据存 `~/.wechat-remote-control/telegram/account.json`（含锁定的 chat id 与绑定群 id），微信文件原样不动。微信侧保持可用但降级：单活跃会话 + 数字文字菜单。
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+ls -d "$WRC/bin/wrc" "$WRC/dist" "$WRC/src/index.js"
+```
+
+#### 登录
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+bash "$WRC/bin/wrc" login --telegram   # 去掉 --telegram 走微信扫码（二维码约 60s 自动换一张）
+```
+
+#### attach
+
+在 tmux 里的 agent 会话中输入（这一步必须在 agent 里做）：
+
+```
+/wechat-remote-control attach
+```
+
+无头机器上没有交互式 agent 可用，就先把三步跑完，再去 tmux 里正常起 agent —— 30s 内会被自动发现并注册：
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+bash "$WRC/bin/wrc" login --telegram
+bash "$WRC/bin/wrc" hooks install --agent both
+bash "$WRC/bin/wrc" start
+```
+
+中间那步 `hooks install` 不能跳 —— 跳了就会得到一个「注册成功但回复永不外发」的会话。
+
+#### 状态
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+bash "$WRC/bin/wrc" status
+```
+
+会打印启动时间、transport 和已注册会话（`*` 是默认路由那个）。daemon 没在跑时**退出码是 3**，别把它接在 `&&` 后面。
+
+#### 日志
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+bash "$WRC/bin/wrc" logs -f   # 默认 50 行；-n 200 看更多历史
+```
+
+#### 更新
+
+daemon 是常驻单例，**不随 `git pull` 自动重启**，所以更新永远是「拉代码 + 重启」两步。先看一眼你是哪种装法：
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+test -d "$WRC/.git" && echo "git clone 装的 → 用 A" || echo "npx 装的 → 用 B"
+```
+
+**A. `git clone` 装的**：`dist/` 是提交进仓库的，随 pull 一起下来，**不需要 `npm run build`**（只有你自己改过 `src/*.ts` 才要）。
+
+```bash
+WRC="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"   # 换成你的 clone 路径
+git -C "$WRC" pull
+bash "$WRC/bin/wrc" restart
+bash "$WRC/bin/wrc" status
+```
+
+**B. `npx skills add` 装的**：装出来的是文件拷贝而不是 git 仓库（`.git` 会被安装器排除），所以 `git pull` 会报 `not a git repository` —— 更新方式是重跑安装命令。**这里也必须 pin `@latest`**：`npx skills update <name>` 内部只是重跑一次 `add`，并不会升级安装器本身，版本低于 1.5.18 就仍然只会装下一个 `SKILL.md`。
+
+```bash
+npx skills@latest add MatrixA/wechat-remote-control -g -y
+WRC="$HOME/.agents/skills/wechat-remote-control"
+ls -d "$WRC/bin/wrc" "$WRC/dist" "$WRC/src/index.js"   # 复查装全了
+bash "$WRC/bin/wrc" restart
+bash "$WRC/bin/wrc" status
+```
+
+#### 重启
+
+`WCC_TRANSPORT` / `WRC_AUTO_APPROVE` / `WRC_FORWARD_INTERIM` / `WRC_INTERIM_MIN_LEN` 都只在 daemon 启动时读一次，改完必须重启才生效。
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+bash "$WRC/bin/wrc" restart
+bash "$WRC/bin/wrc" status
+```
+
+重启是安全的，**不需要重跑 `attach`**：进行中的回合会恢复，tmux 会话由 30s 扫描重新发现，hook 是写在配置文件里的一次性设置。
+
+#### 卸载
+
+```bash
+WRC="$HOME/.agents/skills/wechat-remote-control"
+bash "$WRC/bin/wrc" hooks uninstall --agent both
+bash "$WRC/bin/wrc" stop
+```
+
+只按 `wechat-remote-control/hook.py` 标记精确匹配移除自己的 hook，**别人的 hook 和其它设置原样保留**；状态栏仅在它仍指向本 skill 时才移除。凭据、`history.jsonl`、`logs/` 都**保留**，下次 attach 不用重新登录。在 agent 里跑 `/wechat-remote-control uninstall` 等效。
+
+#### 彻底清除
+
+这一步才会删掉登录凭据和绑定的群 —— 跑完下次得重新登录。
+
+```bash
+rm -rf ~/.wechat-remote-control
+```
 
 ---
 
-## 多会话完全并发
+## 在 IM 里能做什么
 
-桥接自动发现 tmux 里**所有**跑着 claude / codex 的面板，每个会话有独立的消息队列、独立的进行中回合、独立的状态提示 —— A 会话跑长任务时照样可以指挥 B，各自的回复回到各自的对话里。hook 事件按 `TMUX_PANE`（面板 id）权威路由，同目录多会话也不会串。`/sw` 只移动私聊消息的**默认路由**指针，不打断任何会话的进行中工作。
+在 **@BotFather** 建 bot、把 token 粘给 `login --telegram`，再给 bot 发 `/start`。**第一个跟 bot 说话的会话被锁定为唯一授权会话**（所以别人发的消息会被忽略，这不是 bug）；token 等同终端控制权，请妥善保管。
 
----
+**话题模式**：建一个开启「话题」的超级群，把 bot 加为**管理员并勾上「管理话题」权限**（少这个权限就建不出话题，多会话 UX 会静默退化成大厅），群里发 `/bind`。之后每个 tmux 面板自动获得专属话题，像 Slack 频道一样隔离：在话题里发消息就发到对应会话，回复、状态、问卷都留在话题里。会话改名话题跟着改，在 Telegram 里长按话题改名也会反向同步到 tmux 窗口名。General 话题和私聊继续当「大厅」。
 
-## 架构
+**聚焦（`/fc`）**：面板一多话题列表就爆炸。`/fc` 列出 tmux 会话点选聚焦，**只保留该会话下的话题，其余直接删除 —— 历史随话题一起没**（Telegram 没有真正的「隐藏话题」，关闭只会灰显仍占位）。聚焦是**粘性**的，没有「全部显示」；多会话而未聚焦时桥接会**自己**把默认路由所在的会话聚焦，所以你没敲过 `/fc` 也可能触发删除。切回某个会话会重建话题并回放最近几轮作上下文；聚焦只影响可见性，默认路由与进行中的回合都不受影响。
+
+**多会话完全并发**：桥接自动发现 tmux 里所有跑着 claude / codex 的面板，各自独立队列、独立回合、独立状态 —— A 会话跑长任务时照样指挥 B，回复各回各家。hook 事件按面板 id 权威路由，同目录多会话不会串。`/sw` 只移动私聊消息的**默认路由**指针，不打断任何进行中的工作。
+
+**命令菜单**：`/ls` `/sw` `/fc` `/model` `/rename` `/rnt` `/esc` `/reset` `/bind` `/start`
+
+Telegram 侧还有：就地编辑的实时回合状态（带 ⏹ 中断按钮）、消息回应（👀 已注入 · 👍 已回复 · 💔 已放弃）、内联键盘、`AskUserQuestion` 渲染成选项按钮、超长回复自动发成 Markdown 文件。微信侧保持可用但降级：单活跃会话 + 数字文字菜单。
+
+<details>
+<summary>工作原理</summary>
 
 ```
 Telegram / 微信  ⇄  云端 long-poll  ⇄  bridge daemon  ⇄ tmux send-keys ⇄  tmux pane (agent)
@@ -93,93 +216,38 @@ Telegram / 微信  ⇄  云端 long-poll  ⇄  bridge daemon  ⇄ tmux send-keys
                                     agent hooks (hook.py)
 ```
 
-- **bridge daemon**（`src/index.js`）：长轮询 IM，把消息注入 agent 所在面板
-- **hook 服务**：监听 Unix socket，agent 的 PreToolUse / Stop / Notification(Claude) / UserPromptSubmit(Codex) 事件经 `hook.py` 送来
-- **回执转发**：Stop 时读 transcript，找出「来自 IM 那条消息」对应的回复转回去；终端发起的回合不广播
-- **中间长回复实时转发**：一个回合里工具调用之间的长段落（默认 ≥200 字符）在 PreToolUse 间隙就转出去，回合结束兜底补漏，不重复不乱序。`WRC_FORWARD_INTERIM=0` 关闭，`WRC_INTERIM_MIN_LEN` 调阈值
+daemon 长轮询 IM 并把消息注入 agent 所在面板；agent 的 hook 事件经 `hook.py` 送到 Unix socket；回合结束时读 transcript，只把「来自 IM 那条消息」的回复转回去。一个回合里工具调用之间的长段落会在间隙就实时转出（`WRC_FORWARD_INTERIM=0` 关闭）。运行态全部在 `~/.wechat-remote-control/` —— 凭据、会话注册表、`history.jsonl` 和 `logs/` 都在这里，也是「彻底清除」的目标。
 
-运行态集中在 `~/.wechat-remote-control/`：`accounts/` `telegram/`（凭据）、`state.json` / `sessions.json` / `sessions_state.json`（attach 目标 / 会话注册表 / 进行中回合）、`bridge.pid`、`history.jsonl`、`logs/bridge-YYYY-MM-DD.log`（留 30 天）。
+</details>
 
 ---
 
-## 运维：`bin/wrc`
+## 排障
 
-daemon 是常驻单例，**不随 `git pull` 自动重启**；`WCC_TRANSPORT` / `WRC_AUTO_APPROVE` / `WRC_FORWARD_INTERIM` / `WRC_INTERIM_MIN_LEN` 也只在启动时读一次，改完必须重启。`bin/wrc` 不依赖 agent，任何普通终端都能跑：
+**`wrc: command not found`，或 `bin/wrc` 找不到** —— 它从不自动上 PATH，用上面每个块里的 `bash "$WRC/bin/wrc" …` 形式。要是连文件都 `ls` 不到，就是装残了或装的版本太老（`bin/wrc` 是较新版本才加的），走[更新](#更新)再跑一次[自检](#自检)。一台机器上有多份 clone 时，只有 `$WRC` 指向的那份算数。
 
-```bash
-SKILL="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/wechat-remote-control"
-# Codex 用户：SKILL=~/.agents/skills/wechat-remote-control
+**IM 行为看着「过时」**（新功能没有、老 bug 还在）—— 先怀疑 daemon 没重启：`status` 里的启动时间比你仓库最后一次提交还早，就[重启](#重启)。
 
-bash "$SKILL/bin/wrc" status                    # 在不在跑、PID、启动时间、transport、已注册会话
-bash "$SKILL/bin/wrc" start | stop | restart
-bash "$SKILL/bin/wrc" logs -f                   # tail logs/bridge-*.log
-bash "$SKILL/bin/wrc" login --telegram          # 二维码 / token 在 ssh 里也能完成
-bash "$SKILL/bin/wrc" hooks install --agent both
-```
+**会话卡在「忙碌」不动、消息发不进去** —— IM 里发 `/reset`。只清进行中回合的状态，**排队的消息不丢**，会重新投递。
 
-挂到 PATH 上更顺手（用 wrapper 不用软链，这样 clone 丢了可执行位也不影响）：
-
-```bash
-mkdir -p ~/.local/bin
-printf '#!/bin/sh\nexec bash "%s/bin/wrc" "$@"\n' "$SKILL" > ~/.local/bin/wrc
-chmod +x ~/.local/bin/wrc
-```
-
-**更新后重启**：`git -C "$SKILL" pull && wrc restart && wrc status`。`dist/` 是提交进仓库的，**正常不需要** `npm run build` —— 只有你自己改过 `src/*.ts` 才要 `npm install && npm run build`。
-
-重启是安全的，**不需要重跑 `attach`**：daemon 退出时同步删 socket，进行中回合从 `sessions_state.json` 恢复，tmux 会话由每 30s 的扫描重新发现，hook 是写在配置文件里的一次性设置。
-
-> IM 那边行为看着「过时」（新功能没有、老 bug 还在）？先怀疑 daemon 没重启：`wrc status` 的启动时间比 `git -C "$SKILL" log -1 --format=%cd` 早，就 `wrc restart`。
-
-**无头机器**：`wrc login` → `wrc hooks install --agent both` → `wrc start`，然后在 tmux 里正常起 agent，30s 内自动发现并注册。只有想指定「默认路由到哪个会话」时才需要进 agent 跑一次 `attach`（它靠进程父链定位 pane，普通终端做不到）。
-
-> 手工起 daemon 时两个坑：**必须先 kill 再起** —— socket 单例锁会让新进程在旧进程还活着时立刻自杀，而 `nohup` 那行照样打印一个 PID，看着像成功了；**别用 `pkill -f .../src/index.js`** —— agent 把命令包在 `bash -c "..."` 里，这个 pattern 会匹配到包裹 shell 自己。`bridge.pid` 是唯一安全句柄。
+**别手工 kill daemon** —— 尤其别 `pkill -f .../src/index.js`：agent 把命令包在 `bash -c "…"` 里，这个 pattern 会匹配到包裹壳本身，杀掉的是你自己的会话。`bridge.pid` 是唯一安全句柄，`wrc stop` / `wrc restart` 已经处理好了。
 
 ---
 
-## 子命令
+## 依赖与安全
 
-| | |
-|---|---|
-| `login` | 登录 IM。微信扫码（QR 约 60s 自动刷新一张）；Telegram 粘 BotFather token |
-| `attach` | 注册当前会话为遥控目标：`detect.py` 沿 `/proc`(Linux) / `ps`(macOS) 父链找到真正的 agent 进程并确认它在 tmux 里 → 写注册表 → 后台拉起 daemon → 发一条欢迎消息确认通道。Claude 状态栏随后显示 `💬 已连微信 (遥控中)` 或 `(#sw 可切入)`，Telegram 下标签为「TG」 |
-| `sync` | 把 `history.jsonl` 渲染成可读对话记录，给新会话建立上下文 |
-| `uninstall` | 精确移除 wrc 的 hook（按 `wechat-remote-control/hook.py` 标记匹配，别人的 hook 与其它设置原样保留）、移除状态栏（仅当它指向本 skill）、停 daemon 并删运行态；**保留**凭据、`history.jsonl`、`logs/`。想连凭据一起删，之后 `rm -rf ~/.wechat-remote-control` |
-
-> 没开遥控时，attach 装的 hook 本就会因 socket 不存在而立即 `exit 0` 静默 no-op，对正常使用几乎零影响。
-
----
-
-## 依赖
-
-macOS / Linux + `tmux`、**Node ≥ 18**、**Python 3**（`detect.py` 走父链，`hook.py` 送 hook 事件）、agent 跑在 tmux pane 里。
+macOS / Linux + `tmux`、**Node ≥ 18**、**Python 3**（`detect.py` 走进程父链，`hook.py` 送 hook 事件），agent 跑在 tmux pane 里。
 
 > ❌ 不支持云端 / 远程 Claude Code（`CLAUDE_CODE_REMOTE=true`）—— bridge 需要本机 tmux + Unix socket。
 
-**代理**：在启动 skill 的**同一个 shell** 里 `export HTTPS_PROXY=... HTTP_PROXY=...` 即可，登录进程与 daemon 默认带 `NODE_USE_ENV_PROXY=1`，Node 内置 `fetch` 会自动走。注意该开关的 `fetch` 支持需要 **Node ≥ 24（或 ≥ 22.21）**，更低版本会静默忽略；微信还需放行 `ilinkai.weixin.qq.com` 与 `novac2c.cdn.weixin.qq.com`。
+**代理**：在启动 daemon 的**同一个 shell** 里 `export HTTPS_PROXY=… HTTP_PROXY=…`（它只在启动时继承一次环境）。登录进程与 daemon 默认带 `NODE_USE_ENV_PROXY=1`，但 Node 内置 `fetch` 对这个开关的支持需要 **Node ≥ 24（或 ≥ 22.21）** —— 更低版本会静默忽略，症状是 daemon 正常启动、打印 PID，然后**一条消息都收不到，且哪里都没有报错**。微信还需放行 `ilinkai.weixin.qq.com` 与 `novac2c.cdn.weixin.qq.com`。
 
----
+安全上有四件事值得先知道：
 
-## 安全
-
-- **状态全在本机** —— 凭据和会话数据只落 `~/.wechat-remote-control/`，除 IM API 流量外不外传
-- **终端隔离** —— 终端里手敲的内容不会反向转发，只有「来自 IM 的消息」的回执才回去
-- **进程检测安全** —— 用 Python 扫 `/proc` 而不是 `pgrep -f`，后者会匹配到 `bash -c "..."` 包裹 shell、可能误杀
-- **autoApprove 的边界** —— 开启时 hook 直接放行 tool call。方便，但意味着「拿到你 IM 的人」就能在你电脑里触发操作。请像对待 SSH 访问一样对待这个 skill
-
----
-
-## 目录结构
-
-```
-SKILL.md            # skill 入口：login / attach / sync / uninstall 完整 runbook
-src/  dist/         # TS 源码 / 预构建产物（dist 提交进仓库，SKILL.md 直接引用）
-bin/wrc             # 终端运维入口：daemon 生命周期 / login / hooks，不依赖 agent
-detect.py           # /proc + ps 双栈的 agent-in-tmux 检测器
-hook.py             # agent hook 入口，事件转给 bridge
-format_history.py   # history.jsonl → 可读文本
-status.sh           # 一行命令查 bridge / account / session 状态
-```
+- **工具调用默认自动放行。** 这是 daemon 的默认行为，不是需要你打开的开关 —— 意味着**能给你 bot 发消息的人，就能在你电脑上跑命令**。请像对待 SSH 访问一样对待这个 skill。要关掉：设 `WRC_AUTO_APPROVE=0` 后**必须重启 daemon**（环境变量只在启动时读一次，不重启等于没改）；关掉后 hook 不再代为决定，回落到 agent 自己的权限流程。
+- **bot token ≈ 终端控制权**，且第一个跟 bot 说话的会话会被锁为唯一授权会话。
+- **状态全在本机** —— 凭据和会话数据只落 `~/.wechat-remote-control/`，除 IM API 流量外不外传。
+- **进程检测安全** —— 用 Python 扫 `/proc` 而不是 `pgrep -f`，后者会匹配到 `bash -c "…"` 包裹壳、可能误杀。
 
 ---
 
@@ -187,6 +255,6 @@ status.sh           # 一行命令查 bridge / account / session 状态
 
 MIT —— 见 [LICENSE](./LICENSE)。
 
-Issue 和 PR 都欢迎。报 bug 请带上 `bash status.sh` 的输出、`logs/bridge-*.log` 最后 50 行，以及 `tmux -V` / `node --version` / 系统版本。想加新功能（图片 / 语音转发、群聊支持等）欢迎先开 Issue 讨论。
+Issue 和 PR 都欢迎。报 bug 请带上 `bash "$WRC/bin/wrc" status` 与 `bash "$WRC/bin/wrc" logs -n 50` 的输出，以及 `tmux -V` / `node --version` / 系统版本。想加新功能（图片 / 语音转发、群聊支持等）欢迎先开 Issue 讨论。
 
-改过 `src/*.ts` 后跑 `npm install && npm run build`，把重新生成的 `dist/` 一起提交（CI 会校验两者一致）。
+改过 `src/*.ts` 后跑 `npm install && npm run build`，把重新生成的 `dist/` 一起提交 —— CI 会校验两者一致。
